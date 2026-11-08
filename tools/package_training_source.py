@@ -9,6 +9,7 @@ import zipfile
 
 REQUIRED = (
     "pyproject.toml",
+    "hatch_build.py",
     "LICENSE",
     "README.md",
     "kanachan/training/iql/train.py",

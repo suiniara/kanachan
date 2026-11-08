@@ -18,9 +18,13 @@ from kanachan.candidate_features import (
 )
 
 
-def audit(path, limit, batch_size):
+def audit(path, limit, batch_size, *, min_rows=1):
     if limit <= 0 or batch_size <= 0:
         raise ValueError("Audit row limit and batch size must be positive.")
+    if min_rows <= 0 or min_rows > limit:
+        raise ValueError(
+            "Minimum audit rows must be positive and no greater than the row limit."
+        )
     opener = (
         gzip.open
         if path.suffix == ".gz"
@@ -30,8 +34,9 @@ def audit(path, limit, batch_size):
     )
     digest = hashlib.sha256()
     report = {
-        "status": "passed",
         "rows": 0,
+        "min_rows": min_rows,
+        "row_limit": limit,
         "discard_rows": 0,
         "discard_candidates": 0,
         "unsupported_candidates": 0,
@@ -103,7 +108,12 @@ def audit(path, limit, batch_size):
             check(pending)
     if signature != (path.stat().st_size, path.stat().st_mtime_ns):
         raise ValueError("Audit input changed during the read.")
+    if report["rows"] < min_rows:
+        raise ValueError(
+            f"Insufficient audit coverage: checked {report['rows']} rows; require at least {min_rows}."
+        )
     report.update(
+        status="passed",
         source_name=path.name,
         source_size=signature[0],
         uncompressed_prefix_sha256=digest.hexdigest(),
@@ -118,11 +128,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=4096)
+    parser.add_argument(
+        "--min-rows",
+        type=int,
+        default=1,
+        help="Required coverage; set equal to --limit for a release gate.",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     torch.set_num_threads(2)
-    result = audit(args.input, args.limit, args.batch_size)
+    result = audit(
+        args.input, args.limit, args.batch_size, min_rows=args.min_rows
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
         json.dumps(result, indent=2) + "\n", encoding="utf-8"

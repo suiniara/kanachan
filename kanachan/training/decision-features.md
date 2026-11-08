@@ -84,8 +84,15 @@ speedup claim. A bounded, read-only real-data audit is available:
 
 ```bash
 python tools/audit_candidate_features.py --input /data/test.rl.tsv.gz \
-  --limit 4096 --output /runs/afterstate-audit.json
+  --limit 4096 --min-rows 4096 --output /runs/afterstate-audit.json
 ```
+
+Empty input fails with a nonzero exit status. `--min-rows` defaults to one
+and must be positive and no greater than `--limit`. For a release gate,
+set both to the required coverage and require successful process exit before
+accepting the report. Reports record the required minimum and actual checked
+rows. Visible availability includes tiles that may be in opponents' hands or
+the dead wall; it is not the actual drawable live-wall count.
 
 ## AWR diagnostics
 
