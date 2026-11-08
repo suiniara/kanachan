@@ -14,6 +14,7 @@ class DecoderConfig:
     layer_normalization: bool
     num_layers: int
     load_from: Path | None
+    candidate_features: str = "none"
 
 
 @dataclass
@@ -46,13 +47,22 @@ class TripleDecoderConfig(DecoderConfig):
     load_from: Path | None = None
 
 
+@dataclass
+class GlobalActionDecoderConfig(DoubleDecoderConfig):
+    activation_function: str = "silu"
+    dropout: float = 0.0
+
+
 config_store = ConfigStore.instance()
 config_store.store(name="single", node=SingleDecoderConfig, group="decoder")
 config_store.store(name="double", node=DoubleDecoderConfig, group="decoder")
 config_store.store(name="triple", node=TripleDecoderConfig, group="decoder")
+config_store.store(name="global_actions", node=GlobalActionDecoderConfig, group="decoder")
 
 
 def validate(decoder_config: Any, encoder_dimension: int) -> None:
+    if getattr(decoder_config, "candidate_features", "none") not in ("none", "discard_v1"):
+        raise ValueError("decoder.candidate_features must be none or discard_v1.")
     if decoder_config.dimension is None and decoder_config.num_layers >= 2:
         decoder_config.dimension = encoder_dimension
     if decoder_config.dimension is not None and decoder_config.dimension <= 0:
@@ -62,7 +72,7 @@ def validate(decoder_config: Any, encoder_dimension: int) -> None:
         )
         raise RuntimeError(errmsg)
 
-    if decoder_config.activation_function not in (None, "relu", "gelu"):
+    if decoder_config.activation_function not in (None, "relu", "gelu", "silu"):
         errmsg = (
             f"{decoder_config.activation_function}: "
             "An invalid activation function for the decoder."

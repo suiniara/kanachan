@@ -21,10 +21,12 @@ class Config:
     num_workers: int | None = None
     initial_model_prefix: Path | None = None
     initial_model_index: int | None = None
+    start_new_epoch: bool = False
     q_model: Path = MISSING
     value_model: Path | None = None
     beta: float = 1.0
     weight_clipping: float = 20.0
+    weight_diagnostics_interval: int = 100
     checkpointing: bool = False
     batch_size: int = MISSING
     gradient_accumulation_steps: int = 1
@@ -41,3 +43,14 @@ class Config:
 
 config_store = ConfigStore.instance()
 config_store.store(name="config", node=Config)
+
+
+@dataclass
+class DecisionConfig(Config):
+    defaults: list[Any] = field(default_factory=lambda: [
+        {"device": "cuda"}, {"encoder": "decision_tiny"},
+        {"decoder": "global_actions"}, {"optimizer": "adamw"}, "_self_",
+    ])
+
+
+config_store.store(name="decision", node=DecisionConfig)

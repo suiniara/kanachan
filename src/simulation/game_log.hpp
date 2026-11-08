@@ -7,6 +7,7 @@
 #include <vector>
 #include <array>
 #include <cstdint>
+#include <cstddef>
 
 
 namespace Kanachan{
@@ -37,11 +38,17 @@ public:
 
   boost::python::dict getEpisode(std::uint_fast8_t seat) const;
 
+  void setSimulationId(std::size_t set_id, std::size_t game_id);
+
+  boost::python::dict getMetadata() const;
+
 private:
   std::array<boost::python::list, 4u> data_;
   std::array<RoundResults_, 4u> round_results_;
   std::array<std::int_fast32_t, 4u> game_scores_;
   std::array<bool, 4u> with_proposed_model_;
+  std::size_t set_id_ = 0u;
+  std::size_t game_id_ = 0u;
 };
 
 }

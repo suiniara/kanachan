@@ -1,4 +1,5 @@
 #include "simulation/simulator.hpp"
+#include <boost/python/extract.hpp>
 
 #include "simulation/game.hpp"
 #include "simulation/game_log.hpp"
@@ -47,7 +48,7 @@ private:
     using Grades_ = std::array<std::uint_fast8_t, 4u>;
     using SeatArrangement_ = std::array<bool, 4u>;
     using Seed_ = std::vector<std::uint_least32_t>;
-    using GameInitializer_ = std::tuple<Grades_, SeatArrangement_, Seed_>;
+    using GameInitializer_ = std::tuple<Grades_, SeatArrangement_, Seed_, std::size_t, std::size_t>;
 
 public:
     Impl_(
@@ -62,7 +63,8 @@ public:
         std::size_t num_simulation_sets,
         std::size_t batch_size,
         std::size_t concurrency,
-        python::object progress);
+        python::object progress,
+        python::object seed);
 
     Impl_(Impl_ const &) = delete;
 
@@ -98,7 +100,8 @@ Simulator::Simulator(
     std::size_t const num_simulation_sets,
     std::size_t const batch_size,
     std::size_t const concurrency,
-    python::object progress)
+    python::object progress,
+    python::object seed)
     : p_impl_(std::make_shared<Impl_>(
         device,
         dtype,
@@ -111,7 +114,8 @@ Simulator::Simulator(
         num_simulation_sets,
         batch_size,
         concurrency,
-        progress))
+        progress,
+        seed))
 {}
 
 python::list Simulator::run()
@@ -135,7 +139,8 @@ Simulator::Impl_::Impl_(
     std::size_t const num_simulation_sets,
     std::size_t const batch_size,
     std::size_t const concurrency,
-    python::object progress)
+    python::object progress,
+    python::object seed)
     : dong_feng_zhan_(simulation_mode & 2u)
     , room_(room)
     , p_decision_maker_(
@@ -175,12 +180,33 @@ Simulator::Impl_::Impl_(
     }
 
     {
+        Seed_ master_seed;
+        if (seed.is_none()) {
+            master_seed = Kanachan::getRandomSeed();
+        }
+        else {
+            std::uint64_t const value = python::extract<std::uint64_t>(seed);
+            master_seed = { static_cast<std::uint32_t>(value), static_cast<std::uint32_t>(value >> 32u) };
+        }
+        std::seed_seq master_sequence(master_seed.cbegin(), master_seed.cend());
+        std::mt19937 seed_generator(master_sequence);
+        auto next_seed = [&]() {
+            Seed_ result(std::mt19937::state_size);
+            std::generate(result.begin(), result.end(), [&]() { return seed_generator(); });
+            return result;
+        };
+        std::size_t current_set = 0u;
+        auto add_game = [&](Grades_ grades, SeatArrangement_ seats, Seed_ game_seed) {
+            game_initializers_.emplace_back(
+                grades, seats, std::move(game_seed), current_set, game_initializers_.size());
+        };
         if (no_duplicate) {
-            Seed_ seed = Kanachan::getRandomSeed();
+            Seed_ seed = next_seed();
             std::seed_seq ss(seed.cbegin(), seed.cend());
             std::mt19937 urng(ss);
 
             for (std::size_t i = 0u; i < num_simulation_sets; ++i) {
+                current_set = i;
                 std::array<std::pair<std::uint_fast8_t, bool>, 4u> data{
                     std::pair<std::uint_fast8_t, bool>{ baseline_grade, false },
                     std::pair<std::uint_fast8_t, bool>{ baseline_grade, false },
@@ -192,44 +218,45 @@ Simulator::Impl_::Impl_(
                 Grades_ grades{ data[0u].first, data[1u].first, data[2u].first, data[3u].first };
                 SeatArrangement_ seat_arrangement{
                     data[0u].second, data[1u].second, data[2u].second, data[3u].second };
-                game_initializers_.emplace_back(grades, seat_arrangement, Kanachan::getRandomSeed());
+                add_game(grades, seat_arrangement, next_seed());
             }
         }
         else {
             for (std::size_t i = 0u; i < num_simulation_sets; ++i) {
+                current_set = i;
                 if (one_versus_three) {
-                    Seed_ seed = Kanachan::getRandomSeed();
-                    game_initializers_.emplace_back(
+                    Seed_ seed = next_seed();
+                    add_game(
                         Grades_{ baseline_grade, baseline_grade, baseline_grade, proposed_grade },
                         SeatArrangement_{ false, false, false, true }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ baseline_grade, baseline_grade, proposed_grade, baseline_grade },
                         SeatArrangement_{ false, false, true, false }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ baseline_grade, proposed_grade, baseline_grade, baseline_grade },
                         SeatArrangement_{ false, true, false, false }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ proposed_grade, baseline_grade, baseline_grade, baseline_grade },
                         SeatArrangement_{ true, false, false, false }, seed);
                 }
                 else {
-                    Seed_ seed = Kanachan::getRandomSeed();
-                    game_initializers_.emplace_back(
+                    Seed_ seed = next_seed();
+                    add_game(
                         Grades_{ baseline_grade, baseline_grade, proposed_grade, proposed_grade },
                         SeatArrangement_{ false, false, true, true }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ baseline_grade, proposed_grade, baseline_grade, proposed_grade },
                         SeatArrangement_{ false, true, false, true }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ baseline_grade, proposed_grade, proposed_grade, baseline_grade },
                         SeatArrangement_{ false, true, true, false }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ proposed_grade, baseline_grade, baseline_grade, proposed_grade },
                         SeatArrangement_{ true, false, false, true }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ proposed_grade, baseline_grade, proposed_grade, baseline_grade },
                         SeatArrangement_{ true, false, true, false }, seed);
-                    game_initializers_.emplace_back(
+                    add_game(
                         Grades_{ proposed_grade, proposed_grade, baseline_grade, baseline_grade },
                         SeatArrangement_{ true, true, false, false }, seed);
                 }
@@ -237,8 +264,11 @@ Simulator::Impl_::Impl_(
         }
     }
 
+    game_logs_.resize(game_initializers_.size());
     for (std::size_t i = 0u; i < concurrency; ++i) {
-        threads_.emplace_back(&Impl_::threadMain_, this);
+        threads_.emplace_back([this](std::stop_token stop_token) {
+            threadMain_(stop_token);
+        });
     }
 }
 
@@ -252,6 +282,8 @@ try {
         Grades_ grades;
         SeatArrangement_ seats;
         Seed_ seed;
+        std::size_t set_id;
+        std::size_t game_id;
         {
             std::unique_lock lock(mtx_);
             if (game_initializers_.empty()) {
@@ -261,7 +293,7 @@ try {
                 return;
             }
 
-            std::tie(grades, seats, seed) = std::move(game_initializers_.back());
+            std::tie(grades, seats, seed, set_id, game_id) = std::move(game_initializers_.back());
             game_initializers_.pop_back();
         }
 
@@ -282,12 +314,13 @@ try {
             std::shared_ptr<Kanachan::GameLog> p_game_log = Kanachan::simulateGame(
                 urng, room_, dong_feng_zhan_, deciders, grades, dummy_paishan_list, stop_token);
             p_game_log->setWithProposedModel(seats);
+            p_game_log->setSimulationId(set_id, game_id);
             return p_game_log;
         }();
 
         {
             std::scoped_lock lock(mtx_);
-            game_logs_.push_back(p_game_log);
+            game_logs_[game_id] = p_game_log;
         }
 
         {
@@ -321,7 +354,9 @@ python::list Simulator::Impl_::run()
     {
         Kanachan::GIL::RecursiveRelease gil_release;
         for (auto &thread : threads_) {
-            KANACHAN_ASSERT((!thread.joinable()));
+            if (thread.joinable()) {
+                thread.join();
+            }
         }
     }
 

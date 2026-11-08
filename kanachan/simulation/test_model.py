@@ -1,7 +1,7 @@
-import math
 from typing import List
 import torch
 from torch import Tensor
+from tensordict import TensorDictBase
 from kanachan.constants import (
     NUM_TYPES_OF_SPARSE_FEATURES,
     MAX_NUM_ACTIVE_SPARSE_FEATURES,
@@ -18,13 +18,13 @@ class TestModel(object):
         self.__round_index = 0
         self.__decision_index = 0
 
-    def __call__(self, features: List[Tensor]) -> torch.Tensor:
-        if len(features) != 4:
-            raise ValueError(len(features))
-        sparse = features[0]
-        numeric = features[1]
-        progression = features[2]
-        candidates = features[3]
+    def __call__(self, features: TensorDictBase) -> TensorDictBase:
+        if features.batch_size != torch.Size([1]):
+            raise ValueError(features.batch_size)
+        sparse = features["sparse"]
+        numeric = features["numeric"]
+        progression = features["progression"]
+        candidates = features["candidates"]
 
         if len(candidates) == 0:
             msg = f"""No candidate.
@@ -57,7 +57,6 @@ class TestModel(object):
                 message += "sparse != decision['sparse']\n"
             numeric = torch.squeeze(numeric)
             numeric_ = list(decision["numeric"])
-            numeric_[2:] = [float(x) / 10000.0 for x in numeric_[2:]]
             numeric_ = torch.tensor(
                 numeric_, device=numeric.device, dtype=numeric.dtype
             )
@@ -83,7 +82,7 @@ class TestModel(object):
             candidates_ = list(decision["candidates"])
             for _ in range(len(candidates_), MAX_NUM_ACTION_CANDIDATES):
                 # Padding.
-                candidates_.append(NUM_TYPES_OF_ACTIONS + 1)
+                candidates_.append(NUM_TYPES_OF_ACTIONS)
             candidates_ = torch.tensor(
                 candidates_, device=candidates.device, dtype=candidates.dtype
             )
@@ -128,15 +127,14 @@ index: {next_decision["index"]}
                 msg = "Out of index."
                 raise RuntimeError(msg)
             self.__decision_index += 1
-            prediction = torch.full(
-                (MAX_NUM_ACTION_CANDIDATES,),
-                -math.inf,
-                device=numeric.device,
-                dtype=numeric.dtype,
-            )
-            prediction[index] = 0.0
-            prediction = torch.unsqueeze(prediction, dim=0)
-            return prediction
+            features["action"] = torch.tensor([index], device=numeric.device, dtype=torch.int32)
+            return features
 
         msg = "No more decision."
         raise RuntimeError(msg)
+
+    def assert_complete(self) -> None:
+        remaining = sum(len(round_["decisions"]) for round_ in self.__rounds[self.__round_index:])
+        remaining -= self.__decision_index
+        if remaining:
+            raise RuntimeError(f"{remaining} recorded decisions were not replayed.")

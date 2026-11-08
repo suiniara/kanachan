@@ -25,6 +25,7 @@ class Config:
     replay_buffer_size: int = 0
     initial_model_prefix: Path | None = None
     initial_model_index: int | None = None
+    start_new_epoch: bool = False
     reward_plugin: Path = MISSING
     double_q_learning: bool = True
     discount_factor: float = 0.99

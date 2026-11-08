@@ -5,13 +5,16 @@ from kanachan.constants import NUM_TYPES_OF_ACTIONS, MAX_NUM_ACTION_CANDIDATES
 
 
 class DecodeConverter(nn.Module):
-    def __init__(self, mode: str) -> None:
+    def __init__(
+        self, mode: str = "argmax", *, tie_break_by_action_id: bool = False
+    ) -> None:
         super().__init__()
 
         if mode not in ("scores", "probs", "log_probs", "argmax"):
             msg = f"{mode}: An invalid mode."
             raise RuntimeError(msg)
         self.__mode = mode
+        self.__tie_break_by_action_id = tie_break_by_action_id
 
     def forward(self, candidates: Tensor, decode: Tensor) -> Tensor:
         assert candidates.dim() == 2
@@ -38,4 +41,7 @@ class DecodeConverter(nn.Module):
         score = decode.masked_fill(mask, -math.inf)
         if self.__mode == "scores":
             return score
+        if self.__tie_break_by_action_id:
+            from kanachan.nn.decision_decoder import legal_argmax
+            return legal_argmax(candidates, decode)
         return score.argmax(1).to(torch.int32)

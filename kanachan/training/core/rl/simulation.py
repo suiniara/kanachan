@@ -14,7 +14,6 @@ from kanachan.constants import (
     MAX_NUM_ROUND_SUMMARY,
     NUM_RESULTS,
 )
-import kanachan.simulation
 from kanachan.training.core.rl import RewardFunction
 
 
@@ -37,7 +36,12 @@ def simulate(
     simulation_concurrency: int,
     progress: Progress,
     get_reward: RewardFunction,
+    seed: int | None = None,
+    policy_version: int = 0,
+    opponent_version: int = 0,
 ) -> TensorDict:
+    import kanachan.simulation
+
     simulation_mode = 0
     simulation_mode |= 1  # non-duplicate mode
     if dongfengzhan:
@@ -57,6 +61,7 @@ def simulate(
         simulation_batch_size,
         simulation_concurrency,
         progress,
+        seed=seed,
     )
 
     _episodes: list[TensorDict] = []
@@ -79,12 +84,8 @@ def simulate(
                 round_results[round_key]["delta_scores"][i] = delta_score
                 round_results[round_key]["scores"][i] = eor_score
 
-        episode_meta_data = None
-        for seat in range(4):
-            episode_meta_data = game_log.get_episode(seat)
-            if episode_meta_data["proposed"]:
-                break
-        assert episode_meta_data is not None
+        seat = next(i for i, result in enumerate(game_result) if result["proposed"])
+        episode_meta_data = game_log.get_episode(seat)
 
         game_scores = episode_meta_data["scores"]
         assert isinstance(game_scores, list)
@@ -98,6 +99,18 @@ def simulate(
 
         length = episode.size(0)
         assert isinstance(length, int)
+        if length == 0:
+            # A game can end before this seat gets any decision (e.g. a
+            # first-turn multiple yakuman). There is no Q transition to learn.
+            continue
+
+        metadata = game_log.get_metadata()
+        for key, value in {
+            "game_id": metadata["game_id"], "set_id": metadata["set_id"],
+            "collection_seed": seed if seed is not None else -1,
+            "policy_version": policy_version, "opponent_version": opponent_version,
+        }.items():
+            episode[key] = torch.full((length,), value, dtype=torch.int64)
 
         sparse = episode["sparse"]
         assert isinstance(sparse, Tensor)
@@ -265,6 +278,8 @@ def simulate(
 
         _episodes.append(episode.detach().clone().cpu())
 
+    if not _episodes:
+        return TensorDict({}, [0])
     episodes: TensorDict = torch.cat(_episodes).to_tensordict()  # type: ignore
     assert isinstance(episodes, TensorDict)
 

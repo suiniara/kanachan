@@ -30,7 +30,8 @@ public:
         std::size_t num_simulation_sets,
         std::size_t batch_size,
         std::size_t concurrency,
-        boost::python::object progress);
+        boost::python::object progress,
+        boost::python::object seed = boost::python::object());
 
     Simulator(Simulator const &) = delete;
 

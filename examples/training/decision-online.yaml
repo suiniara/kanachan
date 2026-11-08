@@ -1,0 +1,33 @@
+# Set paths to audited train data and the new decoder's scalar CQL export.
+initial_model: ../../runs/decision-cql/snapshots/model.kanachan
+output_dir: ../../runs/decision-online
+offline_data: ../../data/train.rl.tsv.gz
+# Build once by scanning the full train file; capacity limits retained rows.
+# Interrupted initial preparation resumes in the same output_dir.
+offline_capacity: 65536
+offline_fraction: 0.5
+offline_cql_alpha: 0.1
+device: cuda:0
+amp_dtype: float16
+td_loss: huber
+cql_temperature: 1.0
+cql_alpha_first: 0.05
+cql_alpha_last: 0.05
+cql_annealing_steps: 0
+epsilon_first: 0.05
+epsilon_last: 0.05
+epsilon_steps: 0
+batch_size: 128
+learning_rate: 0.0001
+weight_decay: 0.01
+target_update_rate: 0.005
+room: 3
+grade: 12
+# Omit opponents for the frozen initial Q model, or set a fixed BC export list.
+iterations: 100
+games_per_iteration: 4
+simulation_batch_size: 1
+simulation_concurrency: 1
+updates_per_iteration: 16
+evaluate_every: 10
+evaluation_sets: 128

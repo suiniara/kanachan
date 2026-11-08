@@ -2,6 +2,7 @@
 #define KANACHAN_ANNOTATION_UTILITY_HPP_INCLUDE_GUARD
 
 #include "common/throw.hpp"
+#include <array>
 #include <iostream>
 #include <string_view>
 #include <string>
@@ -23,7 +24,7 @@ namespace{
 constexpr std::uint_fast64_t encodeChi_(
   std::uint_fast8_t const a, std::uint_fast8_t const b, std::uint_fast8_t const c)
 {
-  return (1ul << a) + (1ul << b) + (1ul << (c + 10u));
+  return (1ull << a) + (1ull << b) + (1ull << (c + 10u));
 }
 
 } // namespace *unnamed*
@@ -46,7 +47,7 @@ std::uint_fast8_t encodeChi(Iterator first, Iterator last)
   }
 
   std::uint_fast8_t encode = std::numeric_limits<std::uint_fast8_t>::max();
-  switch ((1ul << numbers[0u]) + (1ul << numbers[1u]) + (1ul << (numbers[2u] + 10u))) {
+  switch ((1ull << numbers[0u]) + (1ull << numbers[1u]) + (1ull << (numbers[2u] + 10u))) {
   case encodeChi_(2u, 3u, 1u):
     encode = 0u;
     break;
@@ -156,7 +157,7 @@ namespace{
 constexpr std::uint_fast64_t encodePeng_(
   std::uint_fast8_t const a, std::uint_fast8_t const b, std::uint_fast8_t const c)
 {
-  return (1ul << a) + (1ul << (b + 10u)) + (1ul << (c + 20u));
+  return (1ull << a) + (1ull << (b + 10u)) + (1ull << (c + 20u));
 }
 
 } // namespace *unnamed*
@@ -174,7 +175,7 @@ std::uint_fast8_t encodePeng(Iterator first, Iterator last)
   }
 
   std::uint_fast8_t encode = std::numeric_limits<std::uint_fast8_t>::max();
-  switch ((1ul << numbers[0u]) + (1ul << (numbers[1u] + 10u)) + (1ul << (numbers[2u] + 20u))) {
+  switch ((1ull << numbers[0u]) + (1ull << (numbers[1u] + 10u)) + (1ull << (numbers[2u] + 20u))) {
   case encodePeng_(1u, 1u, 1u):
     encode = 0u;
     break;

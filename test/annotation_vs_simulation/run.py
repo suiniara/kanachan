@@ -33,31 +33,33 @@ def _on_leaf(test_file_path: Path):
 
     test_model = TestModel(rounds)
 
-    result = test(simulation_mode, player_grades, test_model, paishan_list)
+    result = test(simulation_mode, player_grades, test_model, paishan_list).get_result()
+    test_model.assert_complete()
 
-    if len(result['rounds']) != len(test_data['rounds']):
-        raise RuntimeError(f'{result["rounds"]} != {test_data["rounds"]}')
+    if any(len(player['round_results']) != len(rounds) for player in result):
+        raise RuntimeError('Simulation and annotations have different round counts.')
 
     for i in range(len(test_data['rounds'])):
         round_data = test_data['rounds'][i]
-        round_result = result['rounds'][i]
         for j in range(4):
             delta_score_to_be = round_data['delta_scores'][j]
-            delta_score_as_is = round_result[j]['delta_score']
+            delta_score_as_is = result[j]['round_results'][i]['delta_score']
             if delta_score_as_is != delta_score_to_be:
-                delta_scores_as_is = [round_result[k]['delta_score'] for k in range(4)]
+                delta_scores_as_is = [result[k]['round_results'][i]['delta_score'] for k in range(4)]
                 raise RuntimeError(
                     f'''{i}-th round:
 {delta_scores_as_is}
 {round_data["delta_scores"]}''')
 
     final_ranking = [test_data['players'][i]['final_ranking'] for i in range(4)]
-    if result['ranking'] != final_ranking:
-        raise RuntimeError(f'{result["ranking"]} != {final_ranking}')
+    actual_ranking = [player['ranking'] for player in result]
+    if actual_ranking != final_ranking:
+        raise RuntimeError(f'{actual_ranking} != {final_ranking}')
 
     final_scores = [test_data['players'][i]['final_score'] for i in range(4)]
-    if result['scores'] != final_scores:
-        raise RuntimeError(f'{result["scores"]} != {final_scores}')
+    actual_scores = [player['score'] for player in result]
+    if actual_scores != final_scores:
+        raise RuntimeError(f'{actual_scores} != {final_scores}')
 
     print('PASS')
 

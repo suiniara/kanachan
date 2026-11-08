@@ -71,6 +71,11 @@ def _load_model(state: Any, map_location: torch.device | None) -> Any:
     if map_location is not None and "device" in kwargs:
         kwargs["device"] = map_location
 
+    if (module_name == "kanachan.nn.decoder" and class_name == "Decoder"
+            and "layer_normalization" not in kwargs and kwargs.get("noise_init_std") == 0.0):
+        # Legacy BC exports used zero to mean an ordinary linear layer.
+        kwargs["noise_init_std"] = None
+
     model: nn.Module = _class(*args, **kwargs)
 
     if "state_dict" in state:
@@ -103,3 +108,13 @@ def load_model(
         raise RuntimeError(errmsg)
 
     return _load_model(state, map_location)
+
+
+def load_model_state(state: Dict[str, Any], map_location: torch.device | None = None) -> nn.Module:
+    """Reconstruct a portable model description from a training checkpoint."""
+    if not isinstance(state, dict) or state.get("__kanachan__") != "11fc2bfe-c4c7-402e-b11e-7cb3ff6f9945":
+        raise ValueError("Not a Kanachan model description.")
+    model = _load_model(state, map_location)
+    if not isinstance(model, nn.Module):
+        raise ValueError("The model description did not construct a module.")
+    return model

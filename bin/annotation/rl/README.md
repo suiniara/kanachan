@@ -12,6 +12,13 @@ kanachan$ docker build -f bin/annotate4rl/Dockerfile -t cryolite/kanachan.annota
 
 # `annotate4rl.py` Python program
 
+The current source entry point is `bin/annotation/rl/rl.py`. Use
+`python bin/annotation/rl/rl.py --stream INPUT.tsv` for large inputs with
+complete games grouped by UUID. It holds one game at a time, accepts `.gz`
+and `.bz2` inputs, and rejects a UUID appearing in separate groups. Convert
+before shuffling individual transitions. The default mode retains the legacy
+whole-input sort and therefore loads all input into memory.
+
 ### Usage
 
 ```sh

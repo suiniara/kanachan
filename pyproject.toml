@@ -7,16 +7,17 @@ authors = [
 description = "A Japanese (Riichi) Mahjong AI Framework"
 license = {file = "LICENSE"}
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 dependencies = [
-  "hydra-core",
+  "hydra-core==1.3.2",
   "jsonschema",
   "mahjong==1.1.11",
   "pyyaml",
   "pyzmq",
   "tensorboard",
-  "tensordict",
-  "torchrl",
+  "torch>=2.6.0,<2.10",
+  "tensordict>=0.7.0,<0.11",
+  "torchrl>=0.7.0,<0.11",
   "tqdm",
   "types-tqdm",
 ]
@@ -34,12 +35,16 @@ line-length = 79
 [tool.ruff.lint]
 ignore = ["F401"] # imported but unused
 
-[tool.ruff.pycodestyle]
+[tool.ruff.lint.pycodestyle]
 max-doc-length = 72
 
-[tool.ruff.pydocstyle]
+[tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.hatch.build.targets.wheel]
 include = ["/kanachan/**/*.py"]
-artifacts = ["/kanachan/simulation/_simulation.so"]
+artifacts = [
+  "/kanachan/simulation/_simulation.so",
+  "/kanachan/_candidate_features*.so",
+  "/kanachan/_candidate_features*.pyd",
+]

@@ -8,8 +8,13 @@ from kanachan.constants import NUM_TYPES_OF_ACTIONS
 
 
 class TwinQActor(nn.Module):
-    def __init__(self, model0: nn.Module, model1: nn.Module) -> None:
+    def __init__(
+        self, model0: nn.Module, model1: nn.Module, *, return_values: bool = False,
+        tie_break_by_action_id: bool = False,
+    ) -> None:
         super().__init__()
+        self.return_values = return_values
+        self.tie_break_by_action_id = tie_break_by_action_id
 
         if isinstance(model0, DistributedDataParallel):
             self.model0 = model0.module
@@ -20,13 +25,14 @@ class TwinQActor(nn.Module):
         else:
             self.model1 = model1
 
+    @torch.no_grad()
     def forward(
             self,
             sparse: Tensor,
             numeric: Tensor,
             progression: Tensor,
             candidates: Tensor,
-    ) -> Tensor:
+    ) -> Tensor | tuple[Tensor, Tensor]:
         batch_size = int(sparse.size(0))
 
         td = TensorDict(
@@ -47,9 +53,14 @@ class TwinQActor(nn.Module):
         q1: Tensor = td["action_value"]
         q1 = q1.detach().clone()
 
-        q = torch.maximum(q0, q1)
+        q = torch.minimum(q0, q1)
 
         mask = candidates >= NUM_TYPES_OF_ACTIONS
         q = q.masked_fill(mask, -math.inf)
 
-        return q.argmax(1).to(torch.int32)
+        if self.tie_break_by_action_id:
+            from kanachan.nn.decision_decoder import legal_argmax
+            action = legal_argmax(candidates, q)
+        else:
+            action = q.argmax(1).to(torch.int32)
+        return (action, q) if self.return_values else action

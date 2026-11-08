@@ -8,6 +8,7 @@ from kanachan.constants import (
     MAX_NUM_ACTION_CANDIDATES,
 )
 from kanachan.nn import Decoder
+from kanachan.nn.functional import compute_td_target
 
 
 class QRDecoder(nn.Module):
@@ -18,7 +19,7 @@ class QRDecoder(nn.Module):
         dimension: int | None,
         activation_function: str | None,
         dropout: float | None,
-        layer_normalization: bool,
+        layer_normalization: bool = False,
         num_layers: int,
         num_qr_intervals: int,
         dueling_network: bool,
@@ -82,6 +83,12 @@ class QRDecoder(nn.Module):
             )
             self.advantage_decoder_list.append(advantage_decoder)
 
+    def zero_output(self) -> None:
+        for decoder in self.state_value_decoder_list:
+            decoder.zero_output()
+        for decoder in self.advantage_decoder_list:
+            decoder.zero_output()
+
     @torch.compile
     def forward(self, candidates: Tensor, encode: Tensor) -> Tensor:
         device = candidates.device
@@ -113,7 +120,8 @@ class QRDecoder(nn.Module):
 
             if dueling_network:
                 advantage = advantage.masked_fill(mask, 0.0)
-                advantage = advantage - advantage.mean(1, keepdim=True)
+                legal_count = (~mask).sum(1, keepdim=True).clamp_min(1)
+                advantage = advantage - advantage.sum(1, keepdim=True) / legal_count
                 state_value_decoder = self.state_value_decoder_list[i]
                 state_value: Tensor = state_value_decoder(encode)
                 advantage += state_value.unsqueeze(1).expand_as(advantage)
@@ -148,13 +156,13 @@ def _get_a_star(source_network: nn.Module, data: TensorDict) -> Tensor:
         device=data.device,
     )
     with torch.no_grad():
-        # WORKAROUND: See https://github.com/pytorch/pytorch/issues/43259
-        source_network.requires_grad_(False)
-        assert source_network.training
+        modes = [(module, module.training) for module in source_network.modules()]
         source_network.eval()
-        source_network(copy)
-        source_network.train()
-        source_network.requires_grad_(True)
+        try:
+            source_network(copy)
+        finally:
+            for module, was_training in modes:
+                module.training = was_training
 
     next_theta: Tensor = copy["qr_action_value"]
     assert isinstance(next_theta, Tensor)
@@ -183,6 +191,8 @@ def compute_td_error(
     discount_factor: float,
     kappa: float,
 ) -> None:
+    if not math.isfinite(kappa) or kappa < 0:
+        raise ValueError("kappa must be a finite non-negative value.")
     batch_size = int(data.batch_size[0])
 
     a_star = _get_a_star(source_network, data)
@@ -210,10 +220,10 @@ def compute_td_error(
         batch_size=data.batch_size,
         device=data.device,
     )
-    if target_network is None:
-        source_network(_copy)
-    else:
-        with torch.no_grad():
+    with torch.no_grad():
+        if target_network is None:
+            source_network(_copy)
+        else:
             assert not target_network.training
             target_network(_copy)
     data["next", "qr_action_value"] = _copy["qr_action_value"]
@@ -266,11 +276,11 @@ def compute_td_error(
     assert done.dim() == 1
     assert done.size(0) == batch_size
 
-    tau_theta = torch.where(
-        done.unsqueeze(1),
-        reward.unsqueeze(1),
-        reward.unsqueeze(1)
-        + discount_factor * next_theta[torch.arange(batch_size), a_star],
+    tau_theta = compute_td_target(
+        reward,
+        next_theta[torch.arange(batch_size), a_star],
+        done,
+        data.get(("next", "discount"), discount_factor),
     )
     assert tau_theta.dim() == 2
     assert tau_theta.size(0) == batch_size
@@ -282,11 +292,15 @@ def compute_td_error(
     assert u.size(1) == num_qr_intervals
     assert u.size(2) == num_qr_intervals
 
-    lu = torch.where(
-        torch.abs(u) <= kappa,
-        0.5 * (u**2.0),
-        kappa * (torch.abs(u) - 0.5 * kappa),
-    )
+    # QR-DQN defines kappa=0 as ordinary (pinball) quantile regression.
+    if kappa == 0:
+        lu = torch.abs(u)
+    else:
+        lu = torch.where(
+            torch.abs(u) <= kappa,
+            0.5 * (u**2.0),
+            kappa * (torch.abs(u) - 0.5 * kappa),
+        )
 
     factor_i = torch.arange(
         0.5 / num_qr_intervals,

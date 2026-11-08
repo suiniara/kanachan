@@ -6,6 +6,7 @@
 #include <boost/python/import.hpp>
 #include <boost/python/dict.hpp>
 #include <boost/python/list.hpp>
+#include <boost/python/tuple.hpp>
 #include <vector>
 #include <functional>
 #include <cstdint>
@@ -53,6 +54,20 @@ void GameLog::onEndOfGame(std::array<std::int_fast32_t, 4u> const &scores)
 void GameLog::setWithProposedModel(std::array<bool, 4u> const &with_proposed_model)
 {
   with_proposed_model_ = with_proposed_model;
+}
+
+void GameLog::setSimulationId(std::size_t const set_id, std::size_t const game_id)
+{
+  set_id_ = set_id;
+  game_id_ = game_id;
+}
+
+python::dict GameLog::getMetadata() const
+{
+  python::dict result;
+  result["set_id"] = set_id_;
+  result["game_id"] = game_id_;
+  return result;
 }
 
 python::list GameLog::getResult() const
@@ -107,7 +122,13 @@ python::dict GameLog::getEpisode(std::uint_fast8_t const seat) const
   python::dict result;
   python::list episode;
   result["proposed"] = with_proposed_model_[seat];
-  result["episode"] = torch.attr("stack")(data_[seat]);
+  if (python::len(data_[seat]) == 0) {
+    result["episode"] = python::import("tensordict").attr("TensorDict")(
+      python::dict(), python::make_tuple(0));
+  }
+  else {
+    result["episode"] = torch.attr("stack")(data_[seat]);
+  }
   result["scores"] = python::list();
   for (std::uint_fast8_t i = 0u; i < 4u; ++i) {
     result["scores"].attr("append")(game_scores_[i]);

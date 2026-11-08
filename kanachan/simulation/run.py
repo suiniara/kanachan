@@ -4,13 +4,17 @@ import re
 import datetime
 from pathlib import Path
 from argparse import ArgumentParser, Namespace
-from typing import Any, Callable, Final
+from typing import Any
 import sys
+import json
+import secrets
+import os
 from tqdm import tqdm
 import torch
-from torch import backends
+import yaml
 from kanachan.model_loader import load_model
-from kanachan.simulation import simulate
+from kanachan.simulation.statistics import summarize
+from kanachan.training.online.state import file_digest
 
 
 def _parse_arguments() -> Namespace:
@@ -90,20 +94,40 @@ def _parse_arguments() -> Namespace:
     )
     parser.add_argument("--batch-size", default=1, type=int, metavar="N_BATCH")
     parser.add_argument("--concurrency", type=int, metavar="N_THREADS")
+    parser.add_argument("--seed", type=int, help="uint64 seed for walls and seats")
+    parser.add_argument("--output", type=Path, help="save games, seed, hashes and statistics as JSON")
+    parser.add_argument("--bootstrap-samples", type=int, default=2000)
+    parser.add_argument("--confidence", type=float, default=0.95)
+    parser.add_argument("--torch-threads", type=int, default=2)
+    parser.add_argument("--compile", action="store_true", help="enable TorchInductor (requires a working compiler)")
 
     return parser.parse_args()
 
 
 def _main():
+    from kanachan.simulation import simulate
+
     config = _parse_arguments()
+    if config.torch_threads < 1:
+        raise ValueError("--torch-threads must be positive.")
+    torch.set_num_threads(config.torch_threads)
+    from torch._dynamo import config as dynamo_config
+
+    dynamo_config.disable = not config.compile or os.environ.get("TORCHDYNAMO_DISABLE") == "1"
+    if config.seed is None:
+        config.seed = secrets.randbits(63)
+    if not 0 <= config.seed < 2**64:
+        raise ValueError("--seed must be in [0, 2**64).")
+    if config.bootstrap_samples < 100 or not 0 < config.confidence < 1:
+        raise ValueError("Invalid bootstrap sample count or confidence level.")
 
     if config.device is not None:
-        match = re.search("^(cpu|cuda\\d*)$", config.device)
+        match = re.fullmatch(r"cpu|cuda(?::[0-9]+)?", config.device)
         if match is None:
             msg = f"{config.device}: invalid device"
             raise RuntimeError(msg)
         device = torch.device(config.device)
-    elif backends.cuda.is_built():
+    elif torch.cuda.is_available():
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
@@ -224,11 +248,14 @@ def _main():
             config.batch_size,
             config.concurrency,
             lambda: progress.update(1),
+            seed=config.seed,
         )
     game_results: list[list[dict[str, Any]]] = []
+    metadata = []
     for game_log in game_logs:
         game_result = game_log.get_result()
         game_results.append(game_result)
+        metadata.append(game_log.get_metadata())
 
     elapsed_time = datetime.datetime.now() - start_time
     if config.non_duplicated:
@@ -243,199 +270,27 @@ def _main():
             f"Elapsed time: {elapsed_time} ({elapsed_time / (config.n * 4.0)}/game)"
         )
 
-    num_games = len(game_results)
-
-    def get_grading_point(ranking: int, score: int) -> int:
-        return [125, 60, -5, -255][ranking] + (score - 25000) // 1000
-
-    def get_soul_point(ranking: int, _: int) -> float:
-        return [0.5, 0.2, -0.2, -0.5][ranking]
-
-    Statistic = tuple[float, float]
-
-    def get_statistic(
-        game_results: list[list[dict[str, Any]]],
-        proposed: int,
-        callback: Callable[[int, int], float],
-    ) -> Statistic:  # type: ignore
-        assert proposed in (0, 1)
-        average = 0.0
-        num_proposed = 0
-        for game_result in game_results:
-            assert len(game_result) == 4
-            for i in range(4):
-                ranking = game_result[i]["ranking"]
-                assert isinstance(ranking, int)
-                score = int(game_result[i]["score"])
-                assert isinstance(score, int)
-                if game_result[i]["proposed"] == proposed:
-                    average += callback(ranking, score)
-                    num_proposed += 1
-        assert num_proposed >= 1
-        average /= num_proposed
-
-        variance = 0.0
-        num_proposed = 0
-        for game_result in game_results:
-            assert len(game_result) == 4
-            for i in range(4):
-                ranking = game_result[i]["ranking"]
-                assert isinstance(ranking, int)
-                score = game_result[i]["score"]
-                assert isinstance(score, int)
-                if game_result[i]["proposed"] == proposed:
-                    variance += (callback(ranking, score) - average) ** 2.0
-                    num_proposed += 1
-        assert num_proposed >= 1
-        # Unbiased sample variance.
-        variance /= num_proposed - 1
-
-        return average, variance
-
-    Statistics: Final = tuple[
-        Statistic, Statistic, Statistic, Statistic, Statistic
-    ]
-
-    def get_statistics(
-        game_results: list[list[dict[str, Any]]], proposed: int
-    ) -> Statistics:  # type: ignore
-        ranking_statistic = get_statistic(
-            game_results, proposed, lambda r, s: r
-        )
-        grading_point_statistic = get_statistic(
-            game_results, proposed, get_grading_point
-        )
-        soul_point_statistic = get_statistic(
-            game_results, proposed, get_soul_point
-        )
-
-        top_rate = 0.0
-        num_proposed = 0
-        for game_result in game_results:
-            assert len(game_result) == 4
-            for i in range(4):
-                if game_result[i]["proposed"] == proposed:
-                    num_proposed += 1
-                    if game_result[i]["ranking"] == 0:
-                        top_rate += 1.0
-        top_rate /= num_proposed
-        # Unbiased sample variance.
-        top_rate_variance = top_rate * (1.0 - top_rate) / (num_proposed - 1)
-
-        quinella_rate = 0.0
-        num_proposed = 0
-        for game_result in game_results:
-            assert len(game_result) == 4
-            for i in range(4):
-                if game_result[i]["proposed"] == proposed:
-                    num_proposed += 1
-                    if game_result[i]["ranking"] <= 1:
-                        quinella_rate += 1.0
-        quinella_rate /= num_proposed
-        # Unbiased sample variance.
-        quinella_rate_variance = (
-            quinella_rate * (1.0 - quinella_rate) / (num_proposed - 1)
-        )
-
-        return (
-            ranking_statistic,
-            grading_point_statistic,
-            soul_point_statistic,
-            (top_rate, top_rate_variance),
-            (quinella_rate, quinella_rate_variance),
-        )
-
-    baseline_statistics = get_statistics(game_results, 0)
-    proposed_statistics = get_statistics(game_results, 1)
-
-    ranking_diff_average = 0.0
-    for game_result in game_results:
-        assert len(game_result) == 4
-        num_baseline = 0
-        baseline_ranking = 0.0
-        num_proposed = 0
-        proposed_ranking = 0.0
-        for i in range(4):
-            ranking = game_result[i]["ranking"]
-            if game_result[i]["proposed"]:
-                num_baseline += 1
-                baseline_ranking += ranking
-            else:
-                num_proposed += 1
-                proposed_ranking += ranking
-        assert num_baseline >= 1
-        assert num_proposed >= 1
-        baseline_ranking /= num_baseline
-        proposed_ranking /= num_proposed
-        diff = proposed_ranking - baseline_ranking
-        ranking_diff_average += diff
-    ranking_diff_average /= num_games
-
-    ranking_diff_variance = 0.0
-    for game_result in game_results:
-        assert len(game_result) == 4
-        num_baseline = 0
-        baseline_ranking = 0.0
-        num_proposed = 0
-        proposed_ranking = 0.0
-        for i in range(4):
-            ranking = game_result[i]["ranking"]
-            if game_result[i]["proposed"]:
-                num_baseline += 1
-                baseline_ranking += ranking
-            else:
-                num_proposed += 1
-                proposed_ranking += ranking
-        assert num_baseline >= 1
-        assert num_proposed >= 1
-        baseline_ranking /= num_baseline
-        proposed_ranking /= num_proposed
-        diff = proposed_ranking - baseline_ranking
-        ranking_diff_variance += (diff - ranking_diff_average) ** 2.0
-    # Unbiased sample variance.
-    ranking_diff_variance /= num_games - 1
-
-    print(
-        f"""---
-num_games: {num_games}
-baseline:
-  ranking:
-    average: {baseline_statistics[0][0] + 1.0}
-    variance: {baseline_statistics[0][1]}
-  grading_point:
-    average: {baseline_statistics[1][0]}
-    variance: {baseline_statistics[1][1]}
-  soul_point:
-    average: {baseline_statistics[2][0]}
-    variance: {baseline_statistics[2][1]}
-  top_rate:
-    average: {baseline_statistics[3][0]}
-    variance: {baseline_statistics[3][1]}
-  quinella_rate:
-    average: {baseline_statistics[4][0]}
-    variance: {baseline_statistics[4][1]}
-proposed:
-  ranking:
-    average: {proposed_statistics[0][0] + 1.0}
-    variance: {proposed_statistics[0][1]}
-  grading_point:
-    average: {proposed_statistics[1][0]}
-    variance: {proposed_statistics[1][1]}
-  soul_point:
-    average: {proposed_statistics[2][0]}
-    variance: {proposed_statistics[2][1]}
-  top_rate:
-    average: {proposed_statistics[3][0]}
-    variance: {proposed_statistics[3][1]}
-  quinella_rate:
-    average: {proposed_statistics[4][0]}
-    variance: {proposed_statistics[4][1]}
-difference:
-  ranking:
-    average: {ranking_diff_average}
-    variance: {ranking_diff_variance}
-"""
-    )
+    statistics = summarize(game_results, group_ids=[item["set_id"] for item in metadata],
+                           bootstrap_samples=config.bootstrap_samples,
+                           seed=config.seed, confidence=config.confidence)
+    if config.output is not None:
+        config.output.parent.mkdir(parents=True, exist_ok=True)
+        artifact = {
+            "format_version": 1, "seed": config.seed, "room": room,
+            "dongfengzhan": config.dongfengzhan, "simulation_mode": mode,
+            "sets": config.n, "device": str(device), "dtype": str(dtype),
+            "batch_size": config.batch_size, "concurrency": config.concurrency,
+            "baseline_model": str(config.baseline_model.resolve()),
+            "baseline_sha256": file_digest(config.baseline_model),
+            "proposed_model": str(config.proposed_model.resolve()),
+            "proposed_sha256": file_digest(config.proposed_model),
+            "baseline_grade": config.baseline_grade, "proposed_grade": config.proposed_grade,
+            "metadata": metadata, "results": game_results, "statistics": statistics,
+        }
+        temporary = config.output.with_name(config.output.name + ".tmp")
+        temporary.write_text(json.dumps(artifact, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        temporary.replace(config.output)
+    print(yaml.safe_dump({"seed": config.seed, **statistics}, sort_keys=False, explicit_start=True))
 
 
 if __name__ == "__main__":

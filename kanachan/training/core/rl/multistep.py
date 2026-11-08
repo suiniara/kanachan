@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import Tensor
 from tensordict import TensorDict  # type: ignore
@@ -14,9 +16,16 @@ from kanachan.constants import (
 )
 
 
+@torch.no_grad()
 def make_multistep(
     episodes: TensorDict, discount_factor: float, td_steps: int
 ) -> None:
+    """Collapse contiguous one-step transitions without crossing a terminal.
+
+    Only bootstrap observations advance. Round summaries and result labels
+    remain attached to the original transition. ``next.discount`` contains
+    gamma raised to the actual horizon, including a shortened final window.
+    """
     length = int(episodes.size(0))  # type: ignore
     sparse: Tensor = episodes["sparse"]
     assert sparse.dim() == 2
@@ -65,7 +74,7 @@ def make_multistep(
     assert done.size(0) == length
     assert done.dtype == torch.bool
 
-    if discount_factor < 0.0 or 1.0 < discount_factor:
+    if not math.isfinite(discount_factor) or not 0.0 <= discount_factor <= 1.0:
         errmsg = (
             f"{discount_factor}: `discount_factor` must be a real"
             " number within the range [0.0, 1.0]."
@@ -75,40 +84,37 @@ def make_multistep(
         errmsg = f"{td_steps}: `td_steps` must be a positive integer."
         raise ValueError(errmsg)
 
-    for t in range(length):
-        modified_reward = float(reward[t].item())
-        _done = False
-        if done[t].item():
-            _done = True
-        else:
-            _discount_factor = discount_factor
-            for tt in range(1, td_steps):
-                modified_reward += _discount_factor * reward[t + tt].item()
-                if done[t + tt].item():
-                    _done = True
-                    break
-                _discount_factor *= discount_factor
+    source = episodes["next"].detach().clone()
+    reward = source["reward"]
+    done = source["done"]
+    positions = torch.arange(length, device=reward.device)
+    endpoints = positions.clone()
+    active = torch.ones_like(done)
+    accumulated = torch.zeros_like(reward)
+    steps = torch.zeros_like(positions)
+    coefficient = 1.0
+    for offset in range(min(td_steps, length)):
+        indices = positions + offset
+        valid = active & (indices < length)
+        indices = indices.clamp(max=length - 1)
+        if coefficient != 0.0:
+            accumulated += coefficient * reward[indices].masked_fill(~valid, 0.0)
+        endpoints = torch.where(valid, indices, endpoints)
+        steps += valid.to(steps.dtype)
+        active = valid & ~done[indices]
+        coefficient *= discount_factor
 
-        _round_summary: Tensor = round_summary[t].detach().clone()
-        _results: Tensor = results[t].detach().clone()
-        _end_of_round = bool(end_of_round[t].item())
-        _end_of_game = bool(end_of_game[t].item())
-        if t + td_steps - 1 < length:
-            episodes["next"][t] = episodes["next"][t + td_steps - 1]
-        episodes["next", "round_summary"][t] = _round_summary
-        episodes["next", "results"][t] = _results
-        episodes["next", "end_of_round"][t] = _end_of_round
-        episodes["next", "end_of_game"][t] = _end_of_game
-        if _done:
-            episodes["next", "sparse"][t] = torch.full_like(
-                sparse[t], NUM_TYPES_OF_SPARSE_FEATURES
-            )
-            episodes["next", "numeric"][t] = torch.zeros_like(numeric[t])
-            episodes["next", "progression"][t] = torch.full_like(
-                progression[t], NUM_TYPES_OF_PROGRESSION_FEATURES
-            )
-            episodes["next", "candidates"][t] = torch.full_like(
-                candidates[t], NUM_TYPES_OF_ACTIONS
-            )
-            episodes["next", "reward"][t] = modified_reward
-            episodes["next", "done"][t] = _done
+    terminal = done[endpoints]
+    padding = {
+        "sparse": NUM_TYPES_OF_SPARSE_FEATURES,
+        "numeric": 0,
+        "progression": NUM_TYPES_OF_PROGRESSION_FEATURES,
+        "candidates": NUM_TYPES_OF_ACTIONS,
+    }
+    for key, pad_value in padding.items():
+        observation = source[key][endpoints].clone()
+        episodes["next", key] = observation.masked_fill(terminal.unsqueeze(1), pad_value)
+    episodes["next", "reward"] = accumulated
+    episodes["next", "done"] = terminal
+    episodes["next", "steps_to_next_obs"] = steps
+    episodes["next", "discount"] = torch.full_like(reward, discount_factor).pow(steps)

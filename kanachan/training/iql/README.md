@@ -2,6 +2,10 @@
 
 A training program with [IQL](https://arxiv.org/abs/2110.06169).
 
+For the dense decision decoder, BC feature transfer, exported V, existing AWR
+policy extraction and optional final-rank supervision, see
+[the decision IQL guide](decision-decoder.md).
+
 ## Prerequisits
 
 The following items are required to run the programs in this directory:

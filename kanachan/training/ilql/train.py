@@ -7,7 +7,7 @@ from pathlib import Path
 import os
 import logging
 import sys
-from typing import Callable, Any
+from typing import Any
 from omegaconf import DictConfig
 import hydra
 from hydra.core.hydra_config import HydraConfig
@@ -30,12 +30,25 @@ from tensordict.nn import TensorDictModule, TensorDictSequential  # type: ignore
 from kanachan.constants import MAX_NUM_ACTION_CANDIDATES
 from kanachan.training.common import (
     get_distributed_environment,
-    is_gradient_nan,
+    average_tensor,
+    with_last,
+    rescale_gradients,
+    is_gradient_nonfinite,
+    backoff_gradient_scale,
     get_gradient,
 )
-import kanachan.training.ilql.config  # pylint: disable=unused-import
+import kanachan.training.ilql.config  # pylint: disable=unused-import  # noqa: F401
 from kanachan.training.core.offline_rl import DataLoader, EpisodeReplayBuffer
+from kanachan.training.core.checkpoint import (
+    SnapshotWriter,
+    TrainingState,
+    load_training_state,
+    save_training_state,
+)
+from kanachan.training.core.progress import TrainingProgress
+from kanachan.training.core.optimizers import move_optimizer_state, consolidate_optimizer_state
 from kanachan.nn import Encoder, Decoder, TwinQActor
+from kanachan.nn.functional import compute_td_target
 from kanachan.model_loader import dump_object, dump_model
 import kanachan.training.core.config as _config
 
@@ -68,7 +81,7 @@ def _get_q_target(
 
     q_batch_mean = q_target.detach().clone().mean()
     if world_size >= 2:
-        all_reduce(q_batch_mean, ReduceOp.AVG)
+        average_tensor(q_batch_mean)
 
     return q_target, q_batch_mean.item()
 
@@ -88,6 +101,7 @@ def _backward(
     gradient_accumulation_steps: int,
     grad_scaler: GradScaler,
     q_target: Tensor,
+    sample_weight: float = 1.0,
 ) -> BackwardResult:
     batch_size = int(data.batch_size[0])
 
@@ -118,13 +132,13 @@ def _backward(
 
     v_batch_mean = v.detach().clone().mean()
     if world_size >= 2:
-        all_reduce(v_batch_mean, ReduceOp.AVG)
+        average_tensor(v_batch_mean)
 
     _copy: TensorDict = data["next"]  # type: ignore
     assert isinstance(_copy, TensorDict)
     _copy = _copy.copy()
     _copy = _copy.detach()
-    with torch.autocast(**autocast_kwargs):
+    with torch.no_grad(), torch.autocast(**autocast_kwargs):
         source_model(_copy)
 
     vv: Tensor = _copy["state_value"]
@@ -137,14 +151,15 @@ def _backward(
     assert done.dim() == 1
     assert done.size(0) == batch_size
 
-    vv = torch.where(done, torch.zeros_like(vv), vv)
-
     reward: Tensor = _copy["reward"]
     assert isinstance(reward, Tensor)
     assert reward.dim() == 1
     assert reward.size(0) == batch_size
 
-    q_loss = torch.square(reward + discount_factor * vv - q)
+    target = compute_td_target(
+        reward, vv, done, data.get(("next", "discount"), discount_factor)
+    )
+    q_loss = torch.square(target - q)
     q_loss = torch.mean(q_loss)
 
     v_loss = q_target - v
@@ -159,12 +174,12 @@ def _backward(
 
     qv_batch_loss = qv_loss.detach().clone().mean()
     if world_size >= 2:
-        all_reduce(qv_batch_loss, ReduceOp.AVG)
+        average_tensor(qv_batch_loss)
 
-    if math.isnan(qv_loss.item()):
-        raise RuntimeError("QV loss becomes NaN.")
+    if not math.isfinite(qv_loss.item()):
+        raise RuntimeError("QV loss becomes non-finite.")
 
-    qv_loss /= gradient_accumulation_steps
+    qv_loss *= sample_weight / gradient_accumulation_steps
     grad_scaler.scale(qv_loss).backward()  # type: ignore
 
     return q_loss, v_loss, v_batch_mean.item(), qv_batch_loss.item()
@@ -178,23 +193,19 @@ def _step(
     optimizer: Optimizer,
     scheduler: LRScheduler | None,
 ) -> float:
-    grad_scaler.unscale_(optimizer)
     qv_gradient = get_gradient(source_model)
     # pylint: disable=not-callable
     qv_gradient_norm = float(torch.linalg.vector_norm(qv_gradient).item())
     nn.utils.clip_grad_norm_(
         source_model.parameters(),
         max_gradient_norm,
-        error_if_nonfinite=False,
+        error_if_nonfinite=True,
     )
     grad_scaler.step(optimizer)
     if scheduler is not None:
         scheduler.step()
 
     return qv_gradient_norm
-
-
-SnapshotWriter = Callable[[int | None], None]
 
 
 def _train(
@@ -230,10 +241,15 @@ def _train(
     num_samples: int,
     summary_writer: SummaryWriter,
     snapshot_writer: SnapshotWriter,
+    initial_optimizer_steps: int = 0,
+    initial_grad_scaler_state: dict | None = None,
 ) -> None:
     start_time = datetime.datetime.now()
 
-    world_size, _, local_rank = get_distributed_environment()
+    move_optimizer_state(optimizer1)
+    move_optimizer_state(optimizer2)
+
+    world_size, rank, local_rank = get_distributed_environment()
 
     # Load the reward plugin.
     with open(reward_plugin, encoding="UTF-8") as file_pointer:
@@ -274,18 +290,34 @@ def _train(
     if snapshot_interval > 0:
         last_snapshot = num_samples
 
-    is_amp_enabled = device != "cpu" and dtype != amp_dtype
+    is_amp_enabled = device.type == "cuda" and dtype != amp_dtype
     autocast_kwargs: dict[str, Any] = {
         "device_type": device.type,
         "dtype": amp_dtype,
         "enabled": is_amp_enabled,
+        # Reusing a source model under no_grad can cache detached AMP weights.
+        "cache_enabled": False,
     }
     grad_scaler = GradScaler("cuda", enabled=is_amp_enabled)
+    if initial_grad_scaler_state is not None and grad_scaler.is_enabled():
+        grad_scaler.load_state_dict(initial_grad_scaler_state)
 
     batch_count = 0
+    pending_samples = 0
+    epoch_start_samples = num_samples
+    configured_batch_size = batch_size
+    progress = TrainingProgress(
+        summary_writer,
+        batch_size,
+        gradient_accumulation_steps,
+        target_update_interval if double_q_learning else None,
+        target_update_rate,
+        initial_optimizer_steps=initial_optimizer_steps,
+    )
 
-    for data in data_loader:
+    for data, is_last in with_last(data_loader):
         data = data.to(device=device)
+        local_batch_size = int(data.size(0))
 
         # Compute the Q target value.
         with torch.no_grad(), torch.autocast(**autocast_kwargs):
@@ -314,6 +346,7 @@ def _train(
             gradient_accumulation_steps=gradient_accumulation_steps,
             grad_scaler=grad_scaler,
             q_target=q_target,
+            sample_weight=local_batch_size / configured_batch_size,
         )
 
         # Backprop for the QV2 source model.
@@ -328,26 +361,40 @@ def _train(
             gradient_accumulation_steps=gradient_accumulation_steps,
             grad_scaler=grad_scaler,
             q_target=q_target,
+            sample_weight=local_batch_size / configured_batch_size,
         )
 
-        num_samples += batch_size * world_size
+        num_samples += local_batch_size * world_size
+        pending_samples += local_batch_size * world_size
         batch_count += 1
 
-        if batch_count % gradient_accumulation_steps == 0:
-            is_grad_nan = is_gradient_nan(source1_model) or is_gradient_nan(
-                source2_model
+        if batch_count % gradient_accumulation_steps == 0 or is_last:
+            normalization = (
+                configured_batch_size * world_size * gradient_accumulation_steps
+                / pending_samples
             )
-            is_grad_nan = torch.where(
-                is_grad_nan,
-                torch.ones_like(is_grad_nan),
-                torch.zeros_like(is_grad_nan),
+            rescale_gradients(source1_model, normalization)
+            rescale_gradients(source2_model, normalization)
+            pending_samples = 0
+            grad_scaler.unscale_(optimizer1)
+            grad_scaler.unscale_(optimizer2)
+            is_grad_nonfinite = is_gradient_nonfinite(
+                source1_model
+            ) or is_gradient_nonfinite(source2_model)
+            is_grad_nonfinite = torch.where(
+                is_grad_nonfinite,
+                torch.ones_like(is_grad_nonfinite),
+                torch.zeros_like(is_grad_nonfinite),
             )
-            all_reduce(is_grad_nan)
-            if is_grad_nan.item() >= 1:
-                if local_rank == 0:
+            if world_size >= 2:
+                all_reduce(is_grad_nonfinite)
+            if is_grad_nonfinite.item() >= 1:
+                if rank == 0:
                     logging.warning(
-                        "Skip an optimization step because of NaN in the gradient."
+                        "Skip an optimization step because of non-finite "
+                        "values in the gradient."
                     )
+                backoff_gradient_scale(grad_scaler)
                 optimizer1.zero_grad()
                 optimizer2.zero_grad()
                 continue
@@ -367,14 +414,14 @@ def _train(
                 scheduler=lr_scheduler2,
             )
             grad_scaler.update()
+            progress.optimizer_step(num_samples)
 
             optimizer1.zero_grad()
             optimizer2.zero_grad()
 
             if (
                 double_q_learning
-                and batch_count
-                % (gradient_accumulation_steps * target_update_interval)
+                and progress.total_optimizer_steps % target_update_interval
                 == 0
             ):
                 with torch.no_grad():
@@ -395,7 +442,9 @@ def _train(
                             target_update_rate * _param.data.detach().clone()
                         )
 
-            if local_rank == 0:
+                progress.target_update(num_samples)
+
+            if rank == 0:
                 logging.info(
                     "sample = %s, QV1 loss = %s, QV2 loss = %s, "
                     "QV1 gradient norm = %s, QV2 gradient norm = %s",
@@ -442,7 +491,7 @@ def _train(
                         num_samples,
                     )
         else:
-            if local_rank == 0:
+            if rank == 0:
                 logging.info(
                     "sample = %s, QV1 loss = %s, QV2 loss = %s",
                     num_samples,
@@ -476,21 +525,40 @@ def _train(
                 )
 
         if (
-            local_rank == 0
-            and last_snapshot is not None
+            last_snapshot is not None
             and num_samples - last_snapshot >= snapshot_interval
+            and pending_samples == 0
+            and (
+                num_workers <= 1
+                or (num_samples - epoch_start_samples)
+                % (configured_batch_size * world_size * num_workers)
+                == 0
+            )
         ):
-            snapshot_writer(num_samples)
+            consolidate_optimizer_state(optimizer1, optimizer2)
+            if rank == 0:
+                snapshot_writer(
+                    num_samples, optimizer_steps=progress.total_optimizer_steps,
+                    grad_scaler_state=grad_scaler.state_dict() if grad_scaler.is_enabled() else None,
+                )
             last_snapshot = num_samples
 
+    progress.finish(0)
     elapsed_time = datetime.datetime.now() - start_time
+    consolidate_optimizer_state(optimizer1, optimizer2)
 
-    if local_rank == 0:
+    if rank == 0:
         logging.info(
             "A training has finished (elapsed time = %s).",
             elapsed_time,
         )
-        snapshot_writer(None)
+        snapshot_writer(
+            None,
+            resume_num_samples=num_samples - pending_samples,
+            optimizer_steps=progress.total_optimizer_steps,
+            cursor_is_exact=(num_workers <= 1 or pending_samples == 0),
+            grad_scaler_state=grad_scaler.state_dict() if grad_scaler.is_enabled() else None,
+        )
 
 
 @hydra.main(version_base=None, config_name="config")
@@ -556,30 +624,10 @@ def _main(config: DictConfig) -> None:
         )
         raise RuntimeError(errmsg)
 
-    if device.type == "cpu":
-        if config.num_workers is None:
-            config.num_workers = 0
-        if config.num_workers < 0:
-            errmsg = f"{config.num_workers}: An invalid number of workers."
-            raise RuntimeError(errmsg)
-        if config.num_workers > 0:
-            errmsg = (
-                f"{config.num_workers}: An invalid number of workers"
-                " for CPU."
-            )
-            raise RuntimeError(errmsg)
-    else:
-        assert device.type == "cuda"
-        if config.num_workers is None:
-            config.num_workers = 2
-        if config.num_workers < 0:
-            errmsg = f"{config.num_workers}: An invalid number of workers."
-            raise RuntimeError(errmsg)
-        if config.num_workers == 0:
-            errmsg = (
-                f"{config.num_workers}: An invalid number of workers for GPU."
-            )
-            raise RuntimeError(errmsg)
+    if config.num_workers is None:
+        config.num_workers = 0 if device.type == "cpu" else 2
+    if config.num_workers < 0:
+        raise RuntimeError("num_workers must be a non-negative integer.")
 
     if config.replay_buffer_size < 0:
         errmsg = (
@@ -591,9 +639,19 @@ def _main(config: DictConfig) -> None:
         errmsg = "Use `replay_buffer_size` for `contiguous_training_data`."
         raise RuntimeError(errmsg)
 
-    _config.encoder.validate(config)
+    _config.encoder.validate(config.encoder)
 
-    _config.decoder.validate(config)
+    _config.decoder.validate(config.decoder, config.encoder.dimension)
+
+    if config.initial_model_prefix is not None and config.decoder.load_from is not None:
+        raise RuntimeError("initial_model_prefix conflicts with decoder.load_from.")
+
+    if config.decoder.load_from is not None:
+        raise RuntimeError(
+            "decoder.load_from is not supported for separate Q/V heads. "
+            "Use encoder.load_from for BC features, then initialize the AWR "
+            "policy with the BC encoder and decoder when extracting a policy."
+        )
 
     if config.initial_model_prefix is not None:
         if config.encoder.load_from is not None:
@@ -623,6 +681,8 @@ def _main(config: DictConfig) -> None:
             raise RuntimeError(errmsg)
 
     num_samples = 0
+    initial_optimizer_steps = 0
+    initial_grad_scaler_state = None
     source1_encoder_snapshot_path: Path | None = None
     source1_q_decoder_snapshot_path: Path | None = None
     source1_v_decoder_snapshot_path: Path | None = None
@@ -670,6 +730,25 @@ def _main(config: DictConfig) -> None:
         else:
             num_samples = config.initial_model_index
             infix = f".{num_samples}"
+
+        training_state = load_training_state(
+            config.initial_model_prefix,
+            infix,
+            num_samples,
+            restart_data=config.optimizer.initialize,
+            start_new_epoch=config.start_new_epoch,
+        )
+        num_samples = training_state.num_samples
+        initial_optimizer_steps = training_state.optimizer_steps
+        initial_grad_scaler_state = training_state.grad_scaler_state
+        if config.replay_buffer_size > 0 and num_samples > 0:
+            if not config.optimizer.initialize:
+                raise RuntimeError(
+                    "Replay checkpoints do not store the shuffle buffer. "
+                    "Use optimizer.initialize=true to reuse the weights and restart the data."
+                )
+            num_samples = 0
+            initial_optimizer_steps = 0
 
         source1_encoder_snapshot_path = (
             config.initial_model_prefix / f"source1-encoder{infix}.pth"
@@ -828,7 +907,10 @@ def _main(config: DictConfig) -> None:
             config.initial_model_prefix / f"lr-scheduler1{infix}.pth"
         )
         assert lr_scheduler1_snapshot_path is not None
-        if optimizer1_snapshot_path is None:
+        if optimizer1_snapshot_path is None or (
+            config.optimizer.warmup_steps == 0
+            and config.optimizer.annealing_steps == 0
+        ):
             lr_scheduler1_snapshot_path = None
         else:
             if not lr_scheduler1_snapshot_path.exists():
@@ -842,7 +924,10 @@ def _main(config: DictConfig) -> None:
             config.initial_model_prefix / f"lr-scheduler2{infix}.pth"
         )
         assert lr_scheduler2_snapshot_path is not None
-        if optimizer2_snapshot_path is None:
+        if optimizer2_snapshot_path is None or (
+            config.optimizer.warmup_steps == 0
+            and config.optimizer.annealing_steps == 0
+        ):
             lr_scheduler2_snapshot_path = None
         else:
             if not lr_scheduler2_snapshot_path.exists():
@@ -859,7 +944,7 @@ def _main(config: DictConfig) -> None:
         errmsg = f"{config.reward_plugin}: Not a file."
         raise RuntimeError(errmsg)
 
-    if config.discount_factor <= 0.0 or 1.0 < config.discount_factor:
+    if not math.isfinite(config.discount_factor) or not 0.0 <= config.discount_factor <= 1.0:
         errmsg = (
             f"{config.discount_factor}: An invalid value for"
             " `discount_factor`."
@@ -901,7 +986,7 @@ def _main(config: DictConfig) -> None:
         )
         raise RuntimeError(errmsg)
 
-    _config.optimizer.validate(config)
+    _config.optimizer.validate(config.optimizer)
 
     if config.double_q_learning:
         if config.target_update_interval <= 0:
@@ -943,7 +1028,7 @@ def _main(config: DictConfig) -> None:
 
     output_prefix = Path(HydraConfig.get().runtime.output_dir)
 
-    if local_rank == 0:
+    if rank == 0:
         logging.info("Model type: implicit Q-learning (IQL)")
 
         _config.device.dump(
@@ -977,9 +1062,9 @@ def _main(config: DictConfig) -> None:
         if config.replay_buffer_size > 0:
             logging.info("Replay buffer size: %d", config.replay_buffer_size)
 
-        _config.encoder.dump(config)
+        _config.encoder.dump(config.encoder)
 
-        _config.decoder.dump(config)
+        _config.decoder.dump(config.decoder)
 
         if config.initial_model_prefix is not None:
             logging.info(
@@ -1009,7 +1094,7 @@ def _main(config: DictConfig) -> None:
             config.max_gradient_norm,
         )
 
-        _config.optimizer.dump(config)
+        _config.optimizer.dump(config.optimizer)
 
         if config.double_q_learning:
             logging.info(
@@ -1094,7 +1179,7 @@ def _main(config: DictConfig) -> None:
             logging.info("Snapshot interval: %d", config.snapshot_interval)
 
     if world_size >= 2:
-        init_process_group(backend="nccl")
+        init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
 
     source1_encoder = Encoder(
         position_encoder=config.encoder.position_encoder,
@@ -1104,6 +1189,7 @@ def _main(config: DictConfig) -> None:
         activation_function=config.encoder.activation_function,
         dropout=config.encoder.dropout,
         layer_normalization=config.encoder.layer_normalization,
+        architecture=config.encoder.architecture,
         num_layers=config.encoder.num_layers,
         checkpointing=config.checkpointing,
         device=torch.device("cpu"),
@@ -1126,9 +1212,7 @@ def _main(config: DictConfig) -> None:
         device=torch.device("cpu"),
         dtype=dtype,
     )
-    with torch.no_grad():
-        for _param in source1_q_decoder.parameters():
-            _param.zero_()
+    source1_q_decoder.zero_output()
     source1_q_decoder_tdm = TensorDictModule(
         source1_q_decoder,
         in_keys=["encode"],  # type: ignore
@@ -1146,9 +1230,7 @@ def _main(config: DictConfig) -> None:
         device=torch.device("cpu"),
         dtype=dtype,
     )
-    with torch.no_grad():
-        for _param in source1_v_decoder.parameters():
-            _param.zero_()
+    source1_v_decoder.zero_output()
     source1_v_decoder_tdm = TensorDictModule(
         source1_v_decoder,
         in_keys=["encode"],  # type: ignore
@@ -1173,6 +1255,7 @@ def _main(config: DictConfig) -> None:
         activation_function=config.encoder.activation_function,
         dropout=config.encoder.dropout,
         layer_normalization=config.encoder.layer_normalization,
+        architecture=config.encoder.architecture,
         num_layers=config.encoder.num_layers,
         checkpointing=config.checkpointing,
         device=torch.device("cpu"),
@@ -1195,9 +1278,7 @@ def _main(config: DictConfig) -> None:
         device=torch.device("cpu"),
         dtype=dtype,
     )
-    with torch.no_grad():
-        for _param in source2_q_decoder.parameters():
-            _param.zero_()
+    source2_q_decoder.zero_output()
     source2_q_decoder_tdm = TensorDictModule(
         source2_q_decoder,
         in_keys=["encode"],  # type: ignore
@@ -1215,9 +1296,7 @@ def _main(config: DictConfig) -> None:
         device=torch.device("cpu"),
         dtype=dtype,
     )
-    with torch.no_grad():
-        for _param in source2_v_decoder.parameters():
-            _param.zero_()
+    source2_v_decoder.zero_output()
     source2_v_decoder_tdm = TensorDictModule(
         source2_v_decoder,
         in_keys=["encode"],  # type: ignore
@@ -1243,6 +1322,7 @@ def _main(config: DictConfig) -> None:
             activation_function=config.encoder.activation_function,
             dropout=config.encoder.dropout,
             layer_normalization=config.encoder.layer_normalization,
+            architecture=config.encoder.architecture,
             num_layers=config.encoder.num_layers,
             checkpointing=config.checkpointing,
             device=torch.device("cpu"),
@@ -1306,6 +1386,7 @@ def _main(config: DictConfig) -> None:
             activation_function=config.encoder.activation_function,
             dropout=config.encoder.dropout,
             layer_normalization=config.encoder.layer_normalization,
+            architecture=config.encoder.architecture,
             num_layers=config.encoder.num_layers,
             checkpointing=config.checkpointing,
             device=torch.device("cpu"),
@@ -1376,18 +1457,18 @@ def _main(config: DictConfig) -> None:
         target2_v_decoder_tdm = source2_v_decoder_tdm
         target2_model = source2_model
 
-    model_to_save = TwinQActor(target1_model, target2_model)
+    model_to_save = TwinQActor(target1_model, target2_model, return_values=True)
     model_to_save_tdm = TensorDictModule(
         model_to_save,
         in_keys=["sparse", "numeric", "progression", "candidates"],  # type: ignore
-        out_keys=["action"],  # type: ignore
+        out_keys=["action", "action_value"],  # type: ignore
     )
 
     optimizer1, lr_scheduler1 = _config.optimizer.create(
-        device.type, config, source1_model
+        device.type, config.optimizer, source1_model
     )
     optimizer2, lr_scheduler2 = _config.optimizer.create(
-        device.type, config, source2_model
+        device.type, config.optimizer, source2_model
     )
 
     if config.encoder.load_from is not None:
@@ -1513,8 +1594,6 @@ def _main(config: DictConfig) -> None:
             target2_v_decoder.load_state_dict(target2_v_decoder_state_dict)
 
         if optimizer1_snapshot_path is not None:
-            assert lr_scheduler1_snapshot_path is not None
-            assert lr_scheduler1 is not None
             optimizer1.load_state_dict(
                 torch.load(
                     optimizer1_snapshot_path,
@@ -1522,6 +1601,8 @@ def _main(config: DictConfig) -> None:
                     weights_only=True,
                 )
             )
+        if lr_scheduler1_snapshot_path is not None:
+            assert lr_scheduler1 is not None
             lr_scheduler1.load_state_dict(
                 torch.load(
                     lr_scheduler1_snapshot_path,
@@ -1531,8 +1612,6 @@ def _main(config: DictConfig) -> None:
             )
 
         if optimizer2_snapshot_path is not None:
-            assert lr_scheduler2_snapshot_path is not None
-            assert lr_scheduler2 is not None
             optimizer2.load_state_dict(
                 torch.load(
                     optimizer2_snapshot_path,
@@ -1540,6 +1619,8 @@ def _main(config: DictConfig) -> None:
                     weights_only=True,
                 )
             )
+        if lr_scheduler2_snapshot_path is not None:
+            assert lr_scheduler2 is not None
             lr_scheduler2.load_state_dict(
                 torch.load(
                     lr_scheduler2_snapshot_path,
@@ -1573,7 +1654,14 @@ def _main(config: DictConfig) -> None:
 
     snapshots_path = output_prefix / "snapshots"
 
-    def snapshot_writer(num_samples: int | None) -> None:
+    def snapshot_writer(
+        num_samples: int | None = None,
+        *,
+        resume_num_samples: int | None = None,
+        optimizer_steps: int = 0,
+        cursor_is_exact: bool = True,
+        grad_scaler_state: dict | None = None,
+    ) -> None:
         snapshots_path.mkdir(parents=True, exist_ok=True)
 
         infix = "" if num_samples is None else f".{num_samples}"
@@ -1673,6 +1761,7 @@ def _main(config: DictConfig) -> None:
                                                 "activation_function": config.encoder.activation_function,
                                                 "dropout": config.encoder.dropout,
                                                 "layer_normalization": config.encoder.layer_normalization,
+                                                "architecture": config.encoder.architecture,
                                                 "num_layers": config.encoder.num_layers,
                                                 "checkpointing": config.checkpointing,
                                                 "device": torch.device("cpu"),
@@ -1760,6 +1849,7 @@ def _main(config: DictConfig) -> None:
                                                 "activation_function": config.encoder.activation_function,
                                                 "dropout": config.encoder.dropout,
                                                 "layer_normalization": config.encoder.layer_normalization,
+                                                "architecture": config.encoder.architecture,
                                                 "num_layers": config.encoder.num_layers,
                                                 "checkpointing": config.checkpointing,
                                                 "device": torch.device("cpu"),
@@ -1831,15 +1921,32 @@ def _main(config: DictConfig) -> None:
                             {},
                         ),
                     ],
-                    {},
+                    {"return_values": True},
                 ),
             ],
             {
                 "in_keys": ["sparse", "numeric", "progression", "candidates"],
-                "out_keys": ["action"],
+                "out_keys": ["action", "action_value"],
             },
         )
         torch.save(state, snapshots_path / f"model{infix}.kanachan")
+
+        cursor = (
+            resume_num_samples
+            if resume_num_samples is not None
+            else num_samples
+        )
+        assert cursor is not None
+        save_training_state(
+            snapshots_path,
+            infix,
+            TrainingState(
+                cursor,
+                optimizer_steps,
+                cursor_is_exact and config.get("replay_buffer_size", 0) == 0,
+                grad_scaler_state,
+            ),
+        )
 
     tensorboard_path = output_prefix / "tensorboard"
     tensorboard_path.mkdir(parents=True, exist_ok=True)
@@ -1880,6 +1987,8 @@ def _main(config: DictConfig) -> None:
             lr_scheduler2=lr_scheduler2,
             snapshot_interval=config.snapshot_interval,
             num_samples=num_samples,
+            initial_optimizer_steps=initial_optimizer_steps,
+            initial_grad_scaler_state=initial_grad_scaler_state,
             summary_writer=summary_writer,
             snapshot_writer=snapshot_writer,
         )

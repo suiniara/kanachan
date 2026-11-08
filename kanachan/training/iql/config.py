@@ -23,10 +23,13 @@ class Config:
     replay_buffer_size: int = 0
     initial_model_prefix: Path | None = None
     initial_model_index: int | None = None
+    start_new_epoch: bool = False
     reward_plugin: Path = MISSING
+    bc_initial_model: Path | None = None
     double_q_learning: bool = True
     discount_factor: float = 0.99
     expectile: float = MISSING
+    final_rank_weight: float = 0.0
     checkpointing: bool = False
     batch_size: int = MISSING
     gradient_accumulation_steps: int = 1
@@ -46,3 +49,16 @@ class Config:
 
 config_store = ConfigStore.instance()
 config_store.store(name="config", node=Config)
+
+
+@dataclass
+class DecisionConfig(Config):
+    expectile: float = 0.7
+    discount_factor: float = 1.0
+    defaults: list[Any] = field(default_factory=lambda: [
+        {"device": "cuda"}, {"encoder": "decision_tiny"},
+        {"decoder": "global_actions"}, {"optimizer": "adamw"}, "_self_",
+    ])
+
+
+config_store.store(name="decision", node=DecisionConfig)

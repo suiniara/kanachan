@@ -6,7 +6,7 @@ add_library(common
   type_name.cpp)
 target_link_libraries(common
   PRIVATE protobuf
-  PRIVATE Boost::stacktrace_backtrace
+  PRIVATE ${KANACHAN_STACKTRACE_TARGET}
   PRIVATE Boost::headers)
 set_target_properties(common
   PROPERTIES

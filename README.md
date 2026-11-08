@@ -52,6 +52,11 @@ However, it goes without saying that such an end-to-end feature design requires 
 
 ## Components
 
+The dense Mahjong decision decoder and scalar discrete CQL recipe are
+documented in [decision-decoder.md](kanachan/training/decision-decoder.md).
+They retain the current feature vocabulary and native candidate-index
+interface; use `--config-name decision` in BC/CQL to select the new model.
+
 ### [prerequisites](prerequisites) (For developers only)
 
 Make various prerequisite packages and tools available for use in other components. This component is built and available as a [public Docker image](https://hub.docker.com/r/cryolite/kanachan.prerequisites), and implicitly used by other components. Therefore, there is no need for non-developers to build or directly use this component.
