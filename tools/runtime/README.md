@@ -92,3 +92,12 @@ the profiler gate to reject an executing CUDA kernel. The gate still requires
 a CUDA event with the Flex source name; it does not accept a CPU event or a
 generic Triton kernel. This changes verification names, not the training
 backend default. See [PyTorch's naming implementation](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/_inductor/utils.py).
+
+On the tested RTX 5090 / PyTorch 2.9.0+cu128 environment, the tiny profile
+passed CUDA output/gradient equivalence and the fused-kernel dispatch check.
+The medium BF16 profile failed the existing elementwise gradient gate for
+`type_embedding.weight`; that gate remains unchanged. On the eight-observation
+fixture, math-versus-Flex global gradient relative L2 error was 0.69%, and
+both BF16 paths differed from FP32 math by about 0.84%. These aggregate
+measurements do not override the failed elementwise check. SDPA remains the
+default, and full medium-profile Flex acceptance is incomplete.
