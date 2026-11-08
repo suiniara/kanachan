@@ -1,10 +1,12 @@
 from pathlib import Path
 import gzip
 import bz2
+import logging
 
 from tqdm import tqdm
 import torch
 from torch.utils.data import get_worker_info
+from kanachan.training.core.features import validate_sparse_prefix
 from kanachan.constants import (
     NUM_TYPES_OF_SPARSE_FEATURES,
     MAX_NUM_ACTIVE_SPARSE_FEATURES,
@@ -58,6 +60,9 @@ class DataIterator:
         self.__rewrite_grades = rewrite_grades
 
         worker_info = get_worker_info()
+        self.__sampled = 0
+        self.__nonterminal_seen = False
+        self.__primary = local_rank == 0 and (worker_info is None or worker_info.id == 0)
 
         if num_skip_samples > 0:
             is_primary_worker = worker_info is None or worker_info.id == 0
@@ -82,13 +87,19 @@ class DataIterator:
                 pass
 
     def __del__(self) -> None:
-        self.__fp.close()
+        file_pointer = getattr(self, "_DataIterator__fp", None)
+        if file_pointer is not None:
+            file_pointer.close()
 
     def __parse_line(self, line: str):
         line = line.rstrip("\n")
         columns = line.split("\t")
         if len(columns) not in (8, 10, 12):
-            errmsg = f"An invalid line: {line}"
+            errmsg = (
+                "Expected 8, 10 or 12 columns of v2 RL data, "
+                f"got {len(columns)}. Use data and annotations from "
+                "the same project version."
+            )
             raise RuntimeError(errmsg)
 
         (
@@ -101,12 +112,13 @@ class DataIterator:
         ) = columns[:6]
 
         _sparse = [int(x) for x in sparse_str.split(",")]
+        validate_sparse_prefix(_sparse)
         if len(_sparse) > MAX_NUM_ACTIVE_SPARSE_FEATURES:
             errmsg = f"{len(_sparse)} > {MAX_NUM_ACTIVE_SPARSE_FEATURES}"
             raise RuntimeError(errmsg)
         for x in _sparse:
-            if x >= NUM_TYPES_OF_SPARSE_FEATURES:
-                errmsg = f"{x} >= {NUM_TYPES_OF_SPARSE_FEATURES}"
+            if not 0 <= x < NUM_TYPES_OF_SPARSE_FEATURES:
+                errmsg = f"{x}: Expected an index in [0, {NUM_TYPES_OF_SPARSE_FEATURES})."
                 raise RuntimeError(errmsg)
         for _ in range(len(_sparse), MAX_NUM_ACTIVE_SPARSE_FEATURES):
             # padding
@@ -133,13 +145,12 @@ class DataIterator:
         _progression = [int(x) for x in progression_str.split(",")]
         if len(_progression) > MAX_LENGTH_OF_PROGRESSION_FEATURES:
             errmsg = (
-                f"{len(_progression)}"
-                f" > {MAX_LENGTH_OF_PROGRESSION_FEATURES}"
+                f"{len(_progression)} > {MAX_LENGTH_OF_PROGRESSION_FEATURES}"
             )
             raise RuntimeError(errmsg)
         for x in _progression:
-            if x >= NUM_TYPES_OF_PROGRESSION_FEATURES:
-                errmsg = f"{x} >= {NUM_TYPES_OF_PROGRESSION_FEATURES}"
+            if not 0 <= x < NUM_TYPES_OF_PROGRESSION_FEATURES:
+                errmsg = f"{x}: Expected an index in [0, {NUM_TYPES_OF_PROGRESSION_FEATURES})."
                 raise RuntimeError(errmsg)
         for _ in range(len(_progression), MAX_LENGTH_OF_PROGRESSION_FEATURES):
             # padding
@@ -153,8 +164,10 @@ class DataIterator:
             errmsg = f"{len(_candidates)} >= {MAX_NUM_ACTION_CANDIDATES}"
             raise RuntimeError(errmsg)
         for x in _candidates:
-            if x >= NUM_TYPES_OF_ACTIONS:
-                errmsg = f"{x} >= {NUM_TYPES_OF_ACTIONS}"
+            if not 0 <= x < NUM_TYPES_OF_ACTIONS:
+                errmsg = (
+                    f"{x}: Expected an index in [0, {NUM_TYPES_OF_ACTIONS})."
+                )
                 raise RuntimeError(errmsg)
         for _ in range(len(_candidates), MAX_NUM_ACTION_CANDIDATES):
             # padding
@@ -164,6 +177,10 @@ class DataIterator:
         )
 
         _action = int(action_str)
+        if not 0 <= _action < MAX_NUM_ACTION_CANDIDATES or (
+            _candidates[_action] == NUM_TYPES_OF_ACTIONS
+        ):
+            raise RuntimeError(f"Action index {_action} is not legal.")
         action = torch.tensor(
             _action, device=torch.device("cpu"), dtype=torch.int32
         )
@@ -178,15 +195,15 @@ class DataIterator:
             ) = columns[6:10]
 
             _next_sparse = [int(x) for x in next_sparse_str.split(",")]
+            validate_sparse_prefix(_next_sparse)
             if len(_next_sparse) > MAX_NUM_ACTIVE_SPARSE_FEATURES:
                 errmsg = (
-                    f"{len(_next_sparse)}"
-                    f" > {MAX_NUM_ACTIVE_SPARSE_FEATURES}"
+                    f"{len(_next_sparse)} > {MAX_NUM_ACTIVE_SPARSE_FEATURES}"
                 )
                 raise RuntimeError(errmsg)
             for x in _next_sparse:
-                if x >= NUM_TYPES_OF_SPARSE_FEATURES:
-                    errmsg = f"{x} >= {NUM_TYPES_OF_SPARSE_FEATURES}"
+                if not 0 <= x < NUM_TYPES_OF_SPARSE_FEATURES:
+                    errmsg = f"{x}: Expected an index in [0, {NUM_TYPES_OF_SPARSE_FEATURES})."
                     raise RuntimeError(errmsg)
             for _ in range(len(_next_sparse), MAX_NUM_ACTIVE_SPARSE_FEATURES):
                 # padding
@@ -220,8 +237,8 @@ class DataIterator:
                 )
                 raise RuntimeError(errmsg)
             for x in _next_progression:
-                if x >= NUM_TYPES_OF_PROGRESSION_FEATURES:
-                    errmsg = f"{x} >= {NUM_TYPES_OF_PROGRESSION_FEATURES}"
+                if not 0 <= x < NUM_TYPES_OF_PROGRESSION_FEATURES:
+                    errmsg = f"{x}: Expected an index in [0, {NUM_TYPES_OF_PROGRESSION_FEATURES})."
                     raise RuntimeError(errmsg)
             for _ in range(
                 len(_next_progression), MAX_LENGTH_OF_PROGRESSION_FEATURES
@@ -237,13 +254,12 @@ class DataIterator:
             _next_candidates = [int(x) for x in next_candidates_str.split(",")]
             if len(_next_candidates) > MAX_NUM_ACTION_CANDIDATES:
                 errmsg = (
-                    f"{len(_next_candidates)}"
-                    f" > {MAX_NUM_ACTION_CANDIDATES}"
+                    f"{len(_next_candidates)} > {MAX_NUM_ACTION_CANDIDATES}"
                 )
                 raise RuntimeError(errmsg)
             for x in _next_candidates:
-                if x >= NUM_TYPES_OF_ACTIONS:
-                    errmsg = f"{x} >= {NUM_TYPES_OF_ACTIONS}"
+                if not 0 <= x < NUM_TYPES_OF_ACTIONS:
+                    errmsg = f"{x}: Expected an index in [0, {NUM_TYPES_OF_ACTIONS})."
                     raise RuntimeError(errmsg)
             for _ in range(len(_next_candidates), MAX_NUM_ACTION_CANDIDATES):
                 # padding
@@ -281,8 +297,8 @@ class DataIterator:
                     errmsg = f"{len(_round_summary)} > {MAX_NUM_ROUND_SUMMARY}"
                     raise RuntimeError(errmsg)
                 for x in _round_summary:
-                    if x >= NUM_TYPES_OF_ROUND_SUMMARY:
-                        errmsg = f"{x} >= {NUM_TYPES_OF_ROUND_SUMMARY}"
+                    if not 0 <= x < NUM_TYPES_OF_ROUND_SUMMARY:
+                        errmsg = f"{x}: Expected an index in [0, {NUM_TYPES_OF_ROUND_SUMMARY})."
                         raise RuntimeError(errmsg)
                 for _ in range(len(_round_summary), MAX_NUM_ROUND_SUMMARY):
                     # Padding
@@ -362,8 +378,8 @@ class DataIterator:
             errmsg = f"{len(_round_summary)} > {MAX_NUM_ROUND_SUMMARY}"
             raise RuntimeError(errmsg)
         for x in _round_summary:
-            if x >= NUM_TYPES_OF_ROUND_SUMMARY:
-                errmsg = f"{x} >= {NUM_TYPES_OF_ROUND_SUMMARY}"
+            if not 0 <= x < NUM_TYPES_OF_ROUND_SUMMARY:
+                errmsg = f"{x}: Expected an index in [0, {NUM_TYPES_OF_ROUND_SUMMARY})."
                 raise RuntimeError(errmsg)
         for _ in range(len(_round_summary), MAX_NUM_ROUND_SUMMARY):
             # Padding
@@ -402,17 +418,26 @@ class DataIterator:
             done,
         )
 
+    def __iter__(self) -> "DataIterator":
+        return self
+
     def __next__(self):
         worker_info = get_worker_info()
-        if worker_info is None:
-            line = next(self.__fp)
-            return self.__parse_line(line)
-        else:
+        line = next(self.__fp)
+        if worker_info is not None:
             assert worker_info.num_workers >= 1
-            line = next(self.__fp)
             try:
                 for _ in range(worker_info.num_workers - 1):
                     next(self.__fp)
             except StopIteration:
                 pass
-            return self.__parse_line(line)
+        result = self.__parse_line(line)
+        if self.__sampled < 32:
+            self.__sampled += 1
+            self.__nonterminal_seen |= not bool(result[-1].item())
+            if self.__sampled == 32 and not self.__nonterminal_seen and self.__primary:
+                logging.getLogger(__name__).warning(
+                    "The first 32 RL transitions are all terminal. Confirm that "
+                    "BC annotations were converted with bin/annotation/rl/rl.py."
+                )
+        return result

@@ -5,6 +5,7 @@ from tqdm import tqdm
 import torch
 from torch import Tensor
 from torch.utils.data import get_worker_info
+from kanachan.training.core.features import validate_sparse_prefix
 from kanachan.constants import (
     NUM_TYPES_OF_SPARSE_FEATURES,
     MAX_NUM_ACTIVE_SPARSE_FEATURES,
@@ -33,13 +34,21 @@ class DataIterator(object):
         local_rank: int,
     ) -> None:
         if num_skip_samples < 0:
-            errmsg = f"{num_skip_samples}: An invalid value for `num_skip_samples`."
+            errmsg = (
+                f"{num_skip_samples}: An invalid value for `num_skip_samples`."
+            )
             raise ValueError(errmsg)
-        if rewrite_rooms is not None and (rewrite_rooms < 0 or 4 < rewrite_rooms):
+        if rewrite_rooms is not None and (
+            rewrite_rooms < 0 or 4 < rewrite_rooms
+        ):
             errmsg = f"{rewrite_rooms}: An invalid value for `rewrite_rooms`."
             raise ValueError(errmsg)
-        if rewrite_grades is not None and (rewrite_grades < 0 or 15 < rewrite_grades):
-            errmsg = f"{rewrite_grades}: An invalid value for `rewrite_grades`."
+        if rewrite_grades is not None and (
+            rewrite_grades < 0 or 15 < rewrite_grades
+        ):
+            errmsg = (
+                f"{rewrite_grades}: An invalid value for `rewrite_grades`."
+            )
             raise ValueError(errmsg)
 
         if path.suffix == ".gz":
@@ -76,10 +85,19 @@ class DataIterator(object):
                 pass
 
     def __del__(self) -> None:
-        self.__fp.close()
+        file_pointer = getattr(self, "_DataIterator__fp", None)
+        if file_pointer is not None:
+            file_pointer.close()
 
     def __parse_line(self, line: str) -> _Result:
         line = line.rstrip("\n")
+        columns = line.split("\t")
+        if len(columns) != 8:
+            raise RuntimeError(
+                f"Expected 8 columns of v2 BC data, got {len(columns)}. "
+                "Legacy 7-column data must be used with its matching version "
+                "or regenerated with the v2 annotation tool."
+            )
         (
             uuid,
             sparse_str,
@@ -89,14 +107,15 @@ class DataIterator(object):
             action_str,
             round_summary_str,
             results_str,
-        ) = line.split("\t")
+        ) = columns
 
         _sparse = [int(x) for x in sparse_str.split(",")]
+        validate_sparse_prefix(_sparse)
         if len(_sparse) > MAX_NUM_ACTIVE_SPARSE_FEATURES:
             errmsg = f"{uuid}: {len(_sparse)}"
             raise RuntimeError(errmsg)
         for x in _sparse:
-            if x >= NUM_TYPES_OF_SPARSE_FEATURES:
+            if not 0 <= x < NUM_TYPES_OF_SPARSE_FEATURES:
                 errmsg = f"{uuid}: {x}"
                 raise RuntimeError(errmsg)
         for _ in range(len(_sparse), MAX_NUM_ACTIVE_SPARSE_FEATURES):
@@ -125,7 +144,7 @@ class DataIterator(object):
             errmsg = f"{uuid}: {len(_progression)}"
             raise RuntimeError(errmsg)
         for x in _progression:
-            if x >= NUM_TYPES_OF_PROGRESSION_FEATURES:
+            if not 0 <= x < NUM_TYPES_OF_PROGRESSION_FEATURES:
                 errmsg = f"{uuid}: {x}"
                 raise RuntimeError(errmsg)
         for _ in range(len(_progression), MAX_LENGTH_OF_PROGRESSION_FEATURES):
@@ -140,7 +159,7 @@ class DataIterator(object):
             errmsg = f"{uuid}: {len(_candidates)}"
             raise RuntimeError(errmsg)
         for x in _candidates:
-            if x >= NUM_TYPES_OF_ACTIONS:
+            if not 0 <= x < NUM_TYPES_OF_ACTIONS:
                 errmsg = f"{uuid}: {x}"
                 raise RuntimeError(errmsg)
         for _ in range(len(_candidates), MAX_NUM_ACTION_CANDIDATES):
@@ -151,6 +170,10 @@ class DataIterator(object):
         )
 
         _action = int(action_str)
+        if not 0 <= _action < MAX_NUM_ACTION_CANDIDATES or (
+            _candidates[_action] == NUM_TYPES_OF_ACTIONS
+        ):
+            raise RuntimeError(f"{uuid}: action index {_action} is not legal.")
         action = torch.tensor(
             _action, device=torch.device("cpu"), dtype=torch.int32
         )
@@ -160,7 +183,7 @@ class DataIterator(object):
             errmsg = f"{uuid}: {len(_round_summary)}"
             raise RuntimeError(errmsg)
         for x in _round_summary:
-            if x >= NUM_TYPES_OF_ROUND_SUMMARY:
+            if not 0 <= x < NUM_TYPES_OF_ROUND_SUMMARY:
                 errmsg = f"{uuid}: {x}"
                 raise RuntimeError(errmsg)
         for _ in range(len(_round_summary), MAX_NUM_ROUND_SUMMARY):
@@ -187,6 +210,9 @@ class DataIterator(object):
             round_summary,
             results,
         )
+
+    def __iter__(self) -> "DataIterator":
+        return self
 
     def __next__(self) -> _Result:
         worker_info = get_worker_info()

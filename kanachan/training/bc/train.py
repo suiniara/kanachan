@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 import hydra
 import torch
@@ -30,19 +30,34 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.tensorboard.writer import SummaryWriter
 
 # pylint: disable=unused-import
-import kanachan.training.bc.config
+import kanachan.training.bc.config  # noqa: F401
 import kanachan.training.core.config as _config
 from kanachan.constants import MAX_NUM_ACTION_CANDIDATES
 from kanachan.model_loader import dump_model, dump_object
+from kanachan.nn.decision_factory import (
+    make_backbone, backbone_kwargs, make_candidate_head,
+    candidate_head_kwargs, candidate_head_keys,
+    load_candidate_head_state,
+)
+from kanachan.training.core import decision_checkpoint
 from kanachan.nn import DecodeConverter, Decoder, Encoder
 from kanachan.training.common import (
     get_distributed_environment,
-    get_gradient,
-    is_gradient_nan,
+    average_tensor,
+    with_last,
+    rescale_gradients,
+    checked_clip_gradients,
+    backoff_gradient_scale,
 )
 from kanachan.training.core.bc import DataLoader
-
-SnapshotWriter = Callable[[int | None], None]
+from kanachan.training.core.checkpoint import (
+    SnapshotWriter,
+    TrainingState,
+    load_training_state,
+    save_training_state,
+)
+from kanachan.training.core.progress import TrainingProgress
+from kanachan.training.core.optimizers import move_optimizer_state, consolidate_optimizer_state
 
 
 def _training(
@@ -64,8 +79,13 @@ def _training(
     snapshot_interval: int,
     summary_writer: SummaryWriter,
     snapshot_writer: SnapshotWriter,
+    initial_optimizer_steps: int = 0,
+    initial_grad_scaler_state: dict | None = None,
+    initial_rng_state: dict | None = None,
 ) -> None:
     start_time = datetime.datetime.now()
+
+    move_optimizer_state(optimizer)
 
     world_size, rank, local_rank = get_distributed_environment()
 
@@ -82,31 +102,44 @@ def _training(
         drop_last=(world_size >= 2),
     )
 
-    is_amp_enabled = dtype != amp_dtype
+    is_amp_enabled = device.type == "cuda" and dtype != amp_dtype
     autocast_kwargs: dict[str, Any] = {
         "device_type": device.type,
         "dtype": amp_dtype,
         "enabled": is_amp_enabled,
     }
     grad_scaler = GradScaler("cuda", enabled=is_amp_enabled)
+    if initial_grad_scaler_state is not None and grad_scaler.is_enabled():
+        grad_scaler.load_state_dict(initial_grad_scaler_state)
 
     last_snapshot = None
     if snapshot_interval > 0:
-        last_snapshot = 0
+        last_snapshot = num_samples
 
     batch_count = 0
+    pending_samples = 0
+    epoch_start_samples = num_samples
+    configured_batch_size = batch_size
+    progress = TrainingProgress(
+        summary_writer,
+        batch_size,
+        gradient_accumulation_steps,
+        initial_optimizer_steps=initial_optimizer_steps,
+    )
 
     loss_function = nn.NLLLoss()
 
-    for data in data_loader:
+    decision_checkpoint.restore(initial_rng_state)
+    for data, is_last in with_last(data_loader):
         data = data.to(device=device)
+        local_batch_size = int(data.size(0))
 
         action: Tensor = data["action"]
         assert isinstance(action, Tensor)
         assert action.device == device
         assert action.dtype == torch.int32
         assert action.dim() == 1
-        assert action.size(0) == batch_size
+        assert action.size(0) == local_batch_size
 
         copy = data.detach().clone()
         assert isinstance(copy, TensorDict)
@@ -118,57 +151,57 @@ def _training(
         assert log_probs.device == device
         assert log_probs.dtype == dtype
         assert log_probs.dim() == 2
-        assert log_probs.size(0) == batch_size
+        assert log_probs.size(0) == local_batch_size
         assert log_probs.size(1) == MAX_NUM_ACTION_CANDIDATES
 
         loss: Tensor = loss_function(log_probs, action.long())
 
         _loss = loss.detach().clone()
         if world_size >= 2:
-            all_reduce(_loss, ReduceOp.AVG)
+            average_tensor(_loss)
         loss_to_display = float(_loss.item())
 
-        if math.isnan(loss_to_display):
-            errmsg = "Training loss becomes NaN."
+        if not math.isfinite(loss_to_display):
+            errmsg = "Training loss becomes non-finite."
             raise RuntimeError(errmsg)
 
-        loss = loss / gradient_accumulation_steps
+        loss = loss * (local_batch_size / (configured_batch_size * gradient_accumulation_steps))
         grad_scaler.scale(loss).backward()  # type: ignore
 
-        num_samples += batch_size * world_size
+        num_samples += local_batch_size * world_size
+        pending_samples += local_batch_size * world_size
         batch_count += 1
 
-        if batch_count % gradient_accumulation_steps == 0:
-            is_grad_nan = is_gradient_nan(network_tdm)
-            if world_size >= 2:
-                all_reduce(is_grad_nan)
-            if is_grad_nan.item() >= 1:
-                if local_rank == 0:
+        if batch_count % gradient_accumulation_steps == 0 or is_last:
+            normalization = (
+                configured_batch_size * world_size * gradient_accumulation_steps
+                / pending_samples
+            )
+            rescale_gradients(network_tdm, normalization)
+            pending_samples = 0
+            grad_scaler.unscale_(optimizer)
+            norm = checked_clip_gradients(network_tdm, max_gradient_norm)
+            if norm is None:
+                if rank == 0:
                     logging.warning(
                         "Skip an optimization step "
-                        "because of NaN in the gradient."
+                        "because of non-finite values in the gradient."
                     )
+                backoff_gradient_scale(grad_scaler)
                 optimizer.zero_grad()
                 continue
 
-            grad_scaler.unscale_(optimizer)
-            gradient = get_gradient(network_tdm)
-            # pylint: disable=not-callable
-            gradient_norm = float(torch.linalg.vector_norm(gradient).item())
-            nn.utils.clip_grad_norm_(
-                network_tdm.parameters(),
-                max_gradient_norm,
-                error_if_nonfinite=False,
-            )
+            gradient_norm = float(norm)
 
             grad_scaler.step(optimizer)
             grad_scaler.update()
+            progress.optimizer_step(num_samples)
             if scheduler is not None:
                 scheduler.step()
 
             optimizer.zero_grad()
 
-            if local_rank == 0:
+            if rank == 0:
                 logging.info(
                     "sample = %d, loss = %E, gradient norm = %E",
                     num_samples,
@@ -184,27 +217,46 @@ def _training(
                     "LR", scheduler.get_last_lr()[0], num_samples
                 )
         else:
-            if local_rank == 0:
+            if rank == 0:
                 logging.info(
                     "sample = %d, loss = %E", num_samples, loss_to_display
                 )
             summary_writer.add_scalar("Loss", loss_to_display, num_samples)
 
         if (
-            rank == 0
-            and last_snapshot is not None
+            last_snapshot is not None
             and num_samples - last_snapshot >= snapshot_interval
+            and pending_samples == 0
+            and (
+                num_workers <= 1
+                or (num_samples - epoch_start_samples)
+                % (configured_batch_size * world_size * num_workers)
+                == 0
+            )
         ):
-            snapshot_writer(num_samples)
+            consolidate_optimizer_state(optimizer)
+            if rank == 0:
+                snapshot_writer(
+                    num_samples, optimizer_steps=progress.total_optimizer_steps,
+                    grad_scaler_state=grad_scaler.state_dict() if grad_scaler.is_enabled() else None,
+                )
             last_snapshot = num_samples
 
+    progress.finish(0)
     elapsed_time = datetime.datetime.now() - start_time
+    consolidate_optimizer_state(optimizer)
 
-    if local_rank == 0:
+    if rank == 0:
         logging.info(
             "A training epoch has finished (elapsed time = %s).", elapsed_time
         )
-        snapshot_writer(None)
+        snapshot_writer(
+            None,
+            resume_num_samples=num_samples - pending_samples,
+            optimizer_steps=progress.total_optimizer_steps,
+            cursor_is_exact=(num_workers <= 1 or pending_samples == 0),
+            grad_scaler_state=grad_scaler.state_dict() if grad_scaler.is_enabled() else None,
+        )
 
 
 @hydra.main(version_base=None, config_name="config")
@@ -270,35 +322,17 @@ def _main(config: DictConfig) -> None:
         )
         raise RuntimeError(errmsg)
 
-    if device.type == "cpu":
-        if config.num_workers is None:
-            config.num_workers = 0
-        if config.num_workers < 0:
-            errmsg = f"{config.num_workers}: An invalid number of workers."
-            raise RuntimeError(errmsg)
-        if config.num_workers > 0:
-            errmsg = (
-                f"{config.num_workers}: An invalid number of workers"
-                " for CPU."
-            )
-            raise RuntimeError(errmsg)
-    else:
-        assert device.type == "cuda"
-        if config.num_workers is None:
-            config.num_workers = 2
-        if config.num_workers < 0:
-            errmsg = f"{config.num_workers}: An invalid number of workers."
-            raise RuntimeError(errmsg)
-        if config.num_workers == 0:
-            errmsg = (
-                f"{config.num_workers}: An invalid number of workers"
-                " for GPU."
-            )
-            raise RuntimeError(errmsg)
+    if config.num_workers is None:
+        config.num_workers = 0 if device.type == "cpu" else 2
+    if config.num_workers < 0:
+        raise RuntimeError("num_workers must be a non-negative integer.")
 
     _config.encoder.validate(config.encoder)
 
     _config.decoder.validate(config.decoder, config.encoder.dimension)
+
+    if config.initial_model_prefix is not None and config.decoder.load_from is not None:
+        raise RuntimeError("initial_model_prefix conflicts with decoder.load_from.")
 
     if config.initial_model_prefix is not None:
         if config.encoder.load_from is not None:
@@ -328,6 +362,8 @@ def _main(config: DictConfig) -> None:
             raise RuntimeError(errmsg)
 
     num_samples = 0
+    initial_optimizer_steps = 0
+    initial_grad_scaler_state = None
     encoder_snapshot_path: Path | None = None
     decoder_snapshot_path: Path | None = None
     optimizer_snapshot_path: Path | None = None
@@ -354,9 +390,7 @@ def _main(config: DictConfig) -> None:
                     config.initial_model_index = int(match[1])
                     continue
         if config.initial_model_index is None:
-            errmsg = (
-                f"{config.initial_model_prefix}: No model snapshot" " found."
-            )
+            errmsg = f"{config.initial_model_prefix}: No model snapshot found."
             raise RuntimeError(errmsg)
 
         if config.initial_model_index == sys.maxsize:
@@ -365,6 +399,17 @@ def _main(config: DictConfig) -> None:
         else:
             num_samples = config.initial_model_index
             infix = f".{num_samples}"
+
+        training_state = load_training_state(
+            config.initial_model_prefix,
+            infix,
+            num_samples,
+            restart_data=config.optimizer.initialize,
+            start_new_epoch=config.start_new_epoch,
+        )
+        num_samples = training_state.num_samples
+        initial_optimizer_steps = training_state.optimizer_steps
+        initial_grad_scaler_state = training_state.grad_scaler_state
 
         encoder_snapshot_path = (
             config.initial_model_prefix / f"encoder{infix}.pth"
@@ -407,7 +452,7 @@ def _main(config: DictConfig) -> None:
 
     if config.batch_size <= 0:
         errmsg = (
-            f"{config.batch_size}: `batch_size` must be a positive" " integer."
+            f"{config.batch_size}: `batch_size` must be a positive integer."
         )
         raise RuntimeError(errmsg)
 
@@ -437,7 +482,7 @@ def _main(config: DictConfig) -> None:
 
     output_prefix = Path(HydraConfig.get().runtime.output_dir)
 
-    if local_rank == 0:
+    if rank == 0:
         logging.info("Model type: behavioral cloning (BC)")
 
         _config.device.dump(
@@ -510,44 +555,30 @@ def _main(config: DictConfig) -> None:
             logging.info("Snapshot interval: %d", config.snapshot_interval)
 
     if world_size >= 2:
-        init_process_group(backend="nccl")
+        init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
 
-    encoder = Encoder(
-        position_encoder=config.encoder.position_encoder,
-        dimension=config.encoder.dimension,
-        num_heads=config.encoder.num_heads,
-        dim_feedforward=config.encoder.dim_feedforward,
-        activation_function=config.encoder.activation_function,
-        dropout=config.encoder.dropout,
-        layer_normalization=config.encoder.layer_normalization,
-        num_layers=config.encoder.num_layers,
-        checkpointing=config.checkpointing,
-        device=torch.device("cpu"),
-        dtype=dtype,
+    decision_recipe = decision_checkpoint.recipe(
+        config, "bc", dtype=dtype, amp_dtype=amp_dtype
+    )
+    initial_rng_state = decision_checkpoint.validate_resume(config, decision_recipe)
+    encoder = make_backbone(
+        config.encoder, checkpointing=config.checkpointing, dtype=dtype
     )
     encoder_tdm = TensorDictModule(
         encoder,
         in_keys=["sparse", "numeric", "progression", "candidates"],  # type: ignore
         out_keys=["encode"],  # type: ignore
     )
-    decoder = Decoder(
+    decoder = make_candidate_head(
+        config.decoder,
         input_dimension=config.encoder.dimension,
-        dimension=config.decoder.dimension,
-        activation_function=config.decoder.activation_function,
-        dropout=config.decoder.dropout,
-        layer_normalization=config.decoder.layer_normalization,
-        num_layers=config.decoder.num_layers,
-        output_mode="candidates",
-        noise_init_std=None,
-        device=torch.device("cpu"),
+        architecture=config.encoder.architecture,
         dtype=dtype,
     )
-    with torch.no_grad():
-        for _param in decoder.parameters():
-            _param.zero_()
+    decoder.zero_output()
     decoder_tdm = TensorDictModule(
         decoder,
-        in_keys=["encode"],  # type: ignore
+        in_keys=candidate_head_keys(config.encoder.architecture, config.decoder),
         out_keys=["decode"],  # type: ignore
     )
     decode_converter = DecodeConverter("log_probs")
@@ -573,7 +604,9 @@ def _main(config: DictConfig) -> None:
         network_tdm = DistributedDataParallel(network_tdm)
         assert isinstance(network_tdm, nn.Module)
 
-    argmax_layer = DecodeConverter("argmax")
+    argmax_layer = DecodeConverter(
+        "argmax", tie_break_by_action_id=config.encoder.architecture == "dense_decoder"
+    )
     argmax_tdm = TensorDictModule(
         argmax_layer,
         in_keys=["candidates", "log_probs"],  # type: ignore
@@ -608,7 +641,7 @@ def _main(config: DictConfig) -> None:
         decoder_state_dict = torch.load(
             config.decoder.load_from, map_location="cpu", weights_only=True
         )
-        decoder.load_state_dict(decoder_state_dict)
+        load_candidate_head_state(decoder, decoder_state_dict)
         decoder.to(device=device, dtype=dtype)
 
     if config.initial_model_prefix is not None:
@@ -633,13 +666,6 @@ def _main(config: DictConfig) -> None:
                 optimizer_snapshot_path, map_location="cpu", weights_only=True
             )
             optimizer.load_state_dict(optimizer_state_dict)
-            for _optimizer_state in optimizer.state.values():
-                assert isinstance(_optimizer_state, dict)
-                for key, value in _optimizer_state.items():
-                    if isinstance(value, Tensor):
-                        _optimizer_state[key] = value.to(
-                            device=device, dtype=dtype
-                        )
 
         if scheduler_snapshot_path is not None:
             assert scheduler is not None
@@ -650,7 +676,14 @@ def _main(config: DictConfig) -> None:
 
     snapshots_path = output_prefix / "snapshots"
 
-    def snapshot_writer(num_samples: Optional[int]) -> None:
+    def snapshot_writer(
+        num_samples: int | None = None,
+        *,
+        resume_num_samples: int | None = None,
+        optimizer_steps: int = 0,
+        cursor_is_exact: bool = True,
+        grad_scaler_state: dict | None = None,
+    ) -> None:
         snapshots_path.mkdir(parents=True, exist_ok=True)
 
         infix = "" if num_samples is None else f".{num_samples}"
@@ -679,19 +712,9 @@ def _main(config: DictConfig) -> None:
                         dump_object(
                             encoder,
                             [],
-                            {
-                                "position_encoder": config.encoder.position_encoder,
-                                "dimension": config.encoder.dimension,
-                                "num_heads": config.encoder.num_heads,
-                                "dim_feedforward": config.encoder.dim_feedforward,
-                                "activation_function": config.encoder.activation_function,
-                                "dropout": config.encoder.dropout,
-                                "layer_normalization": config.encoder.layer_normalization,
-                                "num_layers": config.encoder.num_layers,
-                                "checkpointing": config.checkpointing,
-                                "device": torch.device("cpu"),
-                                "dtype": dtype,
-                            },
+                            backbone_kwargs(
+                                config.encoder, checkpointing=config.checkpointing, dtype=dtype
+                            ),
                         )
                     ],
                     {
@@ -710,21 +733,16 @@ def _main(config: DictConfig) -> None:
                         dump_object(
                             decoder,
                             [],
-                            {
-                                "input_dimension": config.encoder.dimension,
-                                "dimension": config.decoder.dimension,
-                                "activation_function": config.decoder.activation_function,
-                                "dropout": config.decoder.dropout,
-                                "layer_normalization": config.decoder.layer_normalization,
-                                "num_layers": config.decoder.num_layers,
-                                "output_mode": "candidates",
-                                "noise_init_std": None,
-                                "device": torch.device("cpu"),
-                                "dtype": dtype,
-                            },
+                            candidate_head_kwargs(
+                                config.decoder, input_dimension=config.encoder.dimension,
+                                architecture=config.encoder.architecture, dtype=dtype,
+                            ),
                         )
                     ],
-                    {"in_keys": ["encode"], "out_keys": ["decode"]},
+                    {
+                        "in_keys": candidate_head_keys(config.encoder.architecture, config.decoder),
+                        "out_keys": ["decode"],
+                    },
                 ),
                 dump_object(
                     decode_converter_tdm,
@@ -736,7 +754,9 @@ def _main(config: DictConfig) -> None:
                 ),
                 dump_object(
                     argmax_tdm,
-                    [dump_object(argmax_layer, ["argmax"], {})],
+                    [dump_object(argmax_layer, ["argmax"], {
+                        "tie_break_by_action_id": config.encoder.architecture == "dense_decoder",
+                    })],
                     {
                         "in_keys": ["candidates", "log_probs"],
                         "out_keys": ["action"],
@@ -747,6 +767,26 @@ def _main(config: DictConfig) -> None:
         )
         torch.save(
             network_tdm_state, snapshots_path / f"model{infix}.kanachan"
+        )
+
+        cursor = (
+            resume_num_samples
+            if resume_num_samples is not None
+            else num_samples
+        )
+        assert cursor is not None
+        save_training_state(
+            snapshots_path,
+            infix,
+            TrainingState(
+                cursor,
+                optimizer_steps,
+                cursor_is_exact and config.get("replay_buffer_size", 0) == 0,
+                grad_scaler_state,
+            ),
+        )
+        decision_checkpoint.save(
+            snapshots_path, infix, decision_recipe, algorithm="bc"
         )
 
     tensorboard_path = output_prefix / "tensorboard"
@@ -764,6 +804,9 @@ def _main(config: DictConfig) -> None:
             rewrite_rooms=config.rewrite_rooms,
             rewrite_grades=config.rewrite_grades,
             num_samples=num_samples,
+            initial_optimizer_steps=initial_optimizer_steps,
+            initial_grad_scaler_state=initial_grad_scaler_state,
+            initial_rng_state=initial_rng_state,
             network_tdm=network_tdm,
             batch_size=config.batch_size,
             gradient_accumulation_steps=config.gradient_accumulation_steps,

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <string_view>
 #include <iostream>
 #include <algorithm>
 #include <vector>
@@ -20,6 +21,14 @@
 namespace {
 
 using std::placeholders::_1;
+
+template<typename Message>
+void parseRecord_(Message &message, std::string const &data)
+{
+  if (!message.ParseFromString(data)) {
+    KANACHAN_THROW<std::runtime_error>("Malformed protobuf game record.");
+  }
+}
 
 std::array<std::uint_fast8_t, 4u> getRanks_(lq::GameEndResult const &record)
 {
@@ -39,17 +48,23 @@ std::array<std::uint_fast8_t, 4u> getRanks_(lq::GameEndResult const &record)
     std::numeric_limits<std::uint_fast8_t>::max(),
     std::numeric_limits<std::uint_fast8_t>::max()
   };
+  if (record.players_size() != 4) {
+    KANACHAN_THROW<std::runtime_error>("Expected four final player results.");
+  }
   for (auto const &player : record.players()) {
     std::uint_fast8_t const seat = player.seat();
     if (seat >= 4u) {
       KANACHAN_THROW<std::runtime_error>("A broken data.");
+    }
+    if (tmp[seat].first != std::numeric_limits<std::uint_fast8_t>::max()) {
+      KANACHAN_THROW<std::runtime_error>("Duplicate final-result seat.");
     }
     tmp[seat] = std::pair(seat, player.total_point());
   }
   std::sort(
     tmp.begin(), tmp.end(),
     [](auto const &lhs, auto const &rhs) -> bool{
-      return lhs.second > rhs.second;
+      return lhs.second > rhs.second || (lhs.second == rhs.second && lhs.first < rhs.first);
     });
   for (std::uint_fast8_t i = 0u; i < 4u; ++i) {
     for (std::uint_fast8_t j = 0u; j < 4u; ++j) {
@@ -82,7 +97,7 @@ std::uint_fast8_t getRoundRank_(std::uint_fast8_t const seat, RoundRankInput dat
   KANACHAN_THROW<std::invalid_argument>("An invalid argument.");
 }
 
-void convert(std::filesystem::path const &ph) {
+void convert(std::filesystem::path const &ph, std::ostream &output) {
   std::string data = [&ph]() {
     std::ifstream ifs(ph, std::ios_base::in | std::ios_base::binary);
     for (std::size_t i = 0; i < 3u; ++i) {
@@ -97,13 +112,17 @@ void convert(std::filesystem::path const &ph) {
   }();
 
   lq::Wrapper wrapper;
-  wrapper.ParseFromString(data);
+  if (!wrapper.ParseFromString(data)) {
+    KANACHAN_THROW<std::runtime_error>("Invalid response wrapper.");
+  }
   if (wrapper.name() != "") {
     KANACHAN_THROW<std::runtime_error>(wrapper.name());
   }
 
   lq::ResGameRecord msg0;
-  msg0.ParseFromString(wrapper.data());
+  if (!msg0.ParseFromString(wrapper.data()) || msg0.error().code() != 0) {
+    KANACHAN_THROW<std::runtime_error>("Invalid game response.");
+  }
 
   lq::RecordGame const &header = msg0.head();
   std::string const uuid = header.uuid();
@@ -118,12 +137,17 @@ void convert(std::filesystem::path const &ph) {
   lq::GameMetaData const &meta_data = config.meta();
   std::uint_fast32_t const mode_id = meta_data.mode_id();
 
-  std::array<std::uint_fast32_t, 4u> levels;
+  std::array<std::uint_fast32_t, 4u> levels{};
+  if (header.accounts_size() != 4) {
+    KANACHAN_THROW<std::runtime_error>("Expected a four-player game record.");
+  }
   {
-    std::size_t i = 0u;
     for (auto const &account : header.accounts()) {
-      levels[i] = account.level().id();
-      ++i;
+      auto const seat = account.seat();
+      if (seat >= 4u || levels[seat] != 0u || account.level().id() == 0u) {
+        KANACHAN_THROW<std::runtime_error>("Invalid or duplicate account seat/level.");
+      }
+      levels[seat] = account.level().id();
     }
   }
 
@@ -161,13 +185,17 @@ void convert(std::filesystem::path const &ph) {
     }
   }
 
-  wrapper.ParseFromString(msg0.data());
+  if (!wrapper.ParseFromString(msg0.data())) {
+    KANACHAN_THROW<std::runtime_error>("Invalid detail wrapper.");
+  }
   if (wrapper.name() != ".lq.GameDetailRecords") {
     KANACHAN_THROW<std::runtime_error>(_1) << ph << ": a broken data.";
   }
 
   lq::GameDetailRecords msg1;
-  msg1.ParseFromString(wrapper.data());
+  if (!msg1.ParseFromString(wrapper.data())) {
+    KANACHAN_THROW<std::runtime_error>("Invalid game details.");
+  }
 
   std::array<Kanachan::PlayerState, 4u> player_states{
     Kanachan::PlayerState(0u, mode_id, levels[0u], ranks[0u], game_scores[0u], delta_grading_points[0u]),
@@ -233,11 +261,11 @@ void convert(std::filesystem::path const &ph) {
     if (game_record_version == 210715u && r.empty()) {
       continue;
     }
-    wrapper.ParseFromString(r);
+    parseRecord_(wrapper, r);
     if (wrapper.name() == ".lq.RecordAnGangAddGang") {
       // 暗槓または加槓
       lq::RecordAnGangAddGang record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       {
         std::uint_fast8_t const seat = record.seat();
@@ -277,7 +305,7 @@ void convert(std::filesystem::path const &ph) {
     else if (wrapper.name() == ".lq.RecordChiPengGang") {
       // チー，ポン，または大明槓
       lq::RecordChiPengGang record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       {
         std::uint_fast8_t const seat = record.seat();
@@ -332,7 +360,7 @@ void convert(std::filesystem::path const &ph) {
     else if (wrapper.name() == ".lq.RecordDealTile") {
       // 自摸
       lq::RecordDealTile record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       for (std::uint_fast8_t i = 0; i < 4u; ++i) {
         auto const &prev_action_candidates = prev_action_candidates_list[i];
@@ -376,7 +404,7 @@ void convert(std::filesystem::path const &ph) {
     else if (wrapper.name() == ".lq.RecordDiscardTile") {
       // 打牌
       lq::RecordDiscardTile record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       {
         std::uint_fast8_t const seat = record.seat();
@@ -432,7 +460,7 @@ void convert(std::filesystem::path const &ph) {
     else if (wrapper.name() == ".lq.RecordHule") {
       // 和了
       lq::RecordHule record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       for (std::uint_fast8_t i = 0; i < 4u; ++i) {
         lq::HuleInfo const *p_hule = nullptr;
@@ -521,7 +549,7 @@ void convert(std::filesystem::path const &ph) {
             KANACHAN_THROW<std::logic_error>("A logic error.");
           }
           annotation.printWithRoundResult(
-            uuid, i, round_progress, results, round_delta_scores, next_benchang, 0u, std::cout);
+            uuid, i, round_progress, results, round_delta_scores, next_benchang, 0u, output);
         }
         player_annotations[i].clear();
       }
@@ -536,7 +564,7 @@ void convert(std::filesystem::path const &ph) {
     else if (wrapper.name() == ".lq.RecordLiuJu") {
       // 途中流局
       lq::RecordLiuJu record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       if (record.type() == 1u) {
         // 九種九牌
@@ -584,11 +612,11 @@ void convert(std::filesystem::path const &ph) {
           KANACHAN_THROW<std::logic_error>("A logic error.");
         }();
         lq::Wrapper next_wrapper;
-        next_wrapper.ParseFromString(rr);
+        parseRecord_(next_wrapper, rr);
         if (next_wrapper.name() != ".lq.RecordNewRound") {
           KANACHAN_THROW<std::runtime_error>(_1) << next_wrapper.name();
         }
-        next_record.ParseFromString(next_wrapper.data());
+        parseRecord_(next_record, next_wrapper.data());
       }
 
       for (auto &player_state : player_states) {
@@ -613,7 +641,7 @@ void convert(std::filesystem::path const &ph) {
           };
           annotation.printWithRoundResult(
             uuid, i, round_progress, round_result, round_delta_scores, next_benchang,
-            next_num_liqibangs, std::cout);
+            next_num_liqibangs, output);
         }
         player_annotations[i].clear();
       }
@@ -628,7 +656,7 @@ void convert(std::filesystem::path const &ph) {
     else if (wrapper.name() == ".lq.RecordNewRound") {
       // The beginning of a new round.
       lq::RecordNewRound record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       switch (record.chang()) {
       case 0u:
@@ -657,7 +685,7 @@ void convert(std::filesystem::path const &ph) {
           player_state.onNewRound(record);
         }
       } catch (...) {
-        std::cout << uuid << ": " << chang << ju << "局" << ben << "本場: "
+        std::cerr << uuid << ": " << chang << ju << "局" << ben << "本場: "
                   << static_cast<unsigned>(player_states[0u].getLeftTileCount())
                   << std::endl;
         throw;
@@ -688,7 +716,7 @@ void convert(std::filesystem::path const &ph) {
     else if (wrapper.name() == ".lq.RecordNoTile") {
       // An exhaustive draw.
       lq::RecordNoTile record;
-      record.ParseFromString(wrapper.data());
+      parseRecord_(record, wrapper.data());
 
       if (prev_dapai_seat == std::numeric_limits<std::uint_fast8_t>::max()) {
         KANACHAN_THROW<std::logic_error>("A logic error.");
@@ -761,7 +789,7 @@ void convert(std::filesystem::path const &ph) {
           }
 
           lq::Wrapper wrapper_ahead;
-          wrapper_ahead.ParseFromString(rr);
+          parseRecord_(wrapper_ahead, rr);
           if (wrapper_ahead.name() == ".lq.RecordAnGangAddGang") {
             KANACHAN_THROW<std::logic_error>("A logic error.");
           }
@@ -858,7 +886,7 @@ void convert(std::filesystem::path const &ph) {
         for (auto const &annotation : player_annotations[i]) {
           annotation.printWithRoundResult(
             uuid, i, round_progress, results, round_delta_scores, next_benchang,
-            next_num_liqibangs, std::cout);
+            next_num_liqibangs, output);
         }
         player_annotations[i].clear();
       }
@@ -879,6 +907,96 @@ void convert(std::filesystem::path const &ph) {
 } // namespace *unnamed*
 
 int main(int const argc, char const *argv[]) {
+  // Buffer one complete game. A late conversion failure must never leave
+  // earlier rounds of that game in a training stream.
+  auto emit = [](std::filesystem::path const &path) {
+    std::ostringstream buffer;
+    convert(path, buffer);
+    auto data = std::move(buffer).str();
+    if (data.empty()) {
+      throw std::runtime_error("Game produced no decision annotations.");
+    }
+    std::cout << data << std::flush;
+    if (!std::cout) {
+      throw std::runtime_error("Failed to write annotations.");
+    }
+    return std::pair(data.size(), std::count(data.begin(), data.end(), '\n'));
+  };
+
+  if (argc >= 3 && std::string_view(argv[1]) == "--files-from") {
+    std::filesystem::path status_path;
+    bool continue_on_error = false;
+    for (int i = 3; i < argc; ++i) {
+      if (std::string_view(argv[i]) == "--status-file" && i + 1 < argc) {
+        status_path = argv[++i];
+      }
+      else if (std::string_view(argv[i]) == "--continue-on-error") {
+        continue_on_error = true;
+      }
+      else {
+        throw std::invalid_argument("Unknown annotation option.");
+      }
+    }
+    if (continue_on_error && status_path.empty()) {
+      throw std::invalid_argument("--continue-on-error requires --status-file.");
+    }
+    std::ifstream files(argv[2]);
+    if (!files) {
+      throw std::runtime_error("Cannot read annotation file list.");
+    }
+    std::ofstream status;
+    if (!status_path.empty()) {
+      if (std::filesystem::exists(status_path)) {
+        throw std::invalid_argument("Status output already exists; use a new path.");
+      }
+      status.open(status_path, std::ios::out | std::ios::trunc);
+      if (!status) {
+        throw std::runtime_error("Cannot write annotation status file.");
+      }
+      status.exceptions(std::ios::badbit | std::ios::failbit);
+    }
+    std::string line;
+    while (std::getline(files, line)) {
+      if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+      }
+      if (line.empty() || line.find_first_of("\t\r\n") != std::string::npos) {
+        throw std::invalid_argument("Empty or invalid raw-record path.");
+      }
+      std::ostringstream buffer;
+      try {
+        convert(std::filesystem::path(line), buffer);
+        if (buffer.tellp() <= 0) {
+          throw std::runtime_error("Game produced no decision annotations.");
+        }
+      }
+      catch (std::exception const &error) {
+        if (!continue_on_error) {
+          throw;
+        }
+        std::string message(error.what());
+        std::replace_if(message.begin(), message.end(), [](char c) {
+          return c == '\t' || c == '\r' || c == '\n';
+        }, ' ');
+        status << "error\t" << line << "\t0\t0\t" << message << '\n' << std::flush;
+        continue;
+      }
+      auto const data = std::move(buffer).str();
+      std::cout << data << std::flush;
+      if (!std::cout) {
+        throw std::runtime_error("Failed to write annotations.");
+      }
+      if (status.is_open()) {
+        status << "ok\t" << line << '\t' << std::count(data.begin(), data.end(), '\n')
+               << '\t' << data.size() << "\t\n" << std::flush;
+      }
+    }
+    if (!files.eof()) {
+      throw std::runtime_error("Failed to read annotation file list.");
+    }
+    return EXIT_SUCCESS;
+  }
+
   if (argc < 2) {
     KANACHAN_THROW<std::runtime_error>(_1) << "argc = " << argc;
   }
@@ -897,7 +1015,7 @@ int main(int const argc, char const *argv[]) {
     auto const end = std::filesystem::directory_iterator();
     for (std::filesystem::directory_iterator iter(ph); iter != end; ++iter) {
       if (iter->is_regular_file()) {
-        convert(iter->path());
+        emit(iter->path());
       }
     }
   }

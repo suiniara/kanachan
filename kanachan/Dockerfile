@@ -1,9 +1,11 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+ARG BASE_IMAGE=nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 ARG PYTHON_VERSION=3.12.8
 ARG BUILD_TYPE=Release
 FROM $BASE_IMAGE
 ARG PYTHON_VERSION
 ARG BUILD_TYPE
+ARG INSTALL_APEX=0
+ARG APEX_REVISION
 
 SHELL ["/bin/bash", "-c"]
 
@@ -71,14 +73,17 @@ RUN set -euxo pipefail; \
 # Install PyTorch.
 RUN set -euxo pipefail; \
     eval "$(pyenv init -)"; \
-    python3 -m pip install -U torch --index-url https://download.pytorch.org/whl/cu121
+    python3 -m pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
-# Install Apex.
+# Apex is optional; native optimizers work without compiling CUDA extensions.
 RUN set -euxo pipefail; \
+    if [[ "$INSTALL_APEX" != 1 ]]; then exit 0; fi; \
+    : "${APEX_REVISION:?Set APEX_REVISION to an explicit commit when enabling Apex}"; \
     eval "$(pyenv init -)"; \
     pushd /workspace; \
     git clone 'https://github.com/NVIDIA/apex.git'; \
     pushd apex; \
+    git checkout "$APEX_REVISION"; \
     python3 -m pip install -v --disable-pip-version-check --no-cache-dir --no-build-isolation --config-settings "--build-option=--cpp_ext" --config-settings "--build-option=--cuda_ext" ./; \
     popd; \
     rm -rf apex; \
@@ -171,7 +176,7 @@ RUN set -euxo pipefail; \
     popd; \
     pushd /workspace/kanachan; \
     cmake -S . -B build -DCMAKE_BUILD_TYPE=${BUILD_TYPE}; \
-    VERBOSE=1 cmake --build build --parallel $(nproc) --target simulation; \
+    VERBOSE=1 cmake --build build --parallel $(nproc) --target simulation _candidate_features; \
     cp build/src/simulation/libsimulation.so kanachan/simulation/_simulation.so; \
     python3 -m build -w; \
     python3 -m pip install -U dist/*.whl; \

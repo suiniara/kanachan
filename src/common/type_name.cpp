@@ -4,7 +4,9 @@
 #include <memory>
 #include <typeinfo>
 #include <cstdlib>
+#if defined(__GNUG__)
 #include <cxxabi.h>
+#endif
 
 
 namespace Kanachan{
@@ -12,10 +14,14 @@ namespace Kanachan{
 std::string getTypeName(std::type_info const &ti)
 {
   char const * const name = ti.name();
+#if defined(__GNUG__)
   int status;
   std::unique_ptr<char, void (*)(void *)> p(
     abi::__cxa_demangle(name, NULL, NULL, &status), std::free);
   return { status == 0 ? p.get() : name };
+#else
+  return name;
+#endif
 }
 
 } // namespace Kanachan

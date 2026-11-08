@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import Tensor
 from tensordict import TensorDict  # type: ignore
@@ -15,16 +17,16 @@ class EpsilonGreedy(TensorDictModuleBase):
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
-        if epsilon_first < 0.0 or epsilon_first > 1.0:
+        if not math.isfinite(epsilon_first) or not 0.0 <= epsilon_first <= 1.0:
             msg = (
                 "`epsilon_first` must be a real number within the range"
                 " [0.0, 1.0]."
             )
             raise ValueError(msg)
-        if epsilon_last > epsilon_first:
+        if not math.isfinite(epsilon_last) or epsilon_last > epsilon_first:
             msg = (
                 "`epsilon_last` must be less than or equal to"
-                " `epsilon_last`."
+                " `epsilon_first`."
             )
             raise ValueError(msg)
         if epsilon_last < 0.0:
@@ -54,7 +56,7 @@ class EpsilonGreedy(TensorDictModuleBase):
             "epsilon", torch.tensor(epsilon_first, device=device, dtype=dtype)
         )
         self.annealing_steps = annealing_steps
-        self._step = 0
+        self.register_buffer("_step", torch.tensor(0, device=device, dtype=torch.int64))
 
         self.in_keys = ["candidates", "action"]
         self.out_keys = ["action"]
@@ -73,10 +75,19 @@ class EpsilonGreedy(TensorDictModuleBase):
         if not self.training:
             return td
 
-        action_mask = candidates < NUM_TYPES_OF_ACTIONS
+        stable_ids = getattr(self, "stable_action_ids", False)
+        if stable_ids:
+            sorted_candidates, original_indices = candidates.sort(-1)
+            action_mask = sorted_candidates < NUM_TYPES_OF_ACTIONS
+        else:
+            action_mask = candidates < NUM_TYPES_OF_ACTIONS
         random_action = (
             action_mask.float().multinomial(1).squeeze(1).to(dtype=torch.int32)
         )
+        if stable_ids:
+            random_action = original_indices.gather(
+                1, random_action.long()[:, None]
+            ).squeeze(-1).to(torch.int32)
         assert random_action.dim() == 1
         assert random_action.size(0) == batch_size
         assert (
@@ -100,8 +111,7 @@ class EpsilonGreedy(TensorDictModuleBase):
             msg = "`steps` must be a non-negative integer."
             raise ValueError(msg)
 
-        if self._step + steps >= self.annealing_steps:
-            self._step = self.annealing_steps
+        self._step.fill_(min(int(self._step.item()) + steps, self.annealing_steps))
 
         epsilon_first: Tensor = self.epsilon_first
         epsilon_last: Tensor = self.epsilon_last
@@ -109,8 +119,28 @@ class EpsilonGreedy(TensorDictModuleBase):
             assert epsilon_first.item() == epsilon_last.item()
             return
 
-        # pylint: disable=attribute-defined-outside-init
-        self.epsilon = epsilon_first * (
+        self.epsilon.copy_(epsilon_first * (
             (self.annealing_steps - self._step) / self.annealing_steps
+        ) + epsilon_last * (self._step / self.annealing_steps))
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys,
+        unexpected_keys, error_msgs,
+    ):
+        if prefix + "_step" not in state_dict and all(
+            prefix + key in state_dict for key in ("epsilon_first", "epsilon_last", "epsilon")
+        ):
+            # Legacy snapshots saved epsilon but omitted the schedule position.
+            first = float(state_dict[prefix + "epsilon_first"].item())
+            last = float(state_dict[prefix + "epsilon_last"].item())
+            current = float(state_dict[prefix + "epsilon"].item())
+            step = 0 if first == last else round(
+                self.annealing_steps * (first - current) / (first - last)
+            )
+            state_dict[prefix + "_step"] = torch.tensor(
+                max(0, min(step, self.annealing_steps)), dtype=torch.int64,
+            )
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys,
+            unexpected_keys, error_msgs,
         )
-        self.epsilon += epsilon_last * (self._step / self.annealing_steps)

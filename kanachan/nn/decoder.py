@@ -21,7 +21,7 @@ class Decoder(nn.Module):
         dimension: int | None,
         activation_function: str | None,
         dropout: float | None,
-        layer_normalization: bool,
+        layer_normalization: bool = False,
         num_layers: int,
         output_mode: str,
         noise_init_std: float | None,
@@ -93,7 +93,9 @@ class Decoder(nn.Module):
         if num_layers >= 2:
             if layer_normalization:
                 assert dimension is not None
-                layers["layer_normalization0"] = nn.LayerNorm([dimension])
+                layers["layer_normalization0"] = nn.LayerNorm(
+                    [dimension], device=device, dtype=dtype
+                )
             if activation_function == "relu":
                 layers["activation0"] = nn.ReLU()
             elif activation_function == "gelu":
@@ -116,7 +118,7 @@ class Decoder(nn.Module):
             if not final_layer:
                 if layer_normalization:
                     layers[f"layer_normalization{i}"] = nn.LayerNorm(
-                        [dimension]
+                        [dimension], device=device, dtype=dtype
                     )
                 if activation_function == "relu":
                     layers[f"activation{i}"] = nn.ReLU()
@@ -204,3 +206,9 @@ class Decoder(nn.Module):
         for layer in self.layers:
             if isinstance(layer, (nn.Linear, NoisyLinear)):
                 layer.reset_parameters()
+
+    @torch.no_grad()
+    def zero_output(self) -> None:
+        """Start with zero predictions without disabling the hidden layers."""
+        for parameter in self.layers[-1].parameters():
+            parameter.zero_()

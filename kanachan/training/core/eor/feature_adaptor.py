@@ -31,7 +31,7 @@ class FeatureAdaptor(nn.Module):
         _sparse[:, 3] = sparse[:, 3] - 23 + 23  # grading[1]
         _sparse[:, 4] = sparse[:, 4] - 39 + 39  # grading[2]
         _sparse[:, 5] = sparse[:, 5] - 55 + 55  # grading[3]
-        _sparse[:, 6] = sparse[:, 6] - 75 + 71  # chang (game wind)
-        _sparse[:, 7] = sparse[:, 7] - 78 + 74  # ju (round)
+        _sparse[:, 6] = sparse[:, 7] - 75 + 71  # chang (game wind)
+        _sparse[:, 7] = sparse[:, 8] - 78 + 74  # ju (round)
 
         return _sparse, numeric

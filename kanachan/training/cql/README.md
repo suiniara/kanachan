@@ -2,6 +2,15 @@
 
 A training program with [CQL](https://arxiv.org/abs/2006.04779).
 
+The dense Mahjong `--config-name decision` preset uses `target_kind=mc`:
+complete observed half-game returns, scalar MSE and legal-action CQL
+regularization, with no Q target network. It uses actual settled-round and
+final-placement rewards, not GRP. This is an MC+CQL variant, distinct from
+the original Bellman-backup objective. The explicit one-step comparator is
+`target_kind=td double_q_learning=true`; generic legacy presets remain TD.
+See [the decoder recipe](../decision-decoder.md) for data, checkpoint and
+evaluation requirements. All online-network parameters train in both modes.
+
 ## Prerequisits
 
 The following items are required to run the programs in this directory:
@@ -101,7 +110,7 @@ Options are specified in the [Hydra](https://hydra.cc/) manner.
 
 `reward_plugin=REWARD_PLUGIN`: Specify the path to the [reward plug-in](https://github.com/Cryolite/kanachan/wiki/Reward-Plugin). The path must be one that can be interpreted within the Docker guest.
 
-`discount_factor=GAMMA`: Specify the discount factor (in the sense of reinforcement learning). The argument must be a real number in the range \[0.0, 1.0\]. Default to `1.0`.
+`discount_factor=GAMMA`: Specify the discount factor (in the sense of reinforcement learning). The argument must be a real number in the range \[0.0, 1.0\]. The legacy configuration defaults to `0.99`; use `--config-name placement` for the scalar, undiscounted full-game placement recipe (`1.0`).
 
 `kappa=KAPPA`: Specify the κ hyperparameter (See the CQL paper for details). The argument must be a non-negative real number. Default to `1.0`.
 

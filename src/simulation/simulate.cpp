@@ -4,6 +4,7 @@
 #include "simulation/paishan.hpp"
 #include "simulation/simulator.hpp"
 #include "simulation/decision_maker.hpp"
+#include "simulation/gil.hpp"
 #include "simulation/utility.hpp"
 #include "common/assert.hpp"
 #include "common/throw.hpp"
@@ -26,6 +27,7 @@
 #include <string>
 #include <functional>
 #include <tuple>
+#include <thread>
 #include <utility>
 #include <memory>
 #include <stdexcept>
@@ -56,7 +58,8 @@ python::list simulate(
   long const num_simulation_sets,
   long const batch_size,
   long const concurrency,
-  python::object progress)
+  python::object progress,
+  python::object seed)
 try {
   if (PyGILState_Check() == 0) {
     KANACHAN_THROW<std::runtime_error>("GIL must be held.");
@@ -97,7 +100,8 @@ try {
     num_simulation_sets,
     batch_size,
     concurrency,
-    progress);
+    progress,
+    seed);
   python::list result = simulator.run();
   return result;
 }
@@ -227,10 +231,37 @@ try {
     static_cast<std::uint_fast8_t>(python::extract<long>(grades[0])()),
     static_cast<std::uint_fast8_t>(python::extract<long>(grades[1])()),
     static_cast<std::uint_fast8_t>(python::extract<long>(grades[2])()),
-    static_cast<std::uint_fast8_t>(python::extract<long>(grades[2])())
+    static_cast<std::uint_fast8_t>(python::extract<long>(grades[3])())
   };
-  return Kanachan::simulateGame(
-    urng, room, dong_feng_zhan, deciders, grades_, test_paishan_list_, std::stop_token());
+  std::shared_ptr<Kanachan::GameLog> result;
+  std::exception_ptr error;
+  std::jthread worker([&](std::stop_token stop_token) {
+    try {
+      result = Kanachan::simulateGame(
+        urng, room, dong_feng_zhan, deciders, grades_, test_paishan_list_, stop_token);
+    }
+    catch (...) {
+      error = std::current_exception();
+    }
+    p_test_decision_maker->shrinkBatchSizeToFitNumThreads(0u);
+  });
+  try {
+    p_test_decision_maker->run();
+  }
+  catch (...) {
+    worker.request_stop();
+    Kanachan::GIL::RecursiveRelease gil_release;
+    worker.join();
+    throw;
+  }
+  {
+    Kanachan::GIL::RecursiveRelease gil_release;
+    worker.join();
+  }
+  if (error) {
+    std::rethrow_exception(error);
+  }
+  return result;
 }
 catch (std::exception const &) {
   throw;

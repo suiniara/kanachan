@@ -4,6 +4,11 @@ from pathlib import Path
 from argparse import ArgumentParser
 import sys
 from typing import TypeAlias
+from collections.abc import Iterable
+from contextlib import nullcontext
+from itertools import groupby
+import bz2
+import gzip
 
 
 _AnnotationKey: TypeAlias = tuple[str, int, int, int, int, int, int]
@@ -178,8 +183,27 @@ def _parse(
         i += 1
 
 
+def _parse_stream(
+    input_lines: Iterable[str], room_filter: int | None, grade_filter: int | None
+) -> None:
+    """Keep a single complete game in memory; reject interleaved UUIDs."""
+    seen = set()
+    for uuid, lines in groupby(input_lines, key=lambda line: line.split("\t", 1)[0]):
+        if uuid in seen:
+            raise RuntimeError(
+                f"{uuid}: A game reappeared in streaming input. Group all "
+                "annotations of each complete game together before converting."
+            )
+        seen.add(uuid)
+        _parse(list(lines), room_filter, grade_filter)
+
+
 def _main() -> None:
     parser = ArgumentParser()
+    parser.add_argument(
+        "--stream", action="store_true",
+        help="process one complete game at a time; input UUIDs must be grouped",
+    )
     parser.add_argument(
         "--filter-by-room",
         choices=("bronze", "silver", "gold", "jade", "throne"),
@@ -238,17 +262,20 @@ def _main() -> None:
     if str(input_path) == "-":
         input_path = None
 
-    if input_path is None:
-        input_lines = sys.stdin.readlines()
-    else:
+    if input_path is not None:
         if not input_path.exists():
             raise RuntimeError(f"{input_path}: Does not exist.")
         if not input_path.is_file():
             raise RuntimeError(f"{input_path}: Not a file.")
-        with open(input_path, encoding="UTF-8") as fp:  # pylint: disable=invalid-name
-            input_lines = fp.readlines()
-
-    _parse(input_lines, room_filter, grade_filter)
+    opener = gzip.open if input_path and input_path.suffix == ".gz" else (
+        bz2.open if input_path and input_path.suffix == ".bz2" else open
+    )
+    context = nullcontext(sys.stdin) if input_path is None else opener(input_path, "rt", encoding="UTF-8")
+    with context as input_lines:
+        if args.stream:
+            _parse_stream(input_lines, room_filter, grade_filter)
+        else:
+            _parse(list(input_lines), room_filter, grade_filter)
 
 
 if __name__ == "__main__":

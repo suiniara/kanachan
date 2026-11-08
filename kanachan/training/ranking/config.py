@@ -23,6 +23,7 @@ class Config:
     num_workers: int | None = None
     initial_model_prefix: Path | None = None
     initial_model_index: int | None = None
+    start_new_epoch: bool = False
     checkpointing: bool = False
     batch_size: int = MISSING
     gradient_accumulation_steps: int = 1

@@ -28,7 +28,8 @@ boost::python::list simulate(
   long num_simulation_sets,
   long batch_size,
   long concurrency,
-  boost::python::object progress);
+  boost::python::object progress,
+  boost::python::object seed = boost::python::object());
 
 std::shared_ptr<Kanachan::GameLog> test(
   boost::python::long_ simulation_mode,
@@ -45,8 +46,16 @@ BOOST_PYTHON_MODULE(_simulation)
     Kanachan::GameLog, std::shared_ptr<Kanachan::GameLog>, boost::noncopyable
   >("GameLog", boost::python::no_init)
     .def("get_result", &Kanachan::GameLog::getResult)
-    .def("get_episode", &Kanachan::GameLog::getEpisode);
-  boost::python::def("simulate", &Kanachan::simulate);
+    .def("get_episode", &Kanachan::GameLog::getEpisode)
+    .def("get_metadata", &Kanachan::GameLog::getMetadata);
+  namespace python = boost::python;
+  python::def("simulate", &Kanachan::simulate,
+    (python::arg("device"), python::arg("dtype"), python::arg("room"),
+     python::arg("baseline_grade"), python::arg("baseline_model"),
+     python::arg("proposed_grade"), python::arg("proposed_model"),
+     python::arg("simulation_mode"), python::arg("num_simulation_sets"),
+     python::arg("batch_size"), python::arg("concurrency"),
+     python::arg("progress"), python::arg("seed") = python::object()));
   boost::python::def("test", &Kanachan::test);
 } // BOOST_PYTHON_MODULE(_simulation)
 

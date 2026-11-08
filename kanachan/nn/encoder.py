@@ -2,7 +2,6 @@ import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint_sequential
 
-from kanachan import piecewise_linear_encoding
 from kanachan.constants import (
     ENCODER_WIDTH,
     MAX_LENGTH_OF_PROGRESSION_FEATURES,
@@ -13,6 +12,8 @@ from kanachan.constants import (
     NUM_TYPES_OF_PROGRESSION_FEATURES,
     NUM_TYPES_OF_SPARSE_FEATURES,
 )
+from kanachan.nn.modern_encoder import RMSNormSwiGLUEncoder
+from kanachan.nn.numeric_encoding import encode_numeric_features
 from kanachan.nn.position_embedding import PositionEmbedding
 from kanachan.nn.positional_encoding import PositionalEncoding
 
@@ -27,7 +28,8 @@ class Encoder(nn.Module):
         dim_feedforward: int,
         activation_function: str,
         dropout: float,
-        layer_normalization: bool,
+        layer_normalization: bool = False,
+        architecture: str = "transformer",
         num_layers: int,
         checkpointing: bool,
         device: torch.device,
@@ -50,12 +52,19 @@ class Encoder(nn.Module):
             raise ValueError(dropout)
         if num_layers <= 0:
             raise ValueError(num_layers)
+        if architecture not in ("transformer", "rmsnorm_swiglu"):
+            raise ValueError(architecture)
+        if architecture == "rmsnorm_swiglu" and layer_normalization:
+            raise ValueError(
+                "rmsnorm_swiglu supplies its own per-token normalization."
+            )
         if dtype not in (torch.float64, torch.float32, torch.float16):
             raise ValueError(dtype)
 
         super().__init__()
 
         self.__dimension = dimension
+        self.__architecture = architecture
 
         self.sparse_embedding = nn.Embedding(
             NUM_TYPES_OF_SPARSE_FEATURES + 1,
@@ -110,22 +119,28 @@ class Encoder(nn.Module):
         _layer_normalization: nn.LayerNorm | None = None
         if layer_normalization:
             _layer_normalization = nn.LayerNorm(
-                [ENCODER_WIDTH, self.__dimension]
+                [ENCODER_WIDTH, self.__dimension], device=device, dtype=dtype
             )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            self.__dimension,
-            num_heads,
-            dim_feedforward=dim_feedforward,
-            activation=activation_function,
-            dropout=dropout,
-            batch_first=True,
-            device=device,
-            dtype=dtype,
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_layers, norm=_layer_normalization
-        )
+        if architecture == "transformer":
+            encoder_layer = nn.TransformerEncoderLayer(
+                self.__dimension,
+                num_heads,
+                dim_feedforward=dim_feedforward,
+                activation=activation_function,
+                dropout=dropout,
+                batch_first=True,
+                device=device,
+                dtype=dtype,
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers, norm=_layer_normalization
+            )
+        else:
+            self.encoder = RMSNormSwiGLUEncoder(
+                dimension, num_heads, dim_feedforward, dropout, num_layers,
+                device=device, dtype=dtype,
+            )
 
         self.checkpointing = checkpointing
 
@@ -136,43 +151,9 @@ class Encoder(nn.Module):
         batch_size: int,
         numeric: Tensor,
     ) -> Tensor:
-        numeric = numeric.to(device=torch.device("cpu"))
-        _numeric = torch.zeros(
-            (batch_size, NUM_NUMERIC_FEATURES, self.__dimension // 2),
-            requires_grad=False,
-            device=torch.device("cpu"),
-            dtype=dtype,
+        _numeric = encode_numeric_features(
+            numeric, self.__dimension // 2, device=device, dtype=dtype
         )
-        for i in range(batch_size):
-            benchang = int(numeric[i, 0].item())
-            _numeric[i, 0] = piecewise_linear_encoding(
-                benchang,
-                0.0,
-                float(self.__dimension // 2),
-                self.__dimension // 2,
-                torch.device("cpu"),
-                dtype,
-            )
-            deposites = int(numeric[i, 1].item())
-            _numeric[i, 1] = piecewise_linear_encoding(
-                deposites,
-                0.0,
-                float(self.__dimension // 2),
-                self.__dimension // 2,
-                torch.device("cpu"),
-                dtype,
-            )
-            for seat in range(4):
-                score = int(numeric[i, 2 + seat].item())
-                _numeric[i, 2 + seat] = piecewise_linear_encoding(
-                    score,
-                    0.0,
-                    100000.0,
-                    self.__dimension // 2,
-                    torch.device("cpu"),
-                    dtype,
-                )
-        _numeric = _numeric.to(device=device)
         numeric_embedding: Tensor = self.numeric_embedding(
             torch.arange(
                 NUM_NUMERIC_FEATURES, device=device, dtype=torch.int32
@@ -184,12 +165,24 @@ class Encoder(nn.Module):
         return torch.cat((_numeric, numeric_embedding), 2)
 
     @torch.compile
-    def __encode(self, embedding: Tensor) -> Tensor:
+    def __encode(
+        self, embedding: Tensor, padding_mask: Tensor | None = None
+    ) -> Tensor:
+        if self.__architecture == "rmsnorm_swiglu":
+            return self.encoder(
+                embedding, padding_mask, checkpointing=self.checkpointing
+            )
         if self.checkpointing:
             encoder_layers = self.encoder.layers
-            return checkpoint_sequential(
-                encoder_layers, len(encoder_layers), embedding
+            result = checkpoint_sequential(
+                encoder_layers,
+                len(encoder_layers),
+                embedding,
+                use_reentrant=False,
             )  # type: ignore
+            if self.encoder.norm is not None:
+                result = self.encoder.norm(result)
+            return result
         return self.encoder(embedding)
 
     def forward(
@@ -230,6 +223,20 @@ class Encoder(nn.Module):
         assert candidates.size(0) == batch_size
         assert candidates.size(1) == MAX_NUM_ACTION_CANDIDATES
 
+        padding_mask = None
+        if self.__architecture == "rmsnorm_swiglu":
+            padding_mask = torch.cat(
+                (
+                    sparse == NUM_TYPES_OF_SPARSE_FEATURES,
+                    torch.zeros(
+                        batch_size, NUM_NUMERIC_FEATURES,
+                        device=device, dtype=torch.bool,
+                    ),
+                    progression == NUM_TYPES_OF_PROGRESSION_FEATURES,
+                    candidates == NUM_TYPES_OF_ACTIONS,
+                ),
+                dim=1,
+            )
         sparse = self.sparse_embedding(sparse)
 
         dtype = sparse.dtype
@@ -242,4 +249,4 @@ class Encoder(nn.Module):
 
         embedding = torch.cat((sparse, numeric, progression, candidates), 1)
 
-        return self.__encode(embedding)
+        return self.__encode(embedding, padding_mask)

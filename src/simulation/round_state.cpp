@@ -324,7 +324,7 @@ RoundState::constructFeatures_(std::uint_fast8_t seat, std::uint_fast8_t const z
   sparse_features.push_back(game_style);
 
   for (std::uint_fast8_t i = 0u; i < 4u; ++i) {
-    std::uint_fast16_t const player_grade = getPlayerGrade(seat);
+    std::uint_fast16_t const player_grade = getPlayerGrade(i);
     sparse_features.push_back(7 + i * 16 + player_grade);
   }
 
@@ -349,7 +349,7 @@ RoundState::constructFeatures_(std::uint_fast8_t seat, std::uint_fast8_t const z
     if (gang_dora_indicator == std::numeric_limits<std::uint_fast8_t>::max()) {
       break;
     }
-    sparse_features.push_back(189 + i * 37 + gang_dora_indicator);
+    sparse_features.push_back(152 + i * 37 + gang_dora_indicator);
   }
 
   Kanachan::Shoupai const &shoupai = shoupai_list_[seat];
@@ -593,7 +593,8 @@ std::pair<std::uint_fast8_t, std::uint_fast8_t> RoundState::checkDaSanyuanPao_()
     }
     KANACHAN_THROW<std::logic_error>(_1) << encode << ": A logic error.";
   }
-  KANACHAN_ASSERT((count < 3u));
+  // The final set may be concealed, so every dragon can be present without pao.
+  KANACHAN_ASSERT((count <= 3u));
   return {
     std::numeric_limits<std::uint_fast8_t>::max(),
     std::numeric_limits<std::uint_fast8_t>::max()
@@ -680,7 +681,8 @@ std::pair<std::uint_fast8_t, std::uint_fast8_t> RoundState::checkDaSixiPao_() co
     }
     KANACHAN_THROW<std::logic_error>(_1) << encode << ": A logic error.";
   }
-  KANACHAN_ASSERT((count < 3u));
+  // Three visible winds, or a concealed fourth kan, do not establish pao.
+  KANACHAN_ASSERT((count <= 4u));
   return {
     static_cast<std::uint_fast8_t>(-1), static_cast<std::uint_fast8_t>(-1)
   };

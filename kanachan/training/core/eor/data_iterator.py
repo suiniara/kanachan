@@ -5,6 +5,7 @@ from tqdm import tqdm
 import torch
 from torch import Tensor
 from torch.utils.data import get_worker_info
+from kanachan.training.core.features import validate_sparse_prefix
 from kanachan.constants import (
     EOR_NUM_TYPES_OF_SPARSE_FEATURES,
     EOR_NUM_SPARSE_FEATURES,
@@ -33,7 +34,7 @@ class DataIterator:
             errmsg = f"{rewrite_rooms}: An invalid value for `rewrite_rooms`."
             raise ValueError(errmsg)
         if rewrite_grades is not None and (
-            rewrite_grades < 0 or rewrite_grades > 14
+            rewrite_grades < 0 or rewrite_grades > 15
         ):
             errmsg = (
                 f"{rewrite_grades}: An invalid value for `rewrite_grades`."
@@ -74,18 +75,21 @@ class DataIterator:
                 pass
 
     def __del__(self) -> None:
-        self.__fp.close()
+        file_pointer = getattr(self, "_DataIterator__fp", None)
+        if file_pointer is not None:
+            file_pointer.close()
 
     def __parse_line(self, line: str) -> tuple[Tensor, Tensor, Tensor]:
         line = line.rstrip("\n")
         uuid, sparse_str, numeric_str, game_result_str = line.split("\t")
 
         _sparse = [int(x) for x in sparse_str.split(",")]
+        validate_sparse_prefix(_sparse, end_of_round=True)
         if len(_sparse) != EOR_NUM_SPARSE_FEATURES:
             errmsg = f"{uuid}: {len(_sparse)}"
             raise RuntimeError(errmsg)
         for x in _sparse:
-            if x >= EOR_NUM_TYPES_OF_SPARSE_FEATURES:
+            if not 0 <= x < EOR_NUM_TYPES_OF_SPARSE_FEATURES:
                 errmsg = f"{uuid}: {x}"
                 raise RuntimeError(errmsg)
         sparse = torch.tensor(_sparse, device="cpu", dtype=torch.int32)
@@ -110,6 +114,9 @@ class DataIterator:
         )
 
         return sparse, numeric, game_result
+
+    def __iter__(self) -> "DataIterator":
+        return self
 
     def __next__(self) -> tuple[Tensor, Tensor, Tensor]:
         worker_info = get_worker_info()

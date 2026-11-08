@@ -131,7 +131,7 @@ class NoisyLinear(nn.Module):
         else:
             weight = self.weight_mu
 
-        bias: Tensor
+        bias: Tensor | None
         if self.bias_mu is not None:
             assert isinstance(self.bias_epsilon, Tensor)
             if self.training:
@@ -139,6 +139,6 @@ class NoisyLinear(nn.Module):
             else:
                 bias = self.bias_mu
         else:
-            bias = torch.zeros_like(x)
+            bias = None
 
         return F.linear(x, weight, bias)  # pylint: disable=not-callable

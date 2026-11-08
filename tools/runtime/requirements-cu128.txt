@@ -1,0 +1,4 @@
+# Validated together in the Linux RTX 5090 image. Reuse its CUDA installation.
+torch==2.9.0+cu128
+tensordict==0.10.0
+torchrl==0.10.1

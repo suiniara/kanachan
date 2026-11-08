@@ -1,4 +1,5 @@
 import logging
+import math
 from typing import Type, Any
 from dataclasses import dataclass
 from omegaconf import MISSING
@@ -6,11 +7,17 @@ from hydra.core.config_store import ConfigStore
 from torch import nn
 from torch.optim.optimizer import Optimizer
 from torch.optim.sgd import SGD
-from torch.optim.adam import Adam
 from torch.optim.radam import RAdam
+from torch.optim import AdamW
 from torch.distributed.optim import ZeroRedundancyOptimizer
+from torch.distributed import is_initialized, get_world_size
 import torch.optim.lr_scheduler as lr_scheduler
-from apex.optimizers import FusedSGD, FusedAdam, FusedLAMB  # type: ignore
+from kanachan.training.core.optimizers import (
+    CompatibleAdam, CompatibleZeroRedundancyOptimizer, Lamb,
+    adamw_parameter_groups,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -70,6 +77,12 @@ class RAdamOptimizerConfig(OptimizerConfig):
 
 
 @dataclass
+class AdamWOptimizerConfig(AdamOptimizerConfig):
+    type: str = "adamw"
+    weight_decay: float = 0.01
+
+
+@dataclass
 class LambOptimizerConfig(OptimizerConfig):
     type: str = "lamb"
     momentum: float | None = None
@@ -86,11 +99,17 @@ class LambOptimizerConfig(OptimizerConfig):
 config_store = ConfigStore.instance()
 config_store.store(name="sgd", node=SgdOptimizerConfig, group="optimizer")
 config_store.store(name="adam", node=AdamOptimizerConfig, group="optimizer")
+config_store.store(name="adamw", node=AdamWOptimizerConfig, group="optimizer")
 config_store.store(name="radam", node=RAdamOptimizerConfig, group="optimizer")
 config_store.store(name="lamb", node=LambOptimizerConfig, group="optimizer")
 
 
 def validate(optimizer_config: Any):
+    if optimizer_config.type == "adamw" and (
+        not math.isfinite(optimizer_config.weight_decay)
+        or optimizer_config.weight_decay < 0
+    ):
+        raise ValueError("AdamW weight_decay must be finite and nonnegative.")
     if optimizer_config.type in ("sgd",):
         if optimizer_config.momentum < 0.0 or 1.0 <= optimizer_config.momentum:
             errmsg = (
@@ -106,7 +125,9 @@ def validate(optimizer_config: Any):
             )
             raise RuntimeError(errmsg)
 
-    if optimizer_config.epsilon <= 0.0:
+    if optimizer_config.type != "sgd" and (
+        optimizer_config.epsilon is None or optimizer_config.epsilon <= 0.0
+    ):
         errmsg = (
             f"{optimizer_config.epsilon}: `optimizer.epsilon` must be a"
             " non-negative real value."
@@ -199,47 +220,42 @@ def dump(optimizer_config: Any, prefix: str = "") -> None:
 def create(
     device_type: str, optimizer_config: Any, module: nn.Module
 ) -> tuple[Optimizer, lr_scheduler.LRScheduler | None]:
-    optimizer_class: Type[Optimizer]
-    if optimizer_config.type == "sgd":
-        if device_type == "cpu":
-            optimizer_class = SGD
-        else:
-            optimizer_class = FusedSGD
-        optimizer_kwargs = {
-            "lr": optimizer_config.learning_rate,
-            "momentum": optimizer_config.momentum,
-        }
-    elif optimizer_config.type == "adam":
-        if device_type == "cpu":
-            optimizer_class = Adam
-        else:
-            optimizer_class = FusedAdam
-        optimizer_kwargs = {
-            "lr": optimizer_config.learning_rate,
-            "eps": optimizer_config.epsilon,
-        }
-    elif optimizer_config.type == "radam":
-        optimizer_class = RAdam
-        optimizer_kwargs = {
-            "lr": optimizer_config.learning_rate,
-            "eps": optimizer_config.epsilon,
-        }
-    elif optimizer_config.type == "lamb":
-        optimizer_class = FusedLAMB
-        optimizer_kwargs = {
-            "lr": optimizer_config.learning_rate,
-            "eps": optimizer_config.epsilon,
-        }
-    else:
+    classes = {
+        "sgd": SGD, "adam": CompatibleAdam, "adamw": AdamW,
+        "radam": RAdam, "lamb": Lamb,
+    }
+    if optimizer_config.type not in classes:
         raise NotImplementedError(optimizer_config.type)
+    optimizer_class: Type[Optimizer] = classes[optimizer_config.type]
+    if device_type == "cuda" and optimizer_config.type in ("sgd", "adam", "lamb"):
+        try:
+            from apex.multi_tensor_apply import multi_tensor_applier
+            from apex.optimizers import FusedAdam, FusedLAMB, FusedSGD
+            if multi_tensor_applier.available:
+                optimizer_class = {"sgd": FusedSGD, "adam": FusedAdam, "lamb": FusedLAMB}[optimizer_config.type]
+        except ImportError:
+            pass
+    logger.info("Using optimizer: %s.%s", optimizer_class.__module__, optimizer_class.__name__)
+    optimizer_kwargs = {"lr": optimizer_config.learning_rate}
+    if optimizer_config.type == "sgd":
+        optimizer_kwargs["momentum"] = optimizer_config.momentum
+    else:
+        optimizer_kwargs["eps"] = optimizer_config.epsilon
+    if optimizer_class is CompatibleAdam and device_type == "cuda":
+        optimizer_kwargs["fused"] = True
+    parameters = module.parameters()
+    if optimizer_config.type == "adamw":
+        parameters = adamw_parameter_groups(module, optimizer_config.weight_decay)
+        if device_type == "cuda":
+            optimizer_kwargs["fused"] = True
 
     optimizer: Optimizer
-    if optimizer_config.use_zero:
-        optimizer = ZeroRedundancyOptimizer(
-            module.parameters(), optimizer_class, **optimizer_kwargs
+    if optimizer_config.use_zero and is_initialized() and get_world_size() > 1:
+        optimizer = CompatibleZeroRedundancyOptimizer(
+            parameters, optimizer_class, **optimizer_kwargs
         )
     else:
-        optimizer = optimizer_class(module.parameters(), **optimizer_kwargs)
+        optimizer = optimizer_class(parameters, **optimizer_kwargs)
 
     if optimizer_config.warmup_steps == 0:
         warmup_scheduler = None

@@ -168,11 +168,12 @@ std::pair<GameMap, RoundMap> parseAnnotations(
   std::regex const e(
     "([[:digit:]]{6}-[[:xdigit:]]{8}(?:-[[:xdigit:]]{4}){3}-[[:xdigit:]]{12})"
     "\t([[:digit:]]+(?:,[[:digit:]]+)+)"
-    "\t([[:digit:]]+(?:,[[:digit:]]+){5})"
+    "\t([[:digit:]]+,[[:digit:]]+(?:,-?[[:digit:]]+){4})"
     "\t(0(?:,[[:digit:]]+)*)"
     "\t([[:digit:]]+(?:,[[:digit:]]+)*)"
     "\t([[:digit:]]+)"
-    "\t([[:digit:]]+(?:,-?[[:digit:]]+){11})");
+    "\t([[:digit:]]+(?:,[[:digit:]]+)*)"
+    "\t(-?[[:digit:]]+(?:,-?[[:digit:]]+){13})");
   GameMap game_map;
   RoundMap round_map;
   for (;;) {
@@ -204,7 +205,7 @@ std::pair<GameMap, RoundMap> parseAnnotations(
     std::string const progression_str = m[4u].str();
     std::string const candidates_str = m[5u].str();
     std::string const index_str = m[6u].str();
-    std::string const result_str = m[7u].str();
+    std::string const result_str = m[8u].str();
 
     Sparse sparse = [&]() -> Sparse
     {
@@ -212,7 +213,7 @@ std::pair<GameMap, RoundMap> parseAnnotations(
       for (auto feature_str : sparse_str | views::split(',')) {
         std::uint_fast16_t const feature
           = castRange<std::uint_fast16_t>(feature_str);
-        if (feature > 525u) {
+        if (feature >= 510u) {
           KANACHAN_THROW<std::runtime_error>(_1)
             << annotation_file_path.string() << ": " << feature
             << ": An invalid sparse feature.";
@@ -235,14 +236,14 @@ std::pair<GameMap, RoundMap> parseAnnotations(
     }
     bool const banzhuang_zhan = (sparse[1u] - 5u == 1u);
 
-    std::uint_fast8_t const seat = sparse[2u] - 7u;
+    std::uint_fast8_t const seat = sparse[6u] - 71u;
     if (seat >= 4u) {
       KANACHAN_THROW<std::runtime_error>(_1)
         << annotation_file_path.string() << ": " << static_cast<unsigned>(seat)
         << ": An invalid seat.";
     }
 
-    std::uint_fast8_t const chang = sparse[3u] - 11u;
+    std::uint_fast8_t const chang = sparse[7u] - 75u;
     if (!banzhuang_zhan && chang > 1u) {
       KANACHAN_THROW<std::runtime_error>(_1)
         << annotation_file_path << ": " << static_cast<unsigned>(chang)
@@ -254,7 +255,7 @@ std::pair<GameMap, RoundMap> parseAnnotations(
         << ": An invalid chang.";
     }
 
-    std::uint_fast8_t const ju = sparse[4u] - 14u;
+    std::uint_fast8_t const ju = sparse[8u] - 78u;
     if (ju >= 4u) {
       KANACHAN_THROW<std::runtime_error>(_1)
         << annotation_file_path.string() << ": " << static_cast<unsigned>(ju)
@@ -336,33 +337,21 @@ std::pair<GameMap, RoundMap> parseAnnotations(
     auto const [delta_scores, final_ranking, final_score]
       = [&]() -> std::tuple<DeltaScores, std::uint_fast8_t, std::int_fast32_t>
     {
-      std::ranges::split_view feature_strs{result_str, ','};
-      auto iter = feature_strs.begin();
-      ++iter;
-      DeltaScores delta_scores_{
-        castRange<std::int_fast32_t>(*iter++),
-        castRange<std::int_fast32_t>(*iter++),
-        castRange<std::int_fast32_t>(*iter++),
-        castRange<std::int_fast32_t>(*iter++)
-      };
-      std::rotate(
-        delta_scores_.begin(), delta_scores_.end() - seat, delta_scores_.end());
-      ++iter;
-      ++iter;
-      ++iter;
-      ++iter;
-      std::uint_fast8_t const final_ranking_ = castRange<unsigned>(*iter++);
-      if (final_ranking_ >= 4u) {
-        KANACHAN_THROW<std::runtime_error>(_1)
-          << annotation_file_path << ": "
-          << static_cast<unsigned>(final_ranking_)
-          << ": An invalid final ranking.";
+      std::vector<std::int_fast32_t> results;
+      for (auto field : result_str | views::split(',')) {
+        results.push_back(castRange<std::int_fast32_t>(field));
       }
-      std::int_fast32_t const final_score_
-        = castRange<std::int_fast32_t>(*iter++);
-      ++iter;
-      if (iter != feature_strs.end()) {
-        KANACHAN_THROW<std::logic_error>("A logic error.");
+      if (results.size() != 14u) {
+        KANACHAN_THROW<std::runtime_error>("Invalid v2 results.");
+      }
+      DeltaScores delta_scores_{results[0u], results[1u], results[2u], results[3u]};
+      std::int_fast32_t const final_score_ = results[10u + seat];
+      std::uint_fast8_t final_ranking_ = 0u;
+      for (std::uint_fast8_t i = 0u; i < 4u; ++i) {
+        if (results[10u + i] > final_score_
+            || (results[10u + i] == final_score_ && i < seat)) {
+          ++final_ranking_;
+        }
       }
       return {delta_scores_, final_ranking_, final_score_};
     }();
@@ -394,19 +383,12 @@ std::pair<GameMap, RoundMap> parseAnnotations(
           std::numeric_limits<std::int_fast32_t>::max()
         }
       };
-      for (std::uint_fast16_t const f : sparse) {
-        if (273u <= f && f <= 288u) {
-          std::get<0u>(players[0u]) = f - 273u;
+      for (std::uint_fast8_t i = 0u; i < 4u; ++i) {
+        std::uint_fast8_t const grade = sparse[2u + i] - (7u + 16u * i);
+        if (grade > 15u) {
+          KANACHAN_THROW<std::runtime_error>("Invalid v2 grade.");
         }
-        if (293u <= f && f <= 308u) {
-          std::get<0u>(players[1u]) = f - 293u;
-        }
-        if (313u <= f && f <= 328u) {
-          std::get<0u>(players[2u]) = f - 313u;
-        }
-        if (333u <= f && f <= 348u) {
-          std::get<0u>(players[3u]) = f - 333u;
-        }
+        std::get<0u>(players[i]) = grade;
       }
       auto const [found, emplaced]
         = game_map.try_emplace(uuid, room, banzhuang_zhan, players);
@@ -471,12 +453,10 @@ struct DecisionLess
 private:
   static std::uint_fast8_t getNumLeftTiles(Sparse const &sparse)
   {
-    for (std::uint_fast16_t const f : sparse) {
-      if (203u <= f && f <= 272u) {
-        return f - 203u;
-      }
+    if (sparse.size() < 10u || sparse[9u] < 82u || sparse[9u] > 151u) {
+      KANACHAN_THROW<std::runtime_error>("Invalid v2 remaining tile count.");
     }
-    KANACHAN_THROW<std::runtime_error>("An wrong annotation.");
+    return sparse[9u] - 82u;
   }
 
 public:
@@ -485,8 +465,8 @@ public:
     Sparse const &sparse0 = std::get<0u>(lhs);
     Numeric const &numeric0 = std::get<1u>(lhs);
     Progression const &progression0 = std::get<2u>(lhs);
-    std::uint_fast8_t const chang0 = sparse0[3u] - 11u;
-    std::uint_fast8_t const ju0 = sparse0[4u] - 14u;
+    std::uint_fast8_t const chang0 = sparse0[7u] - 75u;
+    std::uint_fast8_t const ju0 = sparse0[8u] - 78u;
     std::uint_fast8_t const ben0 = std::get<0u>(numeric0);
     std::uint_fast8_t const turn0 = progression0.size();
     std::uint_fast8_t const num_left_tiles0 = getNumLeftTiles(sparse0);
@@ -494,8 +474,8 @@ public:
     Sparse const &sparse1 = std::get<0u>(rhs);
     Numeric const &numeric1 = std::get<1u>(rhs);
     Progression const &progression1 = std::get<2u>(rhs);
-    std::uint_fast8_t const chang1 = sparse1[3u] - 11u;
-    std::uint_fast8_t const ju1 = sparse1[4u] - 14u;
+    std::uint_fast8_t const chang1 = sparse1[7u] - 75u;
+    std::uint_fast8_t const ju1 = sparse1[8u] - 78u;
     std::uint_fast8_t const ben1 = std::get<0u>(numeric1);
     std::uint_fast8_t const turn1 = progression1.size();
     std::uint_fast8_t const num_left_tiles1 = getNumLeftTiles(sparse1);
@@ -565,9 +545,9 @@ public:
       KANACHAN_THROW<std::runtime_error>(_1)
         << encode << ": An wrong annotation";
     }();
-    std::uint_fast8_t const seat0 = sparse0[2u] - 7u;
+    std::uint_fast8_t const seat0 = sparse0[6u] - 71u;
     std::uint_fast8_t const relseat0 = (seat0 + 4u - dapai_seat) % 4u;
-    std::uint_fast8_t const seat1 = sparse1[2u] - 7u;
+    std::uint_fast8_t const seat1 = sparse1[6u] - 71u;
     std::uint_fast8_t const relseat1 = (seat1 + 4u - dapai_seat) % 4u;
     if (relseat0 < relseat1) {
       return true;
@@ -725,8 +705,8 @@ struct RoundLess
     Decision const &decision0 = decisions0.front();
     Sparse const &sparse0 = std::get<0u>(decision0);
     Numeric const &numeric0 = std::get<1u>(decision0);
-    std::uint_fast8_t const chang0 = sparse0[3u] - 11u;
-    std::uint_fast8_t const ju0 = sparse0[4u] - 14u;
+    std::uint_fast8_t const chang0 = sparse0[7u] - 75u;
+    std::uint_fast8_t const ju0 = sparse0[8u] - 78u;
     std::uint_fast8_t const ben0 = std::get<0u>(numeric0);
 
     auto const &[paishan1, decisions1, delta_scores1] = rhs;
@@ -736,8 +716,8 @@ struct RoundLess
     Decision const &decision1 = decisions1.front();
     Sparse const &sparse1 = std::get<0u>(decision1);
     Numeric const &numeric1 = std::get<1u>(decision1);
-    std::uint_fast8_t const chang1 = sparse1[3u] - 11u;
-    std::uint_fast8_t const ju1 = sparse1[4u] - 14u;
+    std::uint_fast8_t const chang1 = sparse1[7u] - 75u;
+    std::uint_fast8_t const ju1 = sparse1[8u] - 78u;
     std::uint_fast8_t const ben1 = std::get<0u>(numeric1);
 
     if (chang0 < chang1) {

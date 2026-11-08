@@ -6,7 +6,8 @@ from kanachan.constants import (
     EOR_NUM_SPARSE_FEATURES,
     EOR_NUM_NUMERIC_FEATURES,
 )
-from kanachan import piecewise_linear_encoding
+from kanachan.nn.modern_encoder import RMSNormSwiGLUEncoder
+from kanachan.nn.numeric_encoding import encode_numeric_features
 
 
 class RoundEncoder(nn.Module):
@@ -20,6 +21,8 @@ class RoundEncoder(nn.Module):
         num_layers: int,
         activation_function: str,
         dropout: float,
+        layer_normalization: bool = False,
+        architecture: str = "transformer",
         checkpointing: bool,
         device: torch.device,
         dtype: torch.dtype,
@@ -41,10 +44,17 @@ class RoundEncoder(nn.Module):
             raise ValueError(activation_function)
         if dropout < 0.0 or 1.0 <= dropout:
             raise ValueError(dropout)
+        if architecture not in ("transformer", "rmsnorm_swiglu"):
+            raise ValueError(architecture)
+        if architecture == "rmsnorm_swiglu" and layer_normalization:
+            raise ValueError(
+                "rmsnorm_swiglu supplies its own per-token normalization."
+            )
 
         super().__init__()
 
         self.__dimension = dimension
+        self.__architecture = architecture
 
         self.sparse_embedding = nn.Embedding(
             EOR_NUM_TYPES_OF_SPARSE_FEATURES,
@@ -64,17 +74,29 @@ class RoundEncoder(nn.Module):
             numeric_embedding, requires_grad=True
         )
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            self.__dimension,
-            num_heads,
-            dim_feedforward=dim_feedforward,
-            activation=activation_function,
-            dropout=dropout,
-            batch_first=True,
-            device=device,
-            dtype=dtype,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        if architecture == "transformer":
+            encoder_layer = nn.TransformerEncoderLayer(
+                self.__dimension,
+                num_heads,
+                dim_feedforward=dim_feedforward,
+                activation=activation_function,
+                dropout=dropout,
+                batch_first=True,
+                device=device,
+                dtype=dtype,
+            )
+            norm = (
+                nn.LayerNorm(dimension, device=device, dtype=dtype)
+                if layer_normalization else None
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer, num_layers, norm=norm
+            )
+        else:
+            self.encoder = RMSNormSwiGLUEncoder(
+                dimension, num_heads, dim_feedforward, dropout, num_layers,
+                device=device, dtype=dtype,
+            )
 
         self.checkpointing = checkpointing
 
@@ -90,36 +112,9 @@ class RoundEncoder(nn.Module):
 
         device = sparse.device
         dtype = sparse.dtype
-        _numeric = torch.zeros(
-            (batch_size, EOR_NUM_NUMERIC_FEATURES, self.__dimension // 2),
-            requires_grad=False,
-            device=device,
-            dtype=dtype,
+        _numeric = encode_numeric_features(
+            numeric, self.__dimension // 2, device=device, dtype=dtype
         )
-        for i in range(batch_size):
-            benchang = int(numeric[i, 0].item())
-            _numeric[i, 0] = piecewise_linear_encoding(
-                benchang,
-                0.0,
-                self.__dimension // 2,
-                self.__dimension // 2,
-                device,
-                dtype,
-            )
-            deposites = int(numeric[i, 1].item())
-            _numeric[i, 1] = piecewise_linear_encoding(
-                deposites,
-                0.0,
-                self.__dimension // 2,
-                self.__dimension // 2,
-                device,
-                dtype,
-            )
-            for seat in range(4):
-                score = int(numeric[i, 2 + seat].item())
-                _numeric[i, 2 + seat] = piecewise_linear_encoding(
-                    score, 0.0, 100000.0, self.__dimension // 2, device, dtype
-                )
         numeric_embedding = self.numeric_embedding.unsqueeze(0).expand(
             batch_size, -1, -1
         )
@@ -127,11 +122,15 @@ class RoundEncoder(nn.Module):
 
         embedding = torch.cat((sparse, numeric), 1)
 
-        if self.checkpointing:
+        if self.__architecture == "rmsnorm_swiglu":
+            encode = self.encoder(embedding, checkpointing=self.checkpointing)
+        elif self.checkpointing:
             encoder_layers = self.encoder.layers
             encode = checkpoint_sequential(
-                encoder_layers, len(encoder_layers), embedding
+                encoder_layers, len(encoder_layers), embedding, use_reentrant=False
             )
+            if self.encoder.norm is not None:
+                encode = self.encoder.norm(encode)
         else:
             encode = self.encoder(embedding)
         assert isinstance(encode, Tensor)

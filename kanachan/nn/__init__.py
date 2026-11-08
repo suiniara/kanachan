@@ -8,3 +8,7 @@ from .round_encoder import RoundEncoder
 from .symexp import Symexp
 from .symlog_loss import SymlogLoss
 from .twin_q_actor import TwinQActor
+from .decision_decoder import (
+    DenseDecisionDecoder, GlobalActionHead, DecisionContext, HistoryCache,
+    cached_decision,
+)
