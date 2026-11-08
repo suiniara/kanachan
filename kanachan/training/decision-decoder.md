@@ -396,6 +396,24 @@ canonical first-epoch update equality are also covered by regression tests.
 Keep checkpoint spacing based on measured wall time and a disk reserve; these
 options do not enable more frequent checkpoints or relax integrity checks.
 
+For a large complete-trajectory corpus, `streaming_mc=true` uses one spawned
+CPU reader and a bounded queue (`streaming_mc_batches=8` by default) instead
+of retaining the full corpus in RAM. It reuses the canonical episode reader,
+MC returns and sampling policy, computes afterstates from public observations,
+and sends CPU batches to the learner. `streaming_mc_seed` seeds the independent
+reader RNG and is bound to the checkpoint recipe. The learner RNG is separate.
+Use this mode with `candidate_feature_workers=0`; it is an alternative to the
+bounded-subset prepared cache, restricted to sequential single-process
+`discard_v1` MC+CQL without `start_new_epoch`.
+
+A checkpoint pauses prefetch at a request barrier, then stores the canonical
+reader's packed shuffle buffer and RNG, the bounded ready queue and the
+training iterator's lookahead batch. Recovery restores all three, including
+transitions read ahead of the learner cursor; it does not rebuild the entire
+corpus or discard queued samples. CPU regression checks compare canonical
+first-pass order and updates, an exact mid-run resume, a full-queue checkpoint,
+the final short batch, independent learner RNG and worker failure propagation.
+
 ## IQL and optional final-rank supervision
 
 The [Mahjong features and AWR diagnostics guide](decision-features.md) covers

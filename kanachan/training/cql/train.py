@@ -1664,6 +1664,14 @@ def _main(config: DictConfig) -> None:
     tensorboard_path = output_prefix / "tensorboard"
     tensorboard_path.mkdir(parents=True, exist_ok=True)
 
+    if config.streaming_mc and (
+        config.target_kind != "mc" or config.encoder.architecture != "dense_decoder"
+        or config.decoder.candidate_features != "discard_v1" or world_size != 1
+        or config.num_workers != 0 or not config.contiguous_training_data
+        or config.start_new_epoch or config.candidate_feature_workers != 0
+        or config.streaming_mc_batches < 1
+    ):
+        raise ValueError("Streaming afterstates require sequential single-process dense MC+CQL without prepared caching or start_new_epoch.")
     if config.candidate_feature_workers < 0 or config.prepared_mc_bytes < 1 or config.prepared_mc_epochs < 1:
         raise ValueError("Invalid prepared MC workers, RAM budget or epoch count.")
     if config.candidate_feature_workers and (
@@ -1675,7 +1683,16 @@ def _main(config: DictConfig) -> None:
         raise ValueError("Prepared afterstates require sequential single-process dense MC+CQL without start_new_epoch.")
     with SummaryWriter(log_dir=tensorboard_path) as summary_writer, ExitStack() as replay_resources:
         replay_buffer_factory = None
-        if config.candidate_feature_workers:
+        if config.streaming_mc:
+            from kanachan.training.core.offline_rl.streaming_mc import StreamingMCPrefetch
+
+            def replay_buffer_factory(**arguments):
+                return replay_resources.enter_context(StreamingMCPrefetch(
+                    arguments, seed=config.streaming_mc_seed,
+                    batches=config.streaming_mc_batches,
+                    pin_memory=device.type == "cuda",
+                ))
+        elif config.candidate_feature_workers:
             from kanachan.training.core.offline_rl.prepared_mc import PreparedMCCache
 
             def replay_buffer_factory(**arguments):

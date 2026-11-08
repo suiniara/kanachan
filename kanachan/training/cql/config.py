@@ -55,6 +55,9 @@ class Config:
     prepared_mc_bytes: int = 3 * 1024**3
     prepared_mc_seed: int = 20261109
     prepared_mc_epochs: int = 1
+    streaming_mc: bool = False
+    streaming_mc_seed: int = 20261109
+    streaming_mc_batches: int = 8
     defaults: list[Any] = field(default_factory=lambda: [
         {"device": "cuda"},
         {"encoder": "bert_base"},

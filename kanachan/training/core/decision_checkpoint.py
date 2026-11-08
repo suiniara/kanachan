@@ -66,6 +66,11 @@ def recipe(config, algorithm, *, dtype, amp_dtype):
         "data_sha256": file_digest(data),
     }
     if algorithm in ("cql", "iql"):
+        if algorithm == "cql" and config.get("streaming_mc", False):
+            value["streaming_mc"] = {
+                "version": "streaming_mc_afterstate_v1",
+                "seed": config.streaming_mc_seed,
+            }
         if algorithm == "cql" and config.get("candidate_feature_workers", 0):
             value["prepared_mc"] = {
                 "version": "prepared_mc_afterstate_v1",
