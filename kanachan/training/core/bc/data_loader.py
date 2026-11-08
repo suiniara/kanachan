@@ -11,7 +11,10 @@ from kanachan.constants import (
     NUM_RESULTS,
 )
 from kanachan.training.common import get_distributed_environment
-from kanachan.training.core.bc.data_iterator import DataIterator
+from kanachan.training.core.bc.data_iterator import (
+    DataIterator,
+    RawDataIterator,
+)
 from kanachan.training.core.dataset import Dataset
 
 
@@ -30,10 +33,11 @@ class DataLoader:
         num_workers: int = 0,
         pin_memory: bool = False,
         drop_last: bool = False,
+        raw_batches: bool = False,
     ) -> None:
         dataset = Dataset(
             path=path,
-            iterator_class=DataIterator,
+            iterator_class=RawDataIterator if raw_batches else DataIterator,
             num_skip_samples=num_skip_samples,
             rewrite_rooms=rewrite_rooms,
             rewrite_grades=rewrite_grades,
@@ -48,6 +52,7 @@ class DataLoader:
         )
 
         self.__iterator = iter(data_loader)
+        self.__raw_batches = raw_batches
 
     def __iter__(self) -> "DataLoader":
         return self
@@ -63,10 +68,16 @@ class DataLoader:
 
         return batch
 
-    def __next__(self) -> TensorDict:
+    def __next__(self) -> TensorDict | list[str]:
         batch: _Batch = next(self.__iterator)
+        if self.__raw_batches:
+            return batch
         batch = self._split_batch_in_case_of_multiprocess(batch)
 
+        return self.to_tensordict(batch)
+
+    @staticmethod
+    def to_tensordict(batch: _Batch) -> TensorDict:
         assert batch[0].dim() == 2
         batch_size = batch[0].size(0)
         assert batch[0].size(1) == MAX_NUM_ACTIVE_SPARSE_FEATURES

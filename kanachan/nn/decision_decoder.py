@@ -600,11 +600,11 @@ class GlobalActionHead(nn.Module):
                 self.layers[-1].bias.to(dtype),
             )
 
-    def forward(self, candidates, representation, sparse=None, progression=None):
+    def forward(self, candidates, representation, sparse=None, progression=None, candidate_afterstate=None):
         valid, _ = legal_actions(candidates)
-        return self._from_validated(candidates, representation, valid, sparse, progression)
+        return self._from_validated(candidates, representation, valid, sparse, progression, candidate_afterstate)
 
-    def _from_validated(self, candidates, representation, valid, sparse=None, progression=None):
+    def _from_validated(self, candidates, representation, valid, sparse=None, progression=None, candidate_afterstate=None):
         values = self.global_values(representation)
         safe_ids = candidates.masked_fill(~valid, 0).long()
         result = values.gather(1, safe_ids)
@@ -612,7 +612,15 @@ class GlobalActionHead(nn.Module):
             if sparse is None or progression is None:
                 raise ValueError("Candidate afterstates require observer sparse and progression inputs.")
             from kanachan.candidate_features import derive_candidate_features
-            features = derive_candidate_features(sparse, progression, candidates)
+            if candidate_afterstate is None:
+                features = derive_candidate_features(sparse, progression, candidates)
+            else:
+                from kanachan.candidate_features import FEATURE_WIDTH
+                if (candidate_afterstate.shape != (*candidates.shape, FEATURE_WIDTH)
+                        or candidate_afterstate.dtype != torch.float32
+                        or candidate_afterstate.device != candidates.device):
+                    raise ValueError("Precomputed candidate afterstates have invalid shape, dtype or device.")
+                features = candidate_afterstate
             dtype = values.dtype
             with torch.autocast(device_type=representation.device.type, enabled=False):
                 state = F.silu(F.linear(representation.to(dtype), self.layers[0].weight.to(dtype), self.layers[0].bias.to(dtype)))

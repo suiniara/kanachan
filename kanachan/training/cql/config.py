@@ -51,6 +51,10 @@ class Config:
     data_cache_bytes: int = 256 * 1024 * 1024
     export_network: str = "target"
     snapshot_interval: int = 0
+    candidate_feature_workers: int = 0
+    prepared_mc_bytes: int = 3 * 1024**3
+    prepared_mc_seed: int = 20261109
+    prepared_mc_epochs: int = 1
     defaults: list[Any] = field(default_factory=lambda: [
         {"device": "cuda"},
         {"encoder": "bert_base"},

@@ -45,7 +45,10 @@ def scalar_field(value, batch_size, *, name, kind):
 
 
 def action_values(model, data):
-    observation = data.select(*OBSERVATIONS).clone(False)
+    keys = OBSERVATIONS
+    if data.get("candidate_afterstate", None) is not None:
+        keys = (*keys, "candidate_afterstate")
+    observation = data.select(*keys).clone(False)
     model(observation)
     values = observation.get("action_value", None)
     if values is None or values.shape != data["candidates"].shape:

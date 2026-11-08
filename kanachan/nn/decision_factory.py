@@ -93,10 +93,12 @@ def make_candidate_head(config, *, input_dimension, architecture, dtype):
     ))
 
 
-def candidate_head_keys(architecture, config=None):
+def candidate_head_keys(architecture, config=None, *, precomputed=False):
     keys = ["candidates", "encode"] if architecture == "dense_decoder" else ["encode"]
     if getattr(config, "candidate_features", "none") != "none":
         keys += ["sparse", "progression"]
+        if precomputed:
+            keys.append("candidate_afterstate")
     return keys
 
 

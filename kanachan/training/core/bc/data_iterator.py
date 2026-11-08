@@ -89,7 +89,7 @@ class DataIterator(object):
         if file_pointer is not None:
             file_pointer.close()
 
-    def __parse_line(self, line: str) -> _Result:
+    def parse_line(self, line: str) -> _Result:
         line = line.rstrip("\n")
         columns = line.split("\t")
         if len(columns) != 8:
@@ -215,10 +215,13 @@ class DataIterator(object):
         return self
 
     def __next__(self) -> _Result:
+        return self.parse_line(self.next_line())
+
+    def next_line(self) -> str:
         worker_info = get_worker_info()
         if worker_info is None:
             line = next(self.__fp)
-            return self.__parse_line(line)
+            return line
         else:
             line = next(self.__fp)
             try:
@@ -227,4 +230,9 @@ class DataIterator(object):
                     next(self.__fp)
             except StopIteration as _:
                 pass
-            return self.__parse_line(line)
+            return line
+
+
+class RawDataIterator(DataIterator):
+    def __next__(self) -> str:
+        return self.next_line()

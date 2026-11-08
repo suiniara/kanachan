@@ -66,6 +66,12 @@ def recipe(config, algorithm, *, dtype, amp_dtype):
         "data_sha256": file_digest(data),
     }
     if algorithm in ("cql", "iql"):
+        if algorithm == "cql" and config.get("candidate_feature_workers", 0):
+            value["prepared_mc"] = {
+                "version": "prepared_mc_afterstate_v1",
+                "seed": config.prepared_mc_seed,
+                "epochs": config.prepared_mc_epochs,
+            }
         if config.get("bc_initial_model") is not None:
             value["bc_feature_transfer"] = {
                 "sha256": file_digest(config.bc_initial_model),

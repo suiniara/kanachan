@@ -2,6 +2,7 @@
 
 import re
 import datetime
+from contextlib import ExitStack
 import math
 from pathlib import Path
 import os
@@ -105,6 +106,7 @@ def _training(
     round_reward_weight: float = 0.2,
     target_kind: str = "td",
     regression_loss: str = "mse",
+    replay_buffer_factory=None,
 ) -> None:
     if target_kind not in ("td", "mc"):
         raise ValueError("CQL target_kind must be mc or td.")
@@ -151,7 +153,7 @@ def _training(
         get_reward = namespace["get_reward"]
 
     if replay_buffer_size >= 1:
-        data_loader = EpisodeReplayBuffer(
+        data_loader = (replay_buffer_factory or EpisodeReplayBuffer)(
             training_data=training_data,
             contiguous_training_data=contiguous_training_data,
             num_skip_samples=num_samples if replay_state is None else replay_state["input_samples"],
@@ -217,7 +219,7 @@ def _training(
     )
 
     decision_checkpoint.restore(initial_rng_state)
-    checkpointable_replay = isinstance(data_loader, EpisodeReplayBuffer) and data_loader.can_checkpoint
+    checkpointable_replay = bool(getattr(data_loader, "can_checkpoint", False))
     batches = data_loader.iter_with_last() if checkpointable_replay else with_last(data_loader)
     for data, is_last in batches:
         # The reader supplies CPU tensors. Check ranges before device transfer
@@ -225,7 +227,7 @@ def _training(
         assert ((data["action"] >= 0) & (data["action"] < MAX_NUM_ACTION_CANDIDATES)).all().item()
         if target_kind == "mc" and not torch.equal(data["next", "done"], data["next", "end_of_game"]):
             raise ValueError("MC observed returns must terminate only at the end of the half-game.")
-        data = data.to(device=device)
+        data = data.to(device=device, non_blocking=True)
         local_batch_size = int(data.size(0))
         assert isinstance(data, TensorDict)
 
@@ -1662,7 +1664,28 @@ def _main(config: DictConfig) -> None:
     tensorboard_path = output_prefix / "tensorboard"
     tensorboard_path.mkdir(parents=True, exist_ok=True)
 
-    with SummaryWriter(log_dir=tensorboard_path) as summary_writer:
+    if config.candidate_feature_workers < 0 or config.prepared_mc_bytes < 1 or config.prepared_mc_epochs < 1:
+        raise ValueError("Invalid prepared MC workers, RAM budget or epoch count.")
+    if config.candidate_feature_workers and (
+        config.target_kind != "mc" or config.encoder.architecture != "dense_decoder"
+        or config.decoder.candidate_features != "discard_v1" or world_size != 1
+        or config.num_workers != 0 or not config.contiguous_training_data
+        or config.start_new_epoch
+    ):
+        raise ValueError("Prepared afterstates require sequential single-process dense MC+CQL without start_new_epoch.")
+    with SummaryWriter(log_dir=tensorboard_path) as summary_writer, ExitStack() as replay_resources:
+        replay_buffer_factory = None
+        if config.candidate_feature_workers:
+            from kanachan.training.core.offline_rl.prepared_mc import PreparedMCCache
+
+            def replay_buffer_factory(**arguments):
+                if arguments["num_skip_samples"] != 0:
+                    raise ValueError("Prepared MC cache must regenerate from its complete source.")
+                return replay_resources.enter_context(PreparedMCCache(
+                    lambda: EpisodeReplayBuffer(**arguments), workers=config.candidate_feature_workers,
+                    max_bytes=config.prepared_mc_bytes, seed=config.prepared_mc_seed,
+                    epochs=config.prepared_mc_epochs, pin_memory=device.type == "cuda",
+                ))
         torch.autograd.set_detect_anomaly(
             False
         )  # `True` for debbing purpose only.
@@ -1704,6 +1727,7 @@ def _main(config: DictConfig) -> None:
             initial_optimizer_steps=initial_optimizer_steps,
             initial_grad_scaler_state=initial_grad_scaler_state,
             initial_rng_state=initial_rng_state,
+            replay_buffer_factory=replay_buffer_factory,
             summary_writer=summary_writer,
             snapshot_writer=snapshot_writer,
         )  # pylint: disable=missing-kwoa

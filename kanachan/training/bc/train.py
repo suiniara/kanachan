@@ -1,4 +1,5 @@
 import datetime
+from contextlib import ExitStack
 import logging
 import math
 import os
@@ -82,6 +83,7 @@ def _training(
     initial_optimizer_steps: int = 0,
     initial_grad_scaler_state: dict | None = None,
     initial_rng_state: dict | None = None,
+    data_loader_factory=None,
 ) -> None:
     start_time = datetime.datetime.now()
 
@@ -91,7 +93,7 @@ def _training(
 
     # Prepare the training data loader. Note that this data loader must iterate
     # the training data set only once.
-    data_loader = DataLoader(
+    data_loader = (data_loader_factory or DataLoader)(
         path=training_data,
         num_skip_samples=num_samples,
         rewrite_rooms=rewrite_rooms,
@@ -131,7 +133,7 @@ def _training(
 
     decision_checkpoint.restore(initial_rng_state)
     for data, is_last in with_last(data_loader):
-        data = data.to(device=device)
+        data = data.to(device=device, non_blocking=True)
         local_batch_size = int(data.size(0))
 
         action: Tensor = data["action"]
@@ -480,6 +482,16 @@ def _main(config: DictConfig) -> None:
         )
         raise RuntimeError(errmsg)
 
+    if config.candidate_feature_workers < 0 or config.candidate_prefetch_batches < 1:
+        raise ValueError("Candidate feature workers must be nonnegative and prefetch batches positive.")
+    if config.candidate_feature_workers and (
+        config.encoder.architecture != "dense_decoder"
+        or config.decoder.candidate_features != "discard_v1"
+        or config.num_workers != 0
+        or world_size != 1
+    ):
+        raise ValueError("Ordered candidate prefetch requires single-process discard_v1 BC with num_workers=0.")
+
     output_prefix = Path(HydraConfig.get().runtime.output_dir)
 
     if rank == 0:
@@ -578,7 +590,10 @@ def _main(config: DictConfig) -> None:
     decoder.zero_output()
     decoder_tdm = TensorDictModule(
         decoder,
-        in_keys=candidate_head_keys(config.encoder.architecture, config.decoder),
+        in_keys=candidate_head_keys(
+            config.encoder.architecture, config.decoder,
+            precomputed=config.candidate_feature_workers > 0,
+        ),
         out_keys=["decode"],  # type: ignore
     )
     decode_converter = DecodeConverter("log_probs")
@@ -791,7 +806,20 @@ def _main(config: DictConfig) -> None:
 
     tensorboard_path = output_prefix / "tensorboard"
     tensorboard_path.mkdir(parents=True, exist_ok=True)
-    with SummaryWriter(log_dir=tensorboard_path) as summary_writer:
+    with SummaryWriter(log_dir=tensorboard_path) as summary_writer, ExitStack() as loader_resources:
+        data_loader_factory = None
+        if config.candidate_feature_workers:
+            from kanachan.training.core.bc.prefetch import CandidateFeaturePrefetch
+
+            def data_loader_factory(**arguments):
+                return loader_resources.enter_context(CandidateFeaturePrefetch(
+                    DataLoader(**arguments, raw_batches=True), workers=config.candidate_feature_workers,
+                    batches=config.candidate_prefetch_batches,
+                    pin_memory=device.type == "cuda",
+                    raw_batches=True, rewrite_rooms=arguments["rewrite_rooms"],
+                    rewrite_grades=arguments["rewrite_grades"],
+                ))
+
         torch.autograd.set_detect_anomaly(
             False  # `True` for debbing purpose only.
         )
@@ -807,6 +835,7 @@ def _main(config: DictConfig) -> None:
             initial_optimizer_steps=initial_optimizer_steps,
             initial_grad_scaler_state=initial_grad_scaler_state,
             initial_rng_state=initial_rng_state,
+            data_loader_factory=data_loader_factory,
             network_tdm=network_tdm,
             batch_size=config.batch_size,
             gradient_accumulation_steps=config.gradient_accumulation_steps,

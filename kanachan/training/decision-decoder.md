@@ -357,6 +357,45 @@ do not establish a CQL speedup or full-corpus throughput gain.
 
 [Throughput verification receipt](../../runs/remote-data/decision-throughput-acceptance.json).
 
+### Ordered afterstate preparation (2026-11-09)
+
+For single-process `discard_v1` BC with `num_workers=0`,
+`candidate_feature_workers=4 candidate_prefetch_batches=8` moves raw-line
+parsing and native afterstate derivation to an ordered, bounded worker queue.
+It preserves reader order, RNG, labels and the exported raw-observation model
+interface. The default worker count is zero. Precomputed features are temporary
+training tensors and use the same public-observation derivation as inference.
+
+Sequential, single-process MC+CQL can also use `candidate_feature_workers=4`.
+Before updates, it prepares canonical complete-return replay batches in RAM,
+including afterstates. `prepared_mc_bytes` caps retained tensor bytes (default
+3 GiB); leave additional RAM for replay, workers and the trainer. Exceeding the
+cap raises an error. This option is for a bounded input subset that fits in RAM,
+not an entire large corpus. It writes no feature cache to disk.
+
+`prepared_mc_epochs` defaults to one. Additional epochs reuse the same prepared
+batches, shuffling their order with `prepared_mc_seed + epoch`; they do not
+resample individual transitions. This sampling policy, seed and epoch count
+are bound to the checkpoint recipe. Recovery regenerates the cache, verifies
+source/reward/tensor/order hashes, and restores its batch cursor. Checkpoints
+contain the small identity and cursor, not the RAM cache. Prepared mode cannot
+resume a conventional replay checkpoint or use `start_new_epoch`; retain its
+original complete input and exact settings. TD+CQL and the default MC reader
+remain available without prepared mode.
+
+On one RTX 5090 with Torch 2.9/CUDA 12.8, a controlled 65,536-row BC comparison
+used the same 512-dimensional, eight-layer model, batch 256 and BF16/SDPA.
+Ordered parsing/afterstates increased steady throughput from 1,813 to 2,529
+samples/s (39.5%); final model weights were bitwise equal. GPU utilization
+averaged about 63% and 87% during the corresponding measurement windows.
+A separate bounded MC+CQL pilot with batch 512 sustained about 2,560 samples/s
+and 95–96% GPU utilization after preparation. These are workload-specific
+throughput measurements, not playing-strength results. Strict recovery and
+canonical first-epoch update equality are also covered by regression tests.
+
+Keep checkpoint spacing based on measured wall time and a disk reserve; these
+options do not enable more frequent checkpoints or relax integrity checks.
+
 ## IQL and optional final-rank supervision
 
 The [Mahjong features and AWR diagnostics guide](decision-features.md) covers

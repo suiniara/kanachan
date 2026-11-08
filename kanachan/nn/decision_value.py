@@ -46,7 +46,8 @@ class DecisionQNetwork(nn.Module):
             *(data[key] for key in OBSERVATION_KEYS)
         )
         data["action_value"] = self.head._from_validated(
-            data["candidates"], representation, valid, data["sparse"], data["progression"]
+            data["candidates"], representation, valid, data["sparse"], data["progression"],
+            data.get("candidate_afterstate", None),
         )
         return data
 

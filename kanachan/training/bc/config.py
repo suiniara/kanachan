@@ -27,6 +27,8 @@ class Config:
     gradient_accumulation_steps: int = 1
     max_gradient_norm: float = 1.0
     snapshot_interval: int = 0
+    candidate_feature_workers: int = 0
+    candidate_prefetch_batches: int = 8
     defaults: list[Any] = field(default_factory=lambda: [
         {"device": "cuda"},
         {"encoder": "bert_base"},
