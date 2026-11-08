@@ -84,3 +84,11 @@ The report lists compilation cost separately. A built-in FlashAttention
 capability flag alone is not dispatch or performance evidence. FlexAttention
 is a PyTorch prototype API, so retain the SDPA option for comparison.
 See [PyTorch FlexAttention](https://docs.pytorch.org/docs/2.9/nn.attention.flex_attention.html).
+
+The verification process scopes Inductor's `triton.descriptive_names` to
+`torch` and records this naming policy in its report. PyTorch 2.9's default
+ATen naming can otherwise label Flex templates `select` or `zeros`, causing
+the profiler gate to reject an executing CUDA kernel. The gate still requires
+a CUDA event with the Flex source name; it does not accept a CPU event or a
+generic Triton kernel. This changes verification names, not the training
+backend default. See [PyTorch's naming implementation](https://github.com/pytorch/pytorch/blob/v2.9.0/torch/_inductor/utils.py).

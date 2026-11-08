@@ -192,6 +192,8 @@ def benchmark(profile, backend, batch_size, steps, device):
 
 
 def verify(*, cpu_reference=False, profiles=("tiny", "medium"), batch_sizes=(128,), steps=12):
+    from torch._inductor import config as inductor_config
+
     torch.set_num_threads(2)
     result = {"scope": "attention_correctness_and_model_step_microbenchmark_only",
               "torch": torch.__version__, "checked_utc": datetime.now(timezone.utc).isoformat()}
@@ -203,11 +205,16 @@ def verify(*, cpu_reference=False, profiles=("tiny", "medium"), batch_sizes=(128
         raise RuntimeError("This profile requires BF16 support.")
     result.update(gpu=torch.cuda.get_device_name(), capability=torch.cuda.get_device_capability(),
                   fused_cuda_verified=False, equivalence={}, benchmarks=[])
-    for profile in profiles:
-        result["equivalence"][profile] = cuda_equivalence(profile, torch.device("cuda"))
-        for batch in batch_sizes:
-            for backend in ("sdpa_math", "sdpa_auto", "flex"):
-                result["benchmarks"].append(benchmark(profile, backend, batch, steps, torch.device("cuda")))
+    # PyTorch 2.9's default ATen names can label Flex templates "select" or
+    # "zeros". Preserve the source operation in actual CUDA kernel names so
+    # the dispatch gate does not mistake them for an absent Flex kernel.
+    result["kernel_name_policy"] = "torch_source_names"
+    with inductor_config.patch({"triton.descriptive_names": "torch"}):
+        for profile in profiles:
+            result["equivalence"][profile] = cuda_equivalence(profile, torch.device("cuda"))
+            for batch in batch_sizes:
+                for backend in ("sdpa_math", "sdpa_auto", "flex"):
+                    result["benchmarks"].append(benchmark(profile, backend, batch, steps, torch.device("cuda")))
     result.update(status="complete", fused_cuda_verified=True)
     return result
 
