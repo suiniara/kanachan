@@ -43,8 +43,9 @@ convention = "google"
 
 [tool.hatch.build.targets.wheel]
 include = ["/kanachan/**/*.py"]
-artifacts = [
-  "/kanachan/simulation/_simulation.so",
-  "/kanachan/_candidate_features*.so",
-  "/kanachan/_candidate_features*.pyd",
-]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/kanachan/**/*.so", "/kanachan/**/*.pyd"]

@@ -1,7 +1,8 @@
 /src/common/mahjongsoul.pb.h
 /src/common/mahjongsoul.pb.cc
 /build/
-/kanachan/simulation/_simulation.so
+/kanachan/simulation/_simulation*.so
+/kanachan/simulation/_simulation*.pyd
 /.mypy_cache/
 *.pyc
 __pycache__
