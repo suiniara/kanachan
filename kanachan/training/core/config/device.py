@@ -76,7 +76,7 @@ def validate(
         raise RuntimeError(errmsg)
     dtype = parameter_dtypes[config.device.dtype]
     encoder = getattr(config, "encoder", None)
-    if getattr(encoder, "architecture", None) == "dense_decoder" and dtype != torch.float32:
+    if getattr(encoder, "architecture", None) in ("dense_decoder", "structured_dual_v2") and dtype != torch.float32:
         raise RuntimeError(
             "Dense decoder training requires FP32 master parameters "
             "(device.dtype=float32). Select device.amp_dtype=float16 or "

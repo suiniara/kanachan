@@ -45,9 +45,13 @@ def scalar_field(value, batch_size, *, name, kind):
 
 
 def action_values(model, data):
+    from kanachan.nn.structured_iql import V2_OBS_KEYS
+
     keys = OBSERVATIONS
     if data.get("candidate_afterstate", None) is not None:
         keys = (*keys, "candidate_afterstate")
+    if data.get("v2_tile_feats", None) is not None:
+        keys = (*keys, *V2_OBS_KEYS)
     observation = data.select(*keys).clone(False)
     model(observation)
     values = observation.get("action_value", None)
@@ -193,7 +197,7 @@ def q_statistics(values, chosen, candidates, *, temperature=1.0, gap=None,
 
 def scalar_cql_loss(
     source, target, data, alpha, *, td_loss="mse", temperature=1.0,
-    tensor_metrics=False, target_kind="td",
+    tensor_metrics=False, target_kind="td", mask_k1=False,
 ):
     if target_kind == "mc":
         if target is not None:
@@ -213,12 +217,21 @@ def scalar_cql_loss(
     require_tensor(
         (torch.isfinite(coefficient) & (coefficient >= 0)).all(), "Invalid CQL alpha."
     )
+    if mask_k1:
+        has_choice = (data["candidates"] < NUM_TYPES_OF_ACTIONS).sum(-1) >= 2
+        has_f = has_choice.float()
+        cql_reduced = (coefficient * conservative * has_f).sum() / has_f.sum().clamp_min(1.0)
+        cql_metric = (conservative.detach() * has_f).sum() / has_f.sum().clamp_min(1.0)
+        total_loss = td.mean() + cql_reduced
+    else:
+        cql_metric = conservative.detach().mean()
+        total_loss = (td + coefficient * conservative).mean()
     metrics = {
         ("return_loss" if target_kind == "mc" else "td_loss"): td.detach().mean(),
-        "cql_loss": conservative.detach().mean(),
+        "cql_loss": cql_metric,
         "mean_q": chosen.detach().mean(),
         "mean_target": expected.detach().mean(),
     }
     if not tensor_metrics:
         metrics = {key: float(value) for key, value in metrics.items()}
-    return (td + coefficient * conservative).mean(), metrics
+    return total_loss, metrics

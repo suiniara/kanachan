@@ -34,11 +34,15 @@ def _unpack_replay(state):
     return state
 
 
-def _reader(connection, arguments, seed, saved, threads):
+def _reader(
+    connection, arguments, seed, saved, threads,
+    feature_mode="discard_v1", enable_early_shape_hint=False,
+):
     # Spawn starts a separate interpreter; the input worker never uses CUDA.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     try:
         from kanachan.candidate_features import derive_candidate_features
+        from kanachan.structured_v2 import derive_structured_v2_batch
         from kanachan.training.core.offline_rl import EpisodeReplayBuffer
 
         torch.set_num_threads(threads)
@@ -58,9 +62,18 @@ def _reader(connection, arguments, seed, saved, threads):
                 except StopIteration:
                     _send(connection, "end", None)
                     continue
-                batch["candidate_afterstate"] = derive_candidate_features(
-                    batch["sparse"], batch["progression"], batch["candidates"]
-                )
+                if feature_mode == "structured_v2":
+                    feats = derive_structured_v2_batch(
+                        batch["sparse"], batch["numeric"], batch["progression"], batch["candidates"],
+                        enable_early_shape_hint=enable_early_shape_hint,
+                        include_room_level=False,
+                    )
+                    for k, v in feats.items():
+                        batch[k] = v
+                elif feature_mode == "discard_v1":
+                    batch["candidate_afterstate"] = derive_candidate_features(
+                        batch["sparse"], batch["progression"], batch["candidates"]
+                    )
                 _send(connection, "batch", batch.to_dict())
             elif command == "state":
                 _send(connection, "state", _pack_replay(source.state_dict()))
@@ -92,16 +105,24 @@ class StreamingMCPrefetch:
     can_checkpoint = True
 
     def __init__(
-        self, arguments, *, seed, batches=8, threads=2, pin_memory=False
+        self, arguments, *, seed, batches=8, threads=2, pin_memory=False,
+        feature_mode="discard_v1", enable_early_shape_hint=False,
     ):
         if batches < 1 or threads < 1:
             raise ValueError(
                 "MC prefetch capacity and CPU threads must be positive."
             )
+        if feature_mode not in ("none", "discard_v1", "structured_v2"):
+            raise ValueError(f"Unsupported StreamingMC feature_mode: {feature_mode}")
+        version = (
+            "streaming_mc_structured_v2"
+            if feature_mode == "structured_v2"
+            else ("streaming_mc_none_v1" if feature_mode == "none" else "streaming_mc_afterstate_v1")
+        )
         path = arguments["training_data"]
         stat = path.stat()
         self.identity = {
-            "version": "streaming_mc_afterstate_v1",
+            "version": version,
             "source": (str(path.resolve()), stat.st_size, stat.st_mtime_ns),
             "seed": seed,
             "batch_size": arguments["batch_size"],
@@ -116,6 +137,8 @@ class StreamingMCPrefetch:
         self.arguments = dict(arguments, pin_memory=False)
         self.seed, self.capacity, self.threads = seed, batches, threads
         self.pin_memory = pin_memory
+        self.feature_mode = feature_mode
+        self.enable_early_shape_hint = bool(enable_early_shape_hint)
         self.condition = Condition()
         self.ready = deque()
         self.pending = None
@@ -133,7 +156,10 @@ class StreamingMCPrefetch:
         self.connection, child = context.Pipe()
         self.process = context.Process(
             target=_reader,
-            args=(child, self.arguments, self.seed, self.saved, self.threads),
+            args=(
+                child, self.arguments, self.seed, self.saved, self.threads,
+                self.feature_mode, self.enable_early_shape_hint,
+            ),
             daemon=True,
         )
         self.process.start()

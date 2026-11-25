@@ -219,18 +219,19 @@ class DataIterator(object):
 
     def next_line(self) -> str:
         worker_info = get_worker_info()
-        if worker_info is None:
+        try:
             line = next(self.__fp)
-            return line
-        else:
-            line = next(self.__fp)
+        except StopIteration:
+            self.__fp.close()
+            raise
+        if worker_info is not None:
             try:
                 assert worker_info.num_workers >= 1
                 for _ in range(worker_info.num_workers - 1):
                     next(self.__fp)
-            except StopIteration as _:
+            except StopIteration:
                 pass
-            return line
+        return line
 
 
 class RawDataIterator(DataIterator):

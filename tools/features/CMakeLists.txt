@@ -7,7 +7,12 @@ if(NOT KANACHAN_PYTHON_INCLUDE_DIR OR NOT KANACHAN_PYTHON_LIBRARY)
   set(KANACHAN_PYTHON_INCLUDE_DIR "${Python3_INCLUDE_DIRS}")
   set(KANACHAN_PYTHON_LIBRARY "${Python3_LIBRARIES}")
 endif()
-add_library(_candidate_features MODULE "${KANACHAN_ROOT}/src/features/candidate_features.cpp")
+add_library(_candidate_features MODULE
+  "${KANACHAN_ROOT}/src/features/candidate_features.cpp"
+  "${KANACHAN_ROOT}/src/features/structured_v2.cpp"
+  "${KANACHAN_ROOT}/src/features/structured_v2.hpp"
+  "${KANACHAN_ROOT}/src/features/structured_v2_tables.hpp"
+  "${KANACHAN_ROOT}/src/features/mjsoul_hand_eval.hpp")
 target_compile_features(_candidate_features PRIVATE cxx_std_20)
 target_include_directories(_candidate_features PRIVATE "${KANACHAN_NYANTEN_ROOT}" "${KANACHAN_PYTHON_INCLUDE_DIR}")
 target_link_libraries(_candidate_features PRIVATE "${KANACHAN_PYTHON_LIBRARY}")

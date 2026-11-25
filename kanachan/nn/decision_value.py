@@ -6,13 +6,50 @@ from tensordict.nn import TensorDictSequential
 from kanachan.nn.decode_converter import DecodeConverter
 from kanachan.nn.decision_decoder import DenseDecisionDecoder, GlobalActionHead
 from kanachan.nn.decision_state import DecisionStateHead
+from kanachan.nn.structured_dual_decoder import (
+    StructuredActionHead,
+    StructuredDualDecoder,
+    StructuredStateHead,
+)
 
 
 OBSERVATION_KEYS = ["sparse", "numeric", "progression", "candidates"]
 
 
+def _transfer_structured_bc(backbone: StructuredDualDecoder, head, bc_model):
+    bodies = [m for m in bc_model.modules() if type(m) is StructuredDualDecoder]
+    heads = [m for m in bc_model.modules() if type(m) is StructuredActionHead]
+    if (
+        type(head) not in (StructuredActionHead, StructuredStateHead)
+        or len(bodies) != 1 or len(heads) != 1
+    ):
+        raise ValueError("BC transfer needs one matching StructuredDualDecoder and StructuredActionHead.")
+    teacher, teacher_head = bodies[0], heads[0]
+
+    def sig(body: StructuredDualDecoder):
+        return (
+            body.dimension, body.num_heads, body.dim_feedforward,
+            body.n_d1_layers, body.n_d2_layers, body.use_rel_bias,
+            body.cand_self_attn, body.head_type, body.enable_early_shape_hint,
+            body.rope_base,
+        )
+
+    if sig(backbone) != sig(teacher):
+        raise ValueError("Structured V2 BC and Q backbone architectures differ.")
+    backbone.load_state_dict(teacher.state_dict(), strict=True)
+    if type(head) is StructuredActionHead and head.head_type == teacher_head.head_type:
+        if head.mlp is not None and teacher_head.mlp is not None:
+            if head.mlp[0].weight.shape != teacher_head.mlp[0].weight.shape:
+                raise ValueError("BC and Q hidden head dimensions differ.")
+            head.mlp[0].load_state_dict(teacher_head.mlp[0].state_dict(), strict=True)
+    head.zero_output()
+
+
 def transfer_bc_features(backbone, head, bc_model):
     """Copy learned features, including the hidden head, never BC logits as Q."""
+    if type(backbone) is StructuredDualDecoder:
+        _transfer_structured_bc(backbone, head, bc_model)
+        return
     bodies = [m for m in bc_model.modules() if type(m) is DenseDecisionDecoder]
     heads = [m for m in bc_model.modules() if type(m) is GlobalActionHead]
     if type(backbone) is not DenseDecisionDecoder or type(head) not in (GlobalActionHead, DecisionStateHead) or len(bodies) != 1 or len(heads) != 1:

@@ -406,26 +406,42 @@ def _training(
                 q2_optimizer.zero_grad()
                 continue
 
-            v_gradient_norm = _step(
-                value_network,
-                v_max_gradient_norm,
-                value_optimizer,
-                value_lr_scheduler,
+            def _step_grad(
+                network: nn.Module,
+                max_gradient_norm: float,
+                optimizer: Optimizer,
+            ) -> float:
+                gradient = get_gradient(network)
+                # pylint: disable=not-callable
+                gradient_norm = float(torch.linalg.vector_norm(gradient).item())
+                nn.utils.clip_grad_norm_(
+                    network.parameters(),
+                    max_gradient_norm,
+                    error_if_nonfinite=True,
+                )
+                grad_scaler.step(optimizer)
+                return gradient_norm
+
+            v_gradient_norm = _step_grad(
+                value_network, v_max_gradient_norm, value_optimizer,
             )
-            q1_gradient_norm = _step(
-                q1_source_network,
-                q_max_gradient_norm,
-                q1_optimizer,
-                q1_lr_scheduler,
+            q1_gradient_norm = _step_grad(
+                q1_source_network, q_max_gradient_norm, q1_optimizer,
             )
-            q2_gradient_norm = _step(
-                q2_source_network,
-                q_max_gradient_norm,
-                q2_optimizer,
-                q2_lr_scheduler,
+            q2_gradient_norm = _step_grad(
+                q2_source_network, q_max_gradient_norm, q2_optimizer,
             )
+            old_scale = grad_scaler.get_scale() if grad_scaler.is_enabled() else None
             grad_scaler.update()
-            progress.optimizer_step(num_samples)
+            step_skipped = old_scale is not None and grad_scaler.get_scale() < old_scale
+            if not step_skipped:
+                if value_lr_scheduler is not None:
+                    value_lr_scheduler.step()
+                if q1_lr_scheduler is not None:
+                    q1_lr_scheduler.step()
+                if q2_lr_scheduler is not None:
+                    q2_lr_scheduler.step()
+                progress.optimizer_step(num_samples)
 
             value_optimizer.zero_grad()
             q1_optimizer.zero_grad()
@@ -640,16 +656,16 @@ def _main(config: DictConfig) -> None:
         )
 
     if config.bc_initial_model is not None:
-        if config.encoder.architecture != "dense_decoder":
-            raise ValueError("bc_initial_model requires a dense decision decoder.")
+        if config.encoder.architecture not in ("dense_decoder", "structured_dual_v2"):
+            raise ValueError("bc_initial_model requires dense_decoder or structured_dual_v2.")
         if config.initial_model_prefix is not None or config.encoder.load_from is not None:
             raise ValueError("bc_initial_model conflicts with resume or encoder.load_from.")
         if not config.bc_initial_model.is_file():
             raise ValueError("bc_initial_model must be an existing model file.")
     if not math.isfinite(config.final_rank_weight) or config.final_rank_weight < 0:
         raise ValueError("final_rank_weight must be finite and nonnegative.")
-    if config.final_rank_weight > 0 and config.encoder.architecture != "dense_decoder":
-        raise ValueError("The final-rank auxiliary head requires a dense decision decoder.")
+    if config.final_rank_weight > 0 and config.encoder.architecture not in ("dense_decoder", "structured_dual_v2"):
+        raise ValueError("The final-rank auxiliary head requires dense_decoder or structured_dual_v2.")
     if not config.double_q_learning:
         raise ValueError("IQL requires two critics; double_q_learning=false is not supported.")
 
@@ -1200,6 +1216,11 @@ def _main(config: DictConfig) -> None:
             broadcast(_param.data, src=0)
         value_network.to(device="cpu")
 
+    head_extra = (
+        {"head_type": getattr(config.encoder, "head_type", "factorized")}
+        if config.encoder.architecture == "structured_dual_v2"
+        else {}
+    )
     q1_source_encoder = make_backbone(
         config.encoder, checkpointing=config.checkpointing, dtype=dtype
     )
@@ -1210,7 +1231,7 @@ def _main(config: DictConfig) -> None:
     )
     q1_source_decoder = make_candidate_head(
         config.decoder, input_dimension=config.encoder.dimension,
-        architecture=config.encoder.architecture, dtype=dtype,
+        architecture=config.encoder.architecture, dtype=dtype, **head_extra,
     )
     q1_source_decoder.zero_output()
     q1_source_decoder_tdm = TensorDictModule(
@@ -1237,7 +1258,7 @@ def _main(config: DictConfig) -> None:
     )
     q2_source_decoder = make_candidate_head(
         config.decoder, input_dimension=config.encoder.dimension,
-        architecture=config.encoder.architecture, dtype=dtype,
+        architecture=config.encoder.architecture, dtype=dtype, **head_extra,
     )
     q2_source_decoder.zero_output()
     q2_source_decoder_tdm = TensorDictModule(
@@ -1264,7 +1285,7 @@ def _main(config: DictConfig) -> None:
     )
     q1_target_decoder = make_candidate_head(
         config.decoder, input_dimension=config.encoder.dimension,
-        architecture=config.encoder.architecture, dtype=dtype,
+        architecture=config.encoder.architecture, dtype=dtype, **head_extra,
     )
     q1_target_decoder_tdm = TensorDictModule(
         q1_target_decoder,
@@ -1290,7 +1311,7 @@ def _main(config: DictConfig) -> None:
     )
     q2_target_decoder = make_candidate_head(
         config.decoder, input_dimension=config.encoder.dimension,
-        architecture=config.encoder.architecture, dtype=dtype,
+        architecture=config.encoder.architecture, dtype=dtype, **head_extra,
     )
     q2_target_decoder_tdm = TensorDictModule(
         q2_target_decoder,
@@ -1308,7 +1329,7 @@ def _main(config: DictConfig) -> None:
 
     model_to_save = TwinQActor(
         q1_target_network, q2_target_network, return_values=True,
-        tie_break_by_action_id=config.encoder.architecture == "dense_decoder",
+        tie_break_by_action_id=config.encoder.architecture in ("dense_decoder", "structured_dual_v2"),
     )
     model_to_save_tdm = TensorDictModule(
         model_to_save,
@@ -1328,8 +1349,13 @@ def _main(config: DictConfig) -> None:
         # both deterministic critics identical forever. Give each its own
         # fresh readout; never copy the BC action logits into a value function.
         for head in (q1_source_decoder, q2_source_decoder):
-            nn.init.normal_(head.layers[-1].weight, std=0.02)
-            nn.init.zeros_(head.layers[-1].bias)
+            out_layer = (
+                head.layers[-1] if hasattr(head, "layers")
+                else (head.mlp[-1] if getattr(head, "mlp", None) is not None else head.flat_proj)
+            )
+            nn.init.normal_(out_layer.weight, std=0.02)
+            if out_layer.bias is not None:
+                nn.init.zeros_(out_layer.bias)
         q1_target_network.load_state_dict(q1_source_network.state_dict())
         q2_target_network.load_state_dict(q2_source_network.state_dict())
         del teacher
@@ -1612,7 +1638,7 @@ def _main(config: DictConfig) -> None:
                 network_description(q1_target_network, config, dtype=dtype),
                 network_description(q2_target_network, config, dtype=dtype),
             ], {"return_values": True,
-                "tie_break_by_action_id": config.encoder.architecture == "dense_decoder"})],
+                "tie_break_by_action_id": config.encoder.architecture in ("dense_decoder", "structured_dual_v2")})],
             {"in_keys": ["sparse", "numeric", "progression", "candidates"],
              "out_keys": ["action", "action_value"]},
         )

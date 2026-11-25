@@ -28,11 +28,15 @@ class PreparedMCCache:
         seed,
         epochs=1,
         pin_memory=False,
+        feature_mode="discard_v1",
+        enable_early_shape_hint=False,
     ):
         if max_bytes <= 0 or epochs < 1:
             raise ValueError(
                 "Prepared MC memory budget and epochs must be positive."
             )
+        if feature_mode not in ("none", "discard_v1", "structured_v2"):
+            raise ValueError(f"Unsupported PreparedMC feature_mode: {feature_mode}")
         self.batches = []
         self.position = 0
         self.pin_memory = pin_memory
@@ -43,7 +47,8 @@ class PreparedMCCache:
             random.seed(seed)
             source = source_factory()
             with CandidateFeaturePrefetch(
-                source, workers=workers, batches=2 * workers
+                source, workers=workers, batches=2 * workers,
+                mode=feature_mode, enable_early_shape_hint=enable_early_shape_hint,
             ) as pipeline:
                 for batch in pipeline:
                     # Release IPC/shared-memory storages instead of retaining
@@ -74,7 +79,11 @@ class PreparedMCCache:
                 random.Random(seed + epoch).shuffle(order)
             self.orders.extend(order)
         self.identity = {
-            "version": "prepared_mc_afterstate_v1",
+            "version": (
+                "prepared_mc_structured_v2"
+                if feature_mode == "structured_v2"
+                else ("prepared_mc_none_v1" if feature_mode == "none" else "prepared_mc_afterstate_v1")
+            ),
             "source": provenance["source"],
             "reward_identity": provenance["reward_identity"],
             "discount_factor": provenance["discount_factor"],

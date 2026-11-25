@@ -55,7 +55,7 @@ from kanachan.nn.functional import compute_td_target
 from kanachan.training.core.rl.rewards import PlacementReward
 from kanachan.model_loader import dump_object, dump_model, load_model
 from kanachan.nn.decision_factory import (
-    make_backbone, backbone_kwargs, make_candidate_head,
+    make_backbone, backbone_kwargs, backbone_in_keys, make_candidate_head,
     candidate_head_kwargs, candidate_head_keys,
 )
 from kanachan.training.core.rl.discrete_cql import (
@@ -107,6 +107,7 @@ def _training(
     target_kind: str = "td",
     regression_loss: str = "mse",
     replay_buffer_factory=None,
+    mask_k1: bool = False,
 ) -> None:
     if target_kind not in ("td", "mc"):
         raise ValueError("CQL target_kind must be mc or td.")
@@ -286,7 +287,14 @@ def _training(
         per_sample_regularizer = conservative_penalty(
             masked_q, q_sa, cql_temperature
         )
-        loss_regularizer = alpha * per_sample_regularizer.mean()
+        if mask_k1:
+            has_choice = (data["candidates"] < NUM_TYPES_OF_ACTIONS).sum(dim=-1) >= 2
+            choice_f = has_choice.to(per_sample_regularizer.dtype)
+            loss_regularizer = (
+                alpha * (per_sample_regularizer * choice_f).sum() / choice_f.sum().clamp_min(1.0)
+            )
+        else:
+            loss_regularizer = alpha * per_sample_regularizer.mean()
         loss_td_error = 0.5 * td_error
         loss = loss_regularizer + loss_td_error
         regression_tag = "Loss (MC Return)" if target_kind == "mc" else "Loss (TD Error)"
@@ -343,11 +351,14 @@ def _training(
                 continue
             gradient_norm = float(norm)
 
+            old_scale = grad_scaler.get_scale() if grad_scaler.is_enabled() else None
             grad_scaler.step(optimizer)
             grad_scaler.update()
-            progress.optimizer_step(num_samples)
-            if scheduler is not None:
-                scheduler.step()
+            step_skipped = old_scale is not None and grad_scaler.get_scale() < old_scale
+            if not step_skipped:
+                progress.optimizer_step(num_samples)
+                if scheduler is not None:
+                    scheduler.step()
             optimizer.zero_grad()
 
             if (
@@ -787,13 +798,17 @@ def _main(config: DictConfig) -> None:
     ):
         raise ValueError("Round rewards need complete episode replay and cannot be combined with reward_plugin or reward_model.")
     if config.bc_initial_model is not None:
-        if config.encoder.architecture != "dense_decoder" or config.encoder.load_from is not None or config.decoder.load_from is not None:
-            raise ValueError("bc_initial_model requires the dense decoder and conflicts with partial snapshot loading.")
+        if (
+            config.encoder.architecture not in ("dense_decoder", "structured_dual_v2")
+            or config.encoder.load_from is not None
+            or config.decoder.load_from is not None
+        ):
+            raise ValueError("bc_initial_model requires dense_decoder/structured_dual_v2 and conflicts with partial snapshot loading.")
         if not config.bc_initial_model.is_file():
             raise ValueError("The BC feature reference model does not exist.")
-    if config.encoder.architecture == "dense_decoder":
+    if config.encoder.architecture in ("dense_decoder", "structured_dual_v2"):
         if config.num_qr_intervals is not None or (config.target_kind == "td" and not config.double_q_learning):
-            raise ValueError("Dense decoder CQL requires scalar MC returns or Double DQN.")
+            raise ValueError("Dense/Structured V2 CQL requires scalar MC returns or Double DQN.")
         if config.decoder.load_from is not None:
             raise ValueError(
                 "Transfer only encoder.load_from from BC; initialize a new Q head. "
@@ -1015,12 +1030,22 @@ def _main(config: DictConfig) -> None:
         config, "cql", dtype=dtype, amp_dtype=amp_dtype
     )
     initial_rng_state = decision_checkpoint.validate_resume(config, decision_recipe)
+    use_v2_precomputed = (
+        config.encoder.architecture == "structured_dual_v2"
+        and (config.streaming_mc or config.candidate_feature_workers > 0)
+    )
+    head_extra = (
+        {"head_type": getattr(config.encoder, "head_type", "factorized")}
+        if config.encoder.architecture == "structured_dual_v2"
+        else {}
+    )
+    enc_in_keys = backbone_in_keys(config.encoder, precomputed=use_v2_precomputed)
     encoder = make_backbone(
         config.encoder, checkpointing=config.checkpointing, dtype=dtype
     )
     encoder_tdm = TensorDictModule(
         encoder,
-        in_keys=["sparse", "numeric", "progression", "candidates"],  # type: ignore
+        in_keys=enc_in_keys,  # type: ignore
         out_keys=["encode"],  # type: ignore
     )
     decoder: nn.Module
@@ -1030,6 +1055,7 @@ def _main(config: DictConfig) -> None:
             input_dimension=config.encoder.dimension,
             architecture=config.encoder.architecture,
             dtype=dtype,
+            **head_extra,
         )
         decoder_tdm = TensorDictModule(
             decoder,
@@ -1074,7 +1100,7 @@ def _main(config: DictConfig) -> None:
         )
         target_encoder_tdm = TensorDictModule(
             target_encoder,
-            in_keys=["sparse", "numeric", "progression", "candidates"],  # type: ignore
+            in_keys=enc_in_keys,  # type: ignore
             out_keys=["encode"],  # type: ignore
         )
         if config.num_qr_intervals is None:
@@ -1083,6 +1109,7 @@ def _main(config: DictConfig) -> None:
                 input_dimension=config.encoder.dimension,
                 architecture=config.encoder.architecture,
                 dtype=dtype,
+                **head_extra,
             )
             target_decoder_tdm = TensorDictModule(
                 target_decoder,
@@ -1121,7 +1148,8 @@ def _main(config: DictConfig) -> None:
     q_decoder_tdm: TensorDictModule | None = None
     if config.num_qr_intervals is None:
         argmax_layer = DecodeConverter(
-            "argmax", tie_break_by_action_id=config.encoder.architecture == "dense_decoder"
+            "argmax",
+            tie_break_by_action_id=config.encoder.architecture in ("dense_decoder", "structured_dual_v2"),
         )
         argmax_layer_tdm = TensorDictModule(
             argmax_layer,
@@ -1325,7 +1353,7 @@ def _main(config: DictConfig) -> None:
             )
             return
 
-        if config.encoder.architecture == "dense_decoder":
+        if config.encoder.architecture in ("dense_decoder", "structured_dual_v2"):
             values, chosen, expected = td_components(
                 td_source, td_target if config.double_q_learning else None,
                 data, default_discount=config.discount_factor,
@@ -1527,6 +1555,7 @@ def _main(config: DictConfig) -> None:
                                 candidate_head_kwargs(
                                     config.decoder, input_dimension=config.encoder.dimension,
                                     architecture=config.encoder.architecture, dtype=dtype,
+                                    **head_extra,
                                 ),
                             ),
                         ],
@@ -1541,7 +1570,11 @@ def _main(config: DictConfig) -> None:
                             dump_object(
                                 argmax_layer,
                                 ["argmax"],
-                                {"tie_break_by_action_id": config.encoder.architecture == "dense_decoder"},
+                                {
+                                    "tie_break_by_action_id": config.encoder.architecture in (
+                                        "dense_decoder", "structured_dual_v2"
+                                    )
+                                },
                             ),
                         ],
                         {
@@ -1664,23 +1697,35 @@ def _main(config: DictConfig) -> None:
     tensorboard_path = output_prefix / "tensorboard"
     tensorboard_path.mkdir(parents=True, exist_ok=True)
 
+    is_dense_mc = (
+        config.encoder.architecture == "dense_decoder"
+        and config.decoder.candidate_features == "discard_v1"
+    )
+    is_v2_mc = (
+        config.encoder.architecture == "structured_dual_v2"
+        and getattr(config.decoder, "candidate_features", "none") in ("none", "structured_v2")
+    )
     if config.streaming_mc and (
-        config.target_kind != "mc" or config.encoder.architecture != "dense_decoder"
-        or config.decoder.candidate_features != "discard_v1" or world_size != 1
-        or config.num_workers != 0 or not config.contiguous_training_data
-        or config.start_new_epoch or config.candidate_feature_workers != 0
-        or config.streaming_mc_batches < 1
+        config.target_kind != "mc" or not (is_dense_mc or is_v2_mc)
+        or world_size != 1 or config.num_workers != 0
+        or not config.contiguous_training_data or config.start_new_epoch
+        or config.candidate_feature_workers != 0 or config.streaming_mc_batches < 1
     ):
-        raise ValueError("Streaming afterstates require sequential single-process dense MC+CQL without prepared caching or start_new_epoch.")
+        raise ValueError("Streaming MC prefetch requires sequential single-process dense/v2 MC+CQL without prepared caching or start_new_epoch.")
     if config.candidate_feature_workers < 0 or config.prepared_mc_bytes < 1 or config.prepared_mc_epochs < 1:
         raise ValueError("Invalid prepared MC workers, RAM budget or epoch count.")
     if config.candidate_feature_workers and (
-        config.target_kind != "mc" or config.encoder.architecture != "dense_decoder"
-        or config.decoder.candidate_features != "discard_v1" or world_size != 1
-        or config.num_workers != 0 or not config.contiguous_training_data
-        or config.start_new_epoch
+        config.target_kind != "mc" or not (is_dense_mc or is_v2_mc)
+        or world_size != 1 or config.num_workers != 0
+        or not config.contiguous_training_data or config.start_new_epoch
     ):
-        raise ValueError("Prepared afterstates require sequential single-process dense MC+CQL without start_new_epoch.")
+        raise ValueError("Prepared MC cache requires sequential single-process dense/v2 MC+CQL without start_new_epoch.")
+    mc_feature_mode = (
+        "structured_v2"
+        if config.encoder.architecture == "structured_dual_v2"
+        else "discard_v1"
+    )
+    mc_early_hint = getattr(config.encoder, "enable_early_shape_hint", False)
     with SummaryWriter(log_dir=tensorboard_path) as summary_writer, ExitStack() as replay_resources:
         replay_buffer_factory = None
         if config.streaming_mc:
@@ -1691,6 +1736,8 @@ def _main(config: DictConfig) -> None:
                     arguments, seed=config.streaming_mc_seed,
                     batches=config.streaming_mc_batches,
                     pin_memory=device.type == "cuda",
+                    feature_mode=mc_feature_mode,
+                    enable_early_shape_hint=mc_early_hint,
                 ))
         elif config.candidate_feature_workers:
             from kanachan.training.core.offline_rl.prepared_mc import PreparedMCCache
@@ -1702,6 +1749,8 @@ def _main(config: DictConfig) -> None:
                     lambda: EpisodeReplayBuffer(**arguments), workers=config.candidate_feature_workers,
                     max_bytes=config.prepared_mc_bytes, seed=config.prepared_mc_seed,
                     epochs=config.prepared_mc_epochs, pin_memory=device.type == "cuda",
+                    feature_mode=mc_feature_mode,
+                    enable_early_shape_hint=mc_early_hint,
                 ))
         torch.autograd.set_detect_anomaly(
             False
@@ -1745,6 +1794,7 @@ def _main(config: DictConfig) -> None:
             initial_grad_scaler_state=initial_grad_scaler_state,
             initial_rng_state=initial_rng_state,
             replay_buffer_factory=replay_buffer_factory,
+            mask_k1=(config.encoder.architecture == "structured_dual_v2"),
             summary_writer=summary_writer,
             snapshot_writer=snapshot_writer,
         )  # pylint: disable=missing-kwoa

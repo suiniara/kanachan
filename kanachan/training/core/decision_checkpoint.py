@@ -9,6 +9,10 @@ from omegaconf import OmegaConf
 
 from kanachan.nn.decision_decoder import ARCHITECTURE_ID, feature_schema
 from kanachan.nn.decision_factory import backbone_kwargs, candidate_head_kwargs
+from kanachan.nn.structured_dual_decoder import (
+    ARCHITECTURE_ID as STRUCTURED_V2_ARCHITECTURE_ID,
+    structured_v2_schema,
+)
 from kanachan.training.online.state import (
     atomic_save, capture_rng, restore_rng, file_digest,
 )
@@ -25,8 +29,10 @@ def _plain(value):
 
 
 def recipe(config, algorithm, *, dtype, amp_dtype):
-    if config.encoder.architecture != "dense_decoder":
+    arch = getattr(config.encoder, "architecture", None)
+    if arch not in ("dense_decoder", "structured_dual_v2"):
         return None
+    is_v2 = arch == "structured_dual_v2"
     data = Path(config.training_data)
     optimizer = OmegaConf.to_container(config.optimizer, resolve=True)
     optimizer.pop("initialize", None)
@@ -49,15 +55,26 @@ def recipe(config, algorithm, *, dtype, amp_dtype):
         ]
     elif algorithm == "awr":
         keys += ["beta", "weight_clipping"]
+    head_extra = (
+        {"head_type": getattr(config.encoder, "head_type", "factorized")}
+        if is_v2
+        else {}
+    )
     value = {
-        "format_version": 1, "architecture": ARCHITECTURE_ID,
-        "schema": feature_schema(getattr(config.decoder, "candidate_features", "none")), "algorithm": algorithm,
+        "format_version": 1,
+        "architecture": STRUCTURED_V2_ARCHITECTURE_ID if is_v2 else ARCHITECTURE_ID,
+        "schema": (
+            structured_v2_schema()
+            if is_v2
+            else feature_schema(getattr(config.decoder, "candidate_features", "none"))
+        ),
+        "algorithm": algorithm,
         "backbone": backbone_kwargs(
             config.encoder, checkpointing=config.checkpointing, dtype=dtype
         ),
         "head": candidate_head_kwargs(
             config.decoder, input_dimension=config.encoder.dimension,
-            architecture=config.encoder.architecture, dtype=dtype,
+            architecture=config.encoder.architecture, dtype=dtype, **head_extra,
         ),
         "optimizer": optimizer,
         "training": {key: config[key] for key in keys},
@@ -68,12 +85,18 @@ def recipe(config, algorithm, *, dtype, amp_dtype):
     if algorithm in ("cql", "iql"):
         if algorithm == "cql" and config.get("streaming_mc", False):
             value["streaming_mc"] = {
-                "version": "streaming_mc_afterstate_v1",
+                "version": (
+                    "streaming_mc_structured_v2"
+                    if is_v2 else "streaming_mc_afterstate_v1"
+                ),
                 "seed": config.streaming_mc_seed,
             }
         if algorithm == "cql" and config.get("candidate_feature_workers", 0):
             value["prepared_mc"] = {
-                "version": "prepared_mc_afterstate_v1",
+                "version": (
+                    "prepared_mc_structured_v2"
+                    if is_v2 else "prepared_mc_afterstate_v1"
+                ),
                 "seed": config.prepared_mc_seed,
                 "epochs": config.prepared_mc_epochs,
             }

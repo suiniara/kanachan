@@ -237,8 +237,9 @@ def _training(
         log_probs = log_probs[
             torch.arange(local_batch_size, device=device), action
         ]
-        loss = -log_probs * weight
-        loss = torch.mean(loss)
+        has_choice = (~mask).sum(dim=-1) >= 2
+        choice_f = has_choice.to(log_probs.dtype)
+        loss = ((-log_probs * weight) * choice_f).sum() / choice_f.sum().clamp_min(1.0)
 
         _loss = loss.detach().clone()
         if world_size >= 2:
@@ -285,11 +286,14 @@ def _training(
                 max_gradient_norm,
                 error_if_nonfinite=True,
             )
+            old_scale = grad_scaler.get_scale() if grad_scaler.is_enabled() else None
             grad_scaler.step(optimizer)
             grad_scaler.update()
-            progress.optimizer_step(num_samples)
-            if scheduler is not None:
-                scheduler.step()
+            step_skipped = old_scale is not None and grad_scaler.get_scale() < old_scale
+            if not step_skipped:
+                progress.optimizer_step(num_samples)
+                if scheduler is not None:
+                    scheduler.step()
 
             optimizer.zero_grad()
 
@@ -706,6 +710,11 @@ def _main(config: DictConfig) -> None:
         value_model.requires_grad_(False)
         value_model.eval()
 
+    head_extra = (
+        {"head_type": getattr(config.encoder, "head_type", "factorized")}
+        if config.encoder.architecture == "structured_dual_v2"
+        else {}
+    )
     encoder = make_backbone(
         config.encoder, checkpointing=config.checkpointing, dtype=dtype
     )
@@ -717,6 +726,7 @@ def _main(config: DictConfig) -> None:
     decoder = make_candidate_head(
         config.decoder, input_dimension=config.encoder.dimension,
         architecture=config.encoder.architecture, dtype=dtype,
+        **head_extra,
     )
     decoder.zero_output()
     decoder_tdm = TensorDictModule(
@@ -740,7 +750,8 @@ def _main(config: DictConfig) -> None:
         network_tdm.to(device="cpu")
 
     argmax_layer = DecodeConverter(
-        "argmax", tie_break_by_action_id=config.encoder.architecture == "dense_decoder"
+        "argmax",
+        tie_break_by_action_id=config.encoder.architecture in ("dense_decoder", "structured_dual_v2"),
     )
     argmax_tdm = TensorDictModule(
         argmax_layer,
@@ -871,7 +882,7 @@ def _main(config: DictConfig) -> None:
                         dump_object(
                             decoder,
                             [],
-                            candidate_head_kwargs(config.decoder, input_dimension=config.encoder.dimension, architecture=config.encoder.architecture, dtype=dtype),
+                            candidate_head_kwargs(config.decoder, input_dimension=config.encoder.dimension, architecture=config.encoder.architecture, dtype=dtype, **head_extra),
                         ),
                     ],
                     {"in_keys": candidate_head_keys(config.encoder.architecture, config.decoder), "out_keys": ["decode"]},
@@ -893,7 +904,7 @@ def _main(config: DictConfig) -> None:
                 dump_object(
                     argmax_tdm,
                     [
-                        dump_object(argmax_layer, ["argmax"], {"tie_break_by_action_id": config.encoder.architecture == "dense_decoder"}),
+                        dump_object(argmax_layer, ["argmax"], {"tie_break_by_action_id": config.encoder.architecture in ("dense_decoder", "structured_dual_v2")}),
                     ],
                     {
                         "in_keys": ["candidates", "log_probs"],

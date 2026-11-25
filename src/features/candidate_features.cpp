@@ -8,6 +8,13 @@
 #include <numeric>
 #include <vector>
 
+namespace Kanachan::StructuredV2 {
+PyObject* py_encode_structured_v2_batch(PyObject*, PyObject* args);
+PyObject* py_eval_mjsoul_hand(PyObject*, PyObject* args);
+PyObject* py_eval_win_settlement(PyObject*, PyObject* args);
+PyObject* py_action_manifest_bytes(PyObject*, PyObject*);
+} // namespace Kanachan::StructuredV2
+
 namespace {
 constexpr int width = 46;
 
@@ -118,6 +125,18 @@ PyObject* discard_features(PyObject*, PyObject* arguments) {
 PyMethodDef methods[] = {
   {"discard_features", discard_features, METH_VARARGS,
    "Generate observed-information discard afterstates as packed float32 rows."},
+  {"encode_structured_v2_batch",
+   Kanachan::StructuredV2::py_encode_structured_v2_batch, METH_VARARGS,
+   "Encode a batch of 4-field canonical samples into structured_v2 tensors without holding the GIL."},
+  {"eval_mjsoul_hand",
+   Kanachan::StructuredV2::py_eval_mjsoul_hand, METH_VARARGS,
+   "Evaluate Mahjong Soul 4-player han/fu without holding the GIL."},
+  {"eval_win_settlement",
+   Kanachan::StructuredV2::py_eval_win_settlement, METH_VARARGS,
+   "Evaluate single-winner score settlement, Pao, rank, and would_end_game."},
+  {"action_manifest",
+   Kanachan::StructuredV2::py_action_manifest_bytes, METH_NOARGS,
+   "Return the 547x10 int32 action manifest buffer."},
   {nullptr, nullptr, 0, nullptr},
 };
 PyModuleDef module = {PyModuleDef_HEAD_INIT, "_candidate_features", nullptr, -1, methods};
@@ -127,7 +146,9 @@ PyMODINIT_FUNC PyInit__candidate_features() {
   PyObject* result = PyModule_Create(&module);
   if (result == nullptr) return nullptr;
   if (PyModule_AddStringConstant(result, "SCHEMA_ID", "discard_afterstate_v1") < 0 ||
-      PyModule_AddIntConstant(result, "FEATURE_WIDTH", width) < 0) {
+      PyModule_AddIntConstant(result, "FEATURE_WIDTH", width) < 0 ||
+      PyModule_AddStringConstant(result, "STRUCTURED_V2_SCHEMA_ID",
+                                 "kanachan_structured_v2_70_10_48_32_8") < 0) {
     Py_DECREF(result);
     return nullptr;
   }

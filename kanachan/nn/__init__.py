@@ -12,3 +12,12 @@ from .decision_decoder import (
     DenseDecisionDecoder, GlobalActionHead, DecisionContext, HistoryCache,
     cached_decision,
 )
+from .structured_dual_decoder import (
+    NextEventHead,
+    StructuredActionHead,
+    StructuredDualDecoder,
+    StructuredKVCache,
+    StructuredStateHead,
+    cached_structured_decision,
+)
+from .structured_iql import DuelingQHead, JointStructuredIQLModule, QuantileQHead

@@ -61,7 +61,7 @@ config_store.store(name="global_actions", node=GlobalActionDecoderConfig, group=
 
 
 def validate(decoder_config: Any, encoder_dimension: int) -> None:
-    if getattr(decoder_config, "candidate_features", "none") not in ("none", "discard_v1"):
+    if getattr(decoder_config, "candidate_features", "none") not in ("none", "discard_v1", "structured_v2"):
         raise ValueError("decoder.candidate_features must be none or discard_v1.")
     if decoder_config.dimension is None and decoder_config.num_layers >= 2:
         decoder_config.dimension = encoder_dimension

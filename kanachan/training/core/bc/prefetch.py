@@ -14,13 +14,32 @@ def _initialize_worker():
     torch.set_num_threads(1)
 
 
-def _derive(sparse, progression, candidates):
+def _derive(sparse, numeric, progression, candidates, mode="discard_v1", enable_early_shape_hint=False):
+    if mode == "structured_v2":
+        from kanachan.structured_v2 import derive_structured_v2_batch
+
+        return derive_structured_v2_batch(
+            sparse, numeric, progression, candidates,
+            enable_early_shape_hint=enable_early_shape_hint,
+            include_room_level=False,
+        )
+    if mode == "none":
+        return None
     from kanachan.candidate_features import derive_candidate_features
 
     return derive_candidate_features(sparse, progression, candidates)
 
 
-def _parse_and_derive(lines, rewrite_rooms, rewrite_grades):
+def _attach_features(batch, result, mode):
+    if mode == "structured_v2":
+        for key, value in result.items():
+            batch[key] = value
+    elif result is not None:
+        batch["candidate_afterstate"] = result
+    return batch
+
+
+def _parse_and_derive(lines, rewrite_rooms, rewrite_grades, mode="discard_v1", enable_early_shape_hint=False):
     from kanachan.training.core.bc.data_iterator import DataIterator
     from kanachan.training.core.bc.data_loader import DataLoader
 
@@ -33,10 +52,11 @@ def _parse_and_derive(lines, rewrite_rooms, rewrite_grades):
     )
     rows = [parser.parse_line(line) for line in lines]
     batch = DataLoader.to_tensordict(torch.utils.data.default_collate(rows))
-    batch["candidate_afterstate"] = _derive(
-        batch["sparse"], batch["progression"], batch["candidates"]
+    feats = _derive(
+        batch["sparse"], batch["numeric"], batch["progression"], batch["candidates"],
+        mode=mode, enable_early_shape_hint=enable_early_shape_hint,
     )
-    return batch
+    return _attach_features(batch, feats, mode)
 
 
 class CandidateFeaturePrefetch:
@@ -59,16 +79,22 @@ class CandidateFeaturePrefetch:
         raw_batches=False,
         rewrite_rooms=None,
         rewrite_grades=None,
+        mode="discard_v1",
+        enable_early_shape_hint=False,
     ):
         if workers < 1 or batches < 1:
             raise ValueError(
                 "Feature workers and prefetch batches must be positive."
             )
+        if mode not in ("none", "discard_v1", "structured_v2"):
+            raise ValueError(f"Unsupported prefetch mode: {mode}")
         self.source = iter(source)
         self.pin_memory = pin_memory
         self.raw_batches = raw_batches
         self.rewrite_rooms = rewrite_rooms
         self.rewrite_grades = rewrite_grades
+        self.mode = mode
+        self.enable_early_shape_hint = bool(enable_early_shape_hint)
         self.queue = Queue(maxsize=batches)
         self.stopped = Event()
         self.closed = False
@@ -99,14 +125,19 @@ class CandidateFeaturePrefetch:
                         batch,
                         self.rewrite_rooms,
                         self.rewrite_grades,
+                        self.mode,
+                        self.enable_early_shape_hint,
                     )
                     self._put((None, future))
                 else:
                     future = self.pool.submit(
                         _derive,
                         batch["sparse"],
+                        batch["numeric"],
                         batch["progression"],
                         batch["candidates"],
+                        self.mode,
+                        self.enable_early_shape_hint,
                     )
                     self._put((batch, future))
             self._put(None)
@@ -133,7 +164,7 @@ class CandidateFeaturePrefetch:
                 batch = future.result()
             else:
                 batch = batch.clone(recurse=False)
-                batch["candidate_afterstate"] = future.result()
+                _attach_features(batch, future.result(), self.mode)
             if self.pin_memory:
                 batch = batch.pin_memory()
             return batch
@@ -148,6 +179,13 @@ class CandidateFeaturePrefetch:
         self.stopped.set()
         self.thread.join(timeout=5)
         self.pool.shutdown(wait=True, cancel_futures=True)
+        src = getattr(self, "source", None)
+        self.source = None
+        if src is not None and hasattr(src, "close"):
+            try:
+                src.close()
+            except Exception:
+                pass
         while True:
             try:
                 self.queue.get_nowait()

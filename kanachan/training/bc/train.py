@@ -33,10 +33,10 @@ from torch.utils.tensorboard.writer import SummaryWriter
 # pylint: disable=unused-import
 import kanachan.training.bc.config  # noqa: F401
 import kanachan.training.core.config as _config
-from kanachan.constants import MAX_NUM_ACTION_CANDIDATES
+from kanachan.constants import MAX_NUM_ACTION_CANDIDATES, NUM_TYPES_OF_ACTIONS
 from kanachan.model_loader import dump_model, dump_object
 from kanachan.nn.decision_factory import (
-    make_backbone, backbone_kwargs, make_candidate_head,
+    make_backbone, backbone_kwargs, backbone_in_keys, make_candidate_head,
     candidate_head_kwargs, candidate_head_keys,
     load_candidate_head_state,
 )
@@ -156,7 +156,12 @@ def _training(
         assert log_probs.size(0) == local_batch_size
         assert log_probs.size(1) == MAX_NUM_ACTION_CANDIDATES
 
-        loss: Tensor = loss_function(log_probs, action.long())
+        has_choice = (data["candidates"] < NUM_TYPES_OF_ACTIONS).sum(dim=-1) >= 2
+        per_sample_loss = nn.functional.nll_loss(
+            log_probs, action.long(), reduction="none"
+        )
+        choice_mask = has_choice.to(per_sample_loss.dtype)
+        loss: Tensor = (per_sample_loss * choice_mask).sum() / choice_mask.sum().clamp_min(1.0)
 
         _loss = loss.detach().clone()
         if world_size >= 2:
@@ -195,11 +200,14 @@ def _training(
 
             gradient_norm = float(norm)
 
+            old_scale = grad_scaler.get_scale() if grad_scaler.is_enabled() else None
             grad_scaler.step(optimizer)
             grad_scaler.update()
-            progress.optimizer_step(num_samples)
-            if scheduler is not None:
-                scheduler.step()
+            step_skipped = old_scale is not None and grad_scaler.get_scale() < old_scale
+            if not step_skipped:
+                progress.optimizer_step(num_samples)
+                if scheduler is not None:
+                    scheduler.step()
 
             optimizer.zero_grad()
 
@@ -484,13 +492,22 @@ def _main(config: DictConfig) -> None:
 
     if config.candidate_feature_workers < 0 or config.candidate_prefetch_batches < 1:
         raise ValueError("Candidate feature workers must be nonnegative and prefetch batches positive.")
+    is_dense_prefetch = (
+        config.encoder.architecture == "dense_decoder"
+        and config.decoder.candidate_features == "discard_v1"
+    )
+    is_v2_prefetch = (
+        config.encoder.architecture == "structured_dual_v2"
+        and getattr(config.decoder, "candidate_features", "none") in ("none", "structured_v2")
+    )
     if config.candidate_feature_workers and (
-        config.encoder.architecture != "dense_decoder"
-        or config.decoder.candidate_features != "discard_v1"
+        not (is_dense_prefetch or is_v2_prefetch)
         or config.num_workers != 0
         or world_size != 1
     ):
-        raise ValueError("Ordered candidate prefetch requires single-process discard_v1 BC with num_workers=0.")
+        raise ValueError(
+            "Ordered candidate prefetch requires single-process discard_v1/structured_v2 BC with num_workers=0."
+        )
 
     output_prefix = Path(HydraConfig.get().runtime.output_dir)
 
@@ -573,12 +590,21 @@ def _main(config: DictConfig) -> None:
         config, "bc", dtype=dtype, amp_dtype=amp_dtype
     )
     initial_rng_state = decision_checkpoint.validate_resume(config, decision_recipe)
+    use_v2_prefetch = (
+        config.encoder.architecture == "structured_dual_v2"
+        and config.candidate_feature_workers > 0
+    )
+    head_extra = (
+        {"head_type": getattr(config.encoder, "head_type", "factorized")}
+        if config.encoder.architecture == "structured_dual_v2"
+        else {}
+    )
     encoder = make_backbone(
         config.encoder, checkpointing=config.checkpointing, dtype=dtype
     )
     encoder_tdm = TensorDictModule(
         encoder,
-        in_keys=["sparse", "numeric", "progression", "candidates"],  # type: ignore
+        in_keys=backbone_in_keys(config.encoder, precomputed=use_v2_prefetch),  # type: ignore
         out_keys=["encode"],  # type: ignore
     )
     decoder = make_candidate_head(
@@ -586,6 +612,7 @@ def _main(config: DictConfig) -> None:
         input_dimension=config.encoder.dimension,
         architecture=config.encoder.architecture,
         dtype=dtype,
+        **head_extra,
     )
     decoder.zero_output()
     decoder_tdm = TensorDictModule(
@@ -620,7 +647,8 @@ def _main(config: DictConfig) -> None:
         assert isinstance(network_tdm, nn.Module)
 
     argmax_layer = DecodeConverter(
-        "argmax", tie_break_by_action_id=config.encoder.architecture == "dense_decoder"
+        "argmax",
+        tie_break_by_action_id=config.encoder.architecture in ("dense_decoder", "structured_dual_v2"),
     )
     argmax_tdm = TensorDictModule(
         argmax_layer,
@@ -751,6 +779,7 @@ def _main(config: DictConfig) -> None:
                             candidate_head_kwargs(
                                 config.decoder, input_dimension=config.encoder.dimension,
                                 architecture=config.encoder.architecture, dtype=dtype,
+                                **head_extra,
                             ),
                         )
                     ],
@@ -770,7 +799,7 @@ def _main(config: DictConfig) -> None:
                 dump_object(
                     argmax_tdm,
                     [dump_object(argmax_layer, ["argmax"], {
-                        "tie_break_by_action_id": config.encoder.architecture == "dense_decoder",
+                        "tie_break_by_action_id": config.encoder.architecture in ("dense_decoder", "structured_dual_v2"),
                     })],
                     {
                         "in_keys": ["candidates", "log_probs"],
@@ -811,6 +840,13 @@ def _main(config: DictConfig) -> None:
         if config.candidate_feature_workers:
             from kanachan.training.core.bc.prefetch import CandidateFeaturePrefetch
 
+            prefetch_mode = (
+                "structured_v2"
+                if config.encoder.architecture == "structured_dual_v2"
+                else "discard_v1"
+            )
+            early_hint = getattr(config.encoder, "enable_early_shape_hint", False)
+
             def data_loader_factory(**arguments):
                 return loader_resources.enter_context(CandidateFeaturePrefetch(
                     DataLoader(**arguments, raw_batches=True), workers=config.candidate_feature_workers,
@@ -818,6 +854,8 @@ def _main(config: DictConfig) -> None:
                     pin_memory=device.type == "cuda",
                     raw_batches=True, rewrite_rooms=arguments["rewrite_rooms"],
                     rewrite_grades=arguments["rewrite_grades"],
+                    mode=prefetch_mode,
+                    enable_early_shape_hint=early_hint,
                 ))
 
         torch.autograd.set_detect_anomaly(

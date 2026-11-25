@@ -11,12 +11,16 @@ LEGACY_ADAMW_POLICY = "adamw_all_parameters_v1"
 
 
 def adamw_parameter_groups(module, weight_decay):
-    """Decay matrices, excluding embeddings; retain deterministic group order."""
+    """Decay matrices, excluding embeddings and declared no-decay params."""
     no_decay = {
         id(parameter)
         for layer in module.modules() if isinstance(layer, torch.nn.Embedding)
         for parameter in layer.parameters(recurse=False)
     }
+    for layer in module.modules():
+        hook = getattr(layer, "_no_weight_decay_param_ids", None)
+        if callable(hook):
+            no_decay.update(hook())
     decayed, unchanged = [], []
     for parameter in module.parameters():
         if parameter.requires_grad:
