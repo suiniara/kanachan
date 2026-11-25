@@ -87,6 +87,15 @@
 
 > **关于 `room` 与四家 `level` 的防偏差处理策略（显式契约）**：`sparse[0]` 与 `sparse[2..5]` 编码了人类牌谱的房间与段位。若直接喂入策略主干，模型会拟合低段位人类次优习惯，且在 `simulate` 对局中受伪造段位影响。因此 V2 默认配置 **`include_room_level: bool = False`**——仅读取 `sparse[1]`（`is_tonpuusen = (sparse[1] == 5)`），**彻底忽略 `room` 与 `level`**，使策略专注于纯粹博弈状态。
 
+#### C. `source-v3` 磁盘 TSV 列格式与单步 / 整局轨迹读取规则
+- **8 列 TSV 行格式**（见 [data_iterator.py](core/bc/data_iterator.py) 与 [annotation.cpp](../../src/annotation/annotation.cpp#L745-L783)）：
+  `uuid \t sparse \t numeric \t progression \t candidates \t action \t round_summary \t results`
+  - `action` 为选定动作在 `candidates` 中的**槽位下标 `0..31`**（`int32`），对应全局动作 ID 为 `chosen_global_id = candidates[action]`；
+  - `results` 为 14 个逗号分隔整数：`round_delta_scores[0..3], benchang, num_liqibangs, post_round_scores[0..3], final_game_scores[0..3]`。
+- **单步模式 vs 整局并行模式的数据源要求**：
+  - 已被全局行打乱（shuffled）的 `train.bc.tsv` 直接走单步模式（可配合按 `len(progression)` 分桶的 `LengthBucketBatchSampler`）；
+  - 整局并行 Teacher Forcing（`forward_round_trajectory`）、20 维 `PureStateGRP` 训练以及 Stage-2 Offline IQL / `streaming_mc` **必须读取未打乱的连续半庄标注流**（同一 `(uuid, observer_seat)` 按对局时间连续排列）：按 `(uuid, observer_seat, chang, ju, ben)` 切分小局块，取该小局块最后一步的 `progression` 作为 `round_events` 全集（因 `progression` 在同小局内严格前缀增长），各决策步的 `len(progression)` 即为 `decision_event_len[t]`。
+
 ---
 
 ### 2.2 从四字段确定性还原完整局内状态的数学规则（零猜测、零泄漏）
@@ -114,7 +123,8 @@
        - `ev_last` 为他家 `KAKAN` $\implies$ **`KAKAN_RESP` (`phase = 2`)**（抢加杠荣和窗口，`is_chankan = True`），触发牌为 `ev_last.tile37`，`trigger_actor_rel = (ev_last.seat + 4 - seat) % 4`；
        - `ev_last` 为他家 `ANKAN` $\implies$ **`ANKAN_RESP` (`phase = 3`)**（国士无双抢暗杠窗口，`is_chankan = True`），触发牌为 `_tile37(ev_last.base34)`，`trigger_actor_rel = (ev_last.seat + 4 - seat) % 4`。
 
-3. **立直成立、双立直、一发与立直巡目精确判定**：
+3. **立直成立、双立直、一发、立直巡目与庄家配牌首打归一化**：
+   - **庄家配牌首打 `moqie` 零偏差归一化**：在原始雀魂 protobuf 中，庄家第一巡首打偶有 `record.moqie() == true` 并原样写入 [round_progress.cpp](../../src/annotation/round_progress.cpp#L43) 的 `progression[1]`，而原生模拟器 [shoupai.cpp](../../src/simulation/shoupai.cpp#L870) 对庄家第一打（`zhuangjia_first_dapai`）恒固定输出 `moqie = 0`（手切）。因此 `structured_v2` 解析 `progression[1]` 时，若该事件为庄家 `ju` 的 `DAHAI`（此前无任何副露/杠），**强制将其 `moqie` 归一化为 `0`（手切）**，同步作用于 `events[1].flags`、`tile_feats` 的 `opp_last_discard_tedashi` 与 `player_feats[19]` 的近 6 巡手切率；
    - 在雀魂规则中，立直宣言牌被 `CHI / PON / DAIMINKAN` 鸣走**立直依然成立**（仅被 `RON` 和牌才作废，而本局仍在继续说明此前所有历史 `DAHAI(..., liqi=1)` 均未被 `RON`）；
    - **唯一需要注意的时序边界**：若当前正处于 `DISCARD_RESP` 且最后一条事件 `ev_last` 恰好是某对手的 `DAHAI(..., liqi=1)`，此时该立直尚处于未结算响应窗口（`numeric` 中该家尚未扣 `1000` 点、`liqibang` 尚未 `+1`）。定义：
      - 对手已公开宣告立直：`riichi_declared[p] = True`（含 `ev_last` 宣告立直者，因其立直宣言已公开）；
@@ -122,8 +132,12 @@
      - 一发有效 `ippatsu_active[p]`：该家宣告 `liqi=1` 之后至当前时刻（不含 `ev_last` 若 `ev_last` 本身即为该立直宣言），中间未出现任何 `CHI / PON / DAIMINKAN / ANKAN / KAKAN`，且未再次出现该家自己的 `DAHAI`；
      - 立直巡目 `riichi_turn_index[p]`：该家宣告立直时其自身河牌的序号（`0`-based，归一化 `/ 24.0`）。
 
-4. **无 `SELF_PASS` 公开流下的三类振听（`FuritenState`）100% 精确还原定理**：
-   - 设观察者当前待牌集合为 $W \subseteq \{0..33\}$（`3k+1` 手牌由 `Nyanten` 替换数 `== 1` 且扣除五枚壁/规则禁和后求得）：
+4. **合法待牌集合 $W$（严格区分“纯虚听”与“空听 Karaten”）及无 `SELF_PASS` 流下的三类振听还原定理**：
+   - **合法待牌集合精确公式**：对观察者 `3k+1` 暗手计数 $h_{\text{closed}}[34]$ 与己方已公开副露/暗杠计数 $M_{\text{self}}[34]$，定义：
+     $$W(h_{\text{closed}}, M_{\text{self}}) = \Big\{ w \in \{0..33\} \;\Big|\; h_{\text{closed}}[w] + M_{\text{self}}[w] < 4 \;\land\; \operatorname{Nyanten}(h_{\text{closed}} + e_w) == 0 \Big\}$$
+     - **纯虚听（非听牌）**：若某牌种 $w$ 的全部 4 张物理牌已在**己方暗手 + 己方副露/杠**中（$h_{\text{closed}}[w] + M_{\text{self}}[w] == 4$，如己方已碰 `111m` 后单骑第 4 张 `1m`），则 $w \notin W$；若因此导致 $W = \varnothing$，则不构成听牌（`is_tenpai = 0`，修正向听 $s = 1, u = 0$）；
+     - **空听 Karaten（合法听牌！）**：若 $h_{\text{closed}}[w] + M_{\text{self}}[w] < 4$，即便其余副本已在河牌/他家副露/宝牌指示牌中全部现身使得未见枚数 $U_w = 0$，在雀魂与 `kanachan` 规则下**仍属于合法听牌**（可立直、流局计听牌，`is_tenpai = 1, s = 0`，仅有效进张 $u = \sum_{w \in W} U_w = 0$），**严禁把桌显空听误判为向听 1**！
+   - 基于上述 $W$，三类振听（`FuritenState`）无损还原如下：
      - **舍牌振听（`permanent`）**：观察者本局历史全部 `DAHAI`（含被他家鸣走的牌）中存在 `base34 ∈ W`；
      - **立直振听（`riichi`）**：若观察者已立直，自观察者 `DAHAI(..., liqi=1)` 事件**之后**，在 `progression` 中除当前未决 `ev_last`（当 `phase != OWN_ACT` 时）以外的**任何已落地 `DAHAI`**（无论哪一家切出、无论是否被吃碰杠）只要其 `base34 ∈ W`（或抢杠事件牌 `∈ W`），由于本局未结束说明观察者当时未荣和/自摸，且立直后暗手结构（除不改变待牌的暗杠外）固定不变，故必触发永久 `riichi_furiten = True`；
      - **同巡振听（`temporary`）**：仅在观察者未立直且 `W` 非空时考察。定位 `progression` 中观察者自己最后一次行动事件下标 $idx_{\text{self}}$（`DAHAI / CHI / PON / DAIMINKAN / ANKAN / KAKAN`，若尚无自身事件则为 `0`）：
@@ -189,7 +203,7 @@
 | `60` | `is_legal_discard` | 当前 `candidates` 中是否存在目标为 `base34 == i` 的合法 `DISCARD` |
 | `61` | `discard_shanten_gap_0` | 合法切 `i` 且切后向听数 $s_i$ 等于当前手牌所有合法切牌最小向听 $s^*$ |
 | `62` | `discard_shanten_gap_1` | 合法切 `i` 且 $s_i == s^* + 1$ |
-| `63` | `discard_post_shanten_norm` | $\min(1.0, \max(0, s_i) / 8.0)$（其中形式听牌但四枚耗尽无待牌时修正 $s_i = 1, u_i = 0$） |
+| `63` | `discard_post_shanten_norm` | $\min(1.0, \max(0, s_i) / 8.0)$（仅当己方暗手+己方副露已占满 4 枚导致 $W = \varnothing$ 的纯虚听时修正 $s_i = 1, u_i = 0$；桌显见满 4 枚的空听保持 $s_i = 0, u_i = 0$） |
 | `64` | `discard_post_ukeire_log` | 扣除全部可见牌后的有效进张枚数 $u_i$：$\min(1.0, \ln(1 + u_i) / \ln(61))$ |
 | `65` | `discard_post_ukeire_ratio` | $u_i / \max(1, \max_{j \in \mathcal{D}_{\text{legal}}} u_j)$ |
 | `66` | `discard_post_is_tenpai` | 切 `i` 后是否存在至少 1 种合法待牌（遵循雀魂非虚听规则） |
@@ -216,7 +230,9 @@
 | `8` | `turn_idx` | `0..255` | 本局单调递增公开事件步序号 `0..L_ev-1` |
 | `9` | `actor_seq_idx` | `0..255` | `DAHAI`: 该家本局第几张舍牌（`0..23`）；副露/杠: 该家副露槽位（`0..3`）；其余 `0` |
 
-- **非空下界保证**：每局 `progression[0] == 0` 恒映射为第 `0` 条有效事件（初始 `DORA`，`actor_rel=4, tile37=dora_indicators[0]`），故任何样本严格满足 **`L_ev >= 1`**，彻底杜绝全掩码 Softmax `NaN`。
+- **非空下界与严格只追加（Append-Only）保护 `KVCache`**：
+  - 每局 `progression[0] == 0` 恒映射为第 `0` 条有效事件（初始 `DORA`，`actor_rel=4, tile37=dora_indicators[0]`），故任何样本严格满足 **`L_ev >= 1`**，彻底杜绝全掩码 Softmax `NaN`；
+  - **Phase 1 严禁将中途新翻出的杠宝牌（`dora_indicators[1..4]`）插入或改写进 `events`**：`events[1..L_p-1]` 与 `progression[1..L_p-1]` 严格保持 1:1 下标对应，新增杠宝牌仅通过 `tile_feats`、`global_feats`、`VisibleTileCounts` 与 `cand_dyn` 进入 Decoder 2，从而保证同小局内 `events` 前缀 100% 不可变、开杠后 Decoder 1 `KVCache` 永不失效或错位！
 - **组合上界证明**：Phase 1 直接受 `MAX_LENGTH_OF_PROGRESSION_FEATURES = 109` 约束；即便在 Phase 2 纳入观察者 `TSUMO_SELF` 与 `SELF_PASS`，由 70 次活山摸牌 + $\le 4$ 岭上 + $\le 20$ 副露/杠 + $\le 90$ 舍牌 + $\le 5$ 宝牌 + $\le 4$ 立直成立，严格满足 $L_{\text{ev}} \le 214 < 256$。Decoder 1 的 1D-RoPE 预分配至 **`MAX_ROPE_LEN = 2048`**。
 
 ---
@@ -236,7 +252,7 @@
 | `15..18` | 4 | 决策阶段 one-hot：`[OWN_ACT, DISCARD_RESP, KAKAN_RESP, ANKAN_RESP]` |
 | `19` | 1 | **己方非河牌振听标记** `furiten.temporary || furiten.riichi` |
 | `20..22` | 3 | 响应阶段触发来源相对席位 one-hot `[下家(1), 对家(2), 上家(3)]`（`OWN_ACT` 全 `0`） |
-| `23..25` | 3 | 己方当前向听 `min(1.0, max(0, cur_shanten) / 8.0)`、己方副露组数 `/ 4.0`、己方门清标记 `is_menzen` |
+| `23..25` | 3 | 己方当前向听 `min(1.0, max(0, cur_shanten) / 8.0)`、己方总副露/杠组数（`CHI+PON+DAIMINKAN+ANKAN`，加杠不另增组数）`/ 4.0`、己方门清标记 `is_menzen`（仅暗杠仍为 `1.0`） |
 | `26..36` | 11 | 雀魂四麻规则常量向量：`[kokushi_ankan_ron=1, kokushi13_double=1, suuankou_tanki_double=1, chuuren9_double=1, daisuushii_double=1, yakuman_pao_liability=1, sanchaho_draw=0, kuikae_forbidden=1, dealer_first_tedashi=1, ext_dealer_repeat=1, allow_5th_copy_tenpai=0]` |
 | `37..43` | 7 | 对局规则标记：`[is_tonpuusen (sparse[1]==5), has_aka=1, has_kuitan=1, has_tobi_end=1, has_agari_yame=1, has_abortive_draws=1, has_nagashi_mangan=1]` |
 | `44..47` | 4 | 归一化目标顺位效用向量 $w(\mathcal{R})$（默认对齐 `kanachan` 顺位效用 `[+1.5, +0.5, -0.5, -1.5]` 或雀魂段位配分，并与训练奖励契约强绑定校验） |
@@ -252,7 +268,7 @@
 | `9..10` | 2 | 点棒 `clamp((score[abs] - 25000) / 25000.0, -3.0, 3.0)`、相对观察者分差 `clamp((score[abs] - score[self]) / 25000.0, -3.0, 3.0)` |
 | `11..13` | 3 | 距上一名分差 `clamp(gap_higher / 25000.0, 0.0, 3.0)`、距下一名分差 `clamp(gap_lower / 25000.0, 0.0, 3.0)`、当前顺位 `(rank - 1) / 3.0`（`rank ∈ {1..4}`，注意同分时追赶高起家需多赢 `100` 点语义在 `WIN_EVAL` 中精确体现） |
 | `14..17` | 4 | `riichi_declared[abs]`、`double_riichi_declared[abs]`、`ippatsu_active[abs]`、`min(1.0, riichi_turn_idx[abs] / 24.0)` |
-| `18` | 1 | 公开副露组数（不含暗杠或单计明副露与全部杠，固定定义为明副露数 `/ 4.0`） |
+| `18` | 1 | 该家已公开**明副露组数**（`CHI+PON+DAIMINKAN`，加杠沿用原碰槽位，不含门清暗杠）`/ 4.0` |
 | `19` | 1 | 该家最近至多 6 枚已落地舍牌中的手切比例（河空时为 `0.0`） |
 | `20..31` | 12 | **跨局半庄行为摘要**：**Phase 1 恒置 `0.0`**（保证与无跨局状态的四字段 `simulate` 严格零偏差）；Phase 2 若扩展模拟与标注携带跨局 `HanchanTracker`，采用 Empirical-Bayes 先验平滑（$\alpha_{\text{rate}} = 4.0, \alpha_{\text{pts}} = 2.0$）：完局数 `/12`、平滑立直/副露/和牌/放铳率、平滑均和/均铳打点 `/12000`、上局分差 `/12000` 及上局和/铳/立/鸣 4 标记 |
 
@@ -379,8 +395,8 @@ flowchart TB
    - **Block 1（`BOARD = GLOBAL + PLAYER + TILE`, 索引 `5..43`）**：允许 attend `0..43`（双向融合历史记忆与当前全局/四家/34 牌状态，不看 `VAL` 与 `CAND`）；
    - **Block 2（`VAL` 索引 `44` 与 `CAND` 索引 `45..45+K-1`）**：
      - 全部允许 attend `0..44`；
-     - 当 `cand_self_attn = True`（默认）时，`VAL(44)` 与所有 `CAND(45..)` 同时允许 attend 所有 `cand_mask == True` 的合法候选槽位（使状态价值 $V(s)$ 直接感知当前是否握有自摸/荣和/立直等合法动作，且让候选动作之间直接横向比价）；
-     - 当 `cand_self_attn = False`（消融开关）时，`CAND_k` 仅看 `0..44` 与自身对角元 `45+k`；
+     - `VAL(44)` 始终允许 attend 所有 `cand_mask == True` 的合法候选槽位（使状态价值 $V(s)$ 直接感知当前是否握有自摸/荣和/立直等合法动作）；
+     - 当 `cand_self_attn = True`（默认）时，`CAND(45..)` 之间允许互相 attend 所有 `cand_mask == True` 的合法候选；当 `cand_self_attn = False`（单变量消融开关）时，仅将 `CAND ↔ CAND` 子矩阵 `[45:, 45:]` 的非对角元置 `False`（保留每个合法候选看自身对角元 `45+k`）；
      - 所有 `~cand_mask` 填充槽在 Key 侧被永久屏蔽，在读出侧输出强制掩码清零。
 
 3. **17 类麻将异构图注意力偏置表（`REL_BIAS_NUM_CLASSES = 17`）**：
@@ -572,8 +588,14 @@ flowchart TB
    - 新建常量 `ARCHITECTURE_ID = "mahjong_structured_dual_decoder_v2"`、`STRUCTURED_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与 `KANACHAN_ACTION_MANIFEST_SHA256`；
    - 严禁与 `"mahjong_dense_block_decoder_v1"` 混用模型构造分支或复用旧优化器/回放检查点；
    - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、数据 SHA256、奖励/GRP SHA256、精度配方、优化器/调度器/`GradScaler`、回放游标以及 CPU/CUDA/增广独立 `Generator` RNG 状态；任一摘要不一致直接抛错拒绝恢复。
-2. **双路径推理与 `kanachan.simulation.simulate` 零改动对接**：
-   - **便携无状态导出路径（`snapshots/model.kanachan`）**：封装 `C++ structured_v2 适配器 -> 纯净 Actor (裁剪全部训练辅助头与 Q/V 头) -> legal_argmax`，输入仍为四字段 TensorDict `(sparse, numeric, progression, candidates)`，输出 `int32` 选定候选下标 `0..31`；因 `DecisionMaker` 跨线程拼批不含稳定半庄槽位身份，此路径严格无状态，零串台风险；
+2. **C++ 扩展模块向后兼容与打包契约（严禁破坏现有 `discard_v1` 基线）**：
+   - 现有 [candidate_features.py](../candidate_features.py) 在导入 `kanachan._candidate_features` 时强制校验 `SCHEMA_ID == "discard_afterstate_v1"` 与 `FEATURE_WIDTH == 46`，且 [hatch_build.py](../../hatch_build.py) 的 `NATIVE_MODULES` 白名单绑定了 `"kanachan/_candidate_features"`；
+   - 因此在升级 [tools/features/CMakeLists.txt](../../tools/features/CMakeLists.txt) 时：**必须原封不动保留 `SCHEMA_ID = "discard_afterstate_v1"`、`FEATURE_WIDTH = 46` 与 `discard_features(...)` 函数导出**（确保实验 1 的 `DenseDecisionDecoder + discard_v1` 对照基线继续零改动运行），并在同一扩展中新增独立常量 `STRUCTURED_V2_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与释放 GIL 的批量函数 `encode_structured_v2_batch(...)`（若选择拆分为独立扩展 `kanachan/_structured_v2`，则必须同步加入 `hatch_build.py::NATIVE_MODULES` 与 `tools/package_training_source.py`）。
+3. **双路径推理、`model_loader.py` (`weights_only=True`) 与 `DecisionMaker` 原生对接硬契约**：
+   - **便携序列化格式约束（防 `UnpicklingError` 与 GPU 设备脱节）**：[model_loader.py](../model_loader.py) 使用 `torch.load(..., weights_only=True)` 加载带魔数 `"__kanachan__": "11fc2bfe-c4c7-402e-b11e-7cb3ff6f9945"` 的描述字典，且仅当 `"device" in kwargs` 时才将 `map_location` 注入 `kwargs["device"]`（见 [model_loader.py#L71-L72](../model_loader.py#L71-L72)）。因此导出 `snapshots/model.kanachan` 的模块类：
+     1. `__init__` 的 `args / kwargs` **仅允许包含 Python 基础标量/列表/字典、`torch.dtype`、`torch.device` 或嵌套 `dump_model/dump_object` 字典，严禁直接塞入自定义 `dataclass` 实例**；
+     2. **必须在 `kwargs` 中显式接收 `device: torch.device` 与 `dtype: torch.dtype`**，将所有参数与 `register_buffer` 直接创建在目标 `device` 上；
+   - **原生 `DecisionMaker` 批调用接口**（见 [decision_maker.cpp#L350-L420](../../src/simulation/decision_maker.cpp#L350-L420)）：C++ 侧构造四字段 `TensorDict`（四个输入张量均为目标 `device` 上的 `torch.int32`），调用 `model(data)` **原地（in-place）写入一维 `data["action"]`（形状 `[B]`，候选槽位下标 `0..31`，在线采样模式可选附带一维 `data["sample_log_prob"]`）**；该便携推理路径严格无状态，零跨槽位串台风险；
    - **显式增量缓存路径（`cached_structured_decision`）**：接收显式 `DecisionContext(environment, game, seat, round_instance, model_version)`，仅对同一 `(environment, game, seat, round_instance)` 增量推进 Decoder 1 `KVCache`。
 
 ---
