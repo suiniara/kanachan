@@ -144,8 +144,9 @@
        - 在 `OWN_ACT` 阶段：若观察者刚完成摸牌（`zimo_pai` 存在），摸牌动作本身按日麻规则已自动解除同巡振听（`temporary = False`）；若刚完成 `CHI/PON`（无 `zimo_pai`），后续动作必为切牌，切牌后亦立即解除 `temporary`；
        - 在 `*_RESP` 阶段：凡在区间 $(idx_{\text{self}}, L_p - 1)$ 内（**显式排除末条当前未决触发事件 $L_p - 1$**）出现的他家 `DAHAI`（或可抢杠的 `KAKAN`/`ANKAN`），观察者当时的 13 张手牌与当前手牌**完全相同**且本局仍在继续，证明观察者必定跳过了该牌；若其中存在 `base34 ∈ W`，则 `temporary = True`（且若 `candidates` 中不含 `RON` 亦可交叉印证）。
 
-5. **大三元 / 大四喜包牌（Pao）责任家确定性追踪**：
-   - 遍历 `progression`：某席位凑齐白/发/中第 3 组刻杠（`PON` 或 `DAIMINKAN`）时记录该副露供牌者为 `pao_daisangen_payer`；凑齐东/南/西/北第 4 组刻杠时记录供牌者为 `pao_daisuushii_payer`，供 `WIN_EVAL` 精确计算包牌分担点数。
+5. **大三元 / 大四喜包牌（Pao）责任家确定性追踪**（严格对齐 [round_state.cpp](../../src/simulation/round_state.cpp#L540-L689) `checkDaSanyuanPao_` / `checkDaSixiPao_`）：
+   - 遍历 `progression` 统计同一玩家已成型的三元牌刻杠数（含 `PON`、`DAIMINKAN` 与 `ANKAN`）或四风牌刻杠数（含 `PON`、`DAIMINKAN` 与 `ANKAN`）；
+   - **包牌触发充要条件**：唯有当凑齐三元的**第 3 组**（或凑齐四风的**第 4 组**）本身是明副露 `PON` 或 `DAIMINKAN` 时，记录该次副露供牌者为 `pao_daisangen_payer`（或 `pao_daisuushii_payer`）——注意若前两组含 `ANKAN` 而第 3 组为 `PON/DAIMINKAN` **依然成立包牌**；反之若第 3/4 组自身是 `ANKAN`（或 `KAKAN` 升级已有碰）则**不成立包牌**。
 
 6. **零 GIL 纯 C++ 雀魂四麻番符与有役评估器（`mjsoul_hand_eval.hpp`）**：
    - **性能红线**：现有模拟器 [shoupai.cpp](../../src/simulation/shoupai.cpp#L240-L244) 的 `calculateHand` 通过 Boost.Python 持 GIL 回调 Python `mahjong` 库，严禁放进训练数据预取与批量特征热路径！
@@ -302,7 +303,7 @@
 | `2: PRE_DISCARD_MELD_ENVELOPE` | `CHI (222..311)`, `PON (312..431)` | 执行该吃/碰后，在剔除食替禁切牌（`claimed_base34` 及两面吃筋食替牌 `chi_encode_[code][3]`）的**全部合法后续弃牌集合 $\mathcal{D}_{\text{legal}}(h')$** 上求最优向听包络 $s^*_{\text{meld}} = \min_{b \in \mathcal{D}_{\text{legal}}} s(h'\setminus\{b\})$ 及最优切牌子集 $\mathcal{O} = \{b : s = s^*_{\text{meld}}\}$：`[0]` $\min(1, s^*_{\text{meld}}/8)$；`[1]` $\text{clamp}((s^*_{\text{meld}} - s_{\text{cur}})/4, -2, 2)$；`[2]` $\min(1, \ln(1 + \max_{b\in\mathcal{O}} u_b)/\ln 61)$；`[3]` $|\mathcal{O}| / 14.0$；`[4]` `can_tenpai` ($s^*_{\text{meld}} == 0$)；`[5]` `all_tenpai_exits_furiten`（`can_tenpai` 且 $\forall b \in \mathcal{O}$ 切后均振听）；`[6]` $\min(2.0, \text{post\_meld\_dora}/8.0)$；`[7]` **副露后有役可达性 / 食替受阻提示**：若 `can_tenpai` 则填是否存在至少一个切牌出口有和了役 `has_yaku_exit`（直接消除无役鸣牌陷阱），否则填 `0.0` |
 | `3: PENDING_RINSHAN_KAN` | `ANKAN`, `KAKAN`, `DAIMINKAN` | 严禁伪造未知岭上牌进张：`[0]` $\min(1, s_{\text{cur}}/8)$；`[1..3]` `0.0`；`[4]` `cur_is_tenpai`；`[5]` `chankan_possible`（`KAKAN` 与 `ANKAN` 为 `1.0`，`DAIMINKAN` 为 `0.0`）；`[6]` 杠后已知宝牌（大明杠计入被鸣牌宝牌，未翻新宝牌不猜）`min(2.0, post_kan_dora / 8.0)`；`[7]` $\min(1.0, (\text{total\_kans}+1)/4.0)$ |
 | `4: PASS_CURRENT_STATE` | `SKIP (221)` | `[0]` $\min(1, s_{\text{cur}}/8)$；`[1]` `0.0`；`[2]` $\min(1, \ln(1 + u_{\text{cur}})/\ln 61)$；`[3]` `1.0`；`[4]` `cur_is_tenpai`；`[5]` `cur_is_furiten`；`[6]` $\min(2.0, \text{cur\_dora}/8.0)$；`[7]` `0.0` |
-| `5: WIN_EVAL` | `TSUMO (219)`, `RON (543..545)` | 调用纯 C++ `mjsoul_hand_eval`（里宝传空 `&[]`，**本场仅在结算层单次计入 `+300*ben`，严禁算点内部与外部双算本场**，计入场上全部 `liqibang * 1000` 及公开可判定大三元/大四喜包牌分担）计算单人和了净得点 `gain` 与结算后四家分数 `post_scores`：`[0]` $\min(2.0, \text{han}/13.0)$；`[1]` $\min(1.5, \text{fu}/110.0)$；`[2]` $\min(1.5, \ln(1 + \max(0, \text{gain}))/\ln 64001)$；`[3]` `is_yakuman`；`[4]` 结算后预测顺位 `(post_rank - 1) / 3.0`；`[5]` `would_end_game`（精确覆盖击飞 `<0`、All-Last 非庄和牌、庄家一位 `>=30000` 和了止、西入/南入 `>=30000` 突然死亡）；`[6]` `is_riichi_uradora_pending`（观察者已立直为 `1.0`）；`[7]` `0.0` |
+| `5: WIN_EVAL` | `TSUMO (219)`, `RON (543..545)` | 调用纯 C++ `mjsoul_hand_eval`（里宝传空 `&[]`，**本场仅在结算层单次计入 `+300*ben`，严禁算点内部与外部双算本场**，计入场上全部 `liqibang * 1000` 及公开可判定大三元/大四喜包牌分担）计算单人和了净得点 `gain` 与结算后四家分数 `post_scores`：`[0]` $\min(2.0, \text{han}/13.0)$；`[1]` $\min(1.5, \text{fu}/110.0)$；`[2]` $\min(1.5, \ln(1 + \max(0, \text{gain}))/\ln 64001)$；`[3]` `is_yakuman`；`[4]` 结算后预测顺位 `(post_rank - 1) / 3.0`；`[5]` `would_end_game`（1:1 对齐 [round_state.cpp](../../src/simulation/round_state.cpp#L2401-L2552)：任一家 `<0` 击飞完局；常规 All-Last 或延长局中若有人 `>=30000` 则非庄和牌或庄家和牌且升至 `1` 位时完局，否则连庄/入南入西；硬上限局东战南4/半庄西4若无人 `>=30000` 则非庄和牌亦完局、仅庄家和牌连庄）；`[6]` `is_riichi_uradora_pending`（观察者已立直为 `1.0`）；`[7]` `0.0` |
 | `6: KYUSHU_DRAW_EVAL` | `KYUSHU (220)` | `[0]` $\min(1, s_{\text{cur}}/8)$；`[1]` 手牌不同幺九牌种数 `distinct_yaochuu / 13.0`；`[2]` $\min(2.0, \text{cur\_dora}/8.0)$；`[3]` `is_dealer`；`[4]` 当前顺位 `(cur_rank - 1) / 3.0`；`[5..7]` `0.0` |
 
 ---
@@ -522,6 +523,7 @@ flowchart TB
 - CQL 正则项 $\alpha \big(T \log\sum_{k:\,m_k=1} \exp(Q_k / T) - Q_{k^*}\big)$ 严格仅在合法候选且 $K \ge 2$ 样本上归约。
 
 #### 轨道 B：Offline IQL + Twin Dueling Q + AWR（含可选分布式 QR-DQN CQL）
+> **单主干共享 vs 旧 5 网络独立副本显存警示**：现有 [iql/train.py](iql/train.py#L1174-L1308) 默认针对小模型实例化 `value / q1_source / q2_source / q1_target / q2_target` 共 **5 份完整 Encoder 主干**并拆分 3 个优化器，在 `v2_base` / `v2_large` 主力尺度下会造成 5 倍主干显存与前向开销。因此 V2 轨道 B 首选实现**单共享双 Decoder 主干联合模块**（仅对轻量级 `DuelingQHead` 做双胞独立初始化与 Polyak Target 复制，单次主干前向同时产出 `logits`、`V`、`Q1/Q2`，并在 `torch.autocast(..., cache_enabled=False)` 下计算 `no_grad` 目标前向防止缓存脱离梯度的 AMP 权重）；若在 `v2_tiny/v2_small` 对照旧分离式 `iql/train.py`，通过 §5 第 3 条的打包 `encode: [B, 33, D]` 契约同样兼容。
 1. **头部结构**：
    - 状态价值头 $V_\psi(s)$：`RMSNorm(d) -> Linear(d, d) -> SiLU -> Linear(d, 1)` 作用于 `h_val`（末层零初始化）；
    - 双胞独立初始化 **`DuelingQHead`** $Q_{\theta_1}, Q_{\theta_2}$（及对应 Polyak EMA 目标头 $Q_{\bar{\theta}_1}, Q_{\bar{\theta}_2}$，$\tau_{\text{EMA}} = 0.005$）：
@@ -588,10 +590,19 @@ flowchart TB
    - 新建常量 `ARCHITECTURE_ID = "mahjong_structured_dual_decoder_v2"`、`STRUCTURED_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与 `KANACHAN_ACTION_MANIFEST_SHA256`；
    - 严禁与 `"mahjong_dense_block_decoder_v1"` 混用模型构造分支或复用旧优化器/回放检查点；
    - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、数据 SHA256、奖励/GRP SHA256、精度配方、优化器/调度器/`GradScaler`、回放游标以及 CPU/CUDA/增广独立 `Generator` RNG 状态；任一摘要不一致直接抛错拒绝恢复。
-2. **C++ 扩展模块向后兼容与打包契约（严禁破坏现有 `discard_v1` 基线）**：
+2. **C++ 扩展模块向后兼容、Wheel 钩子与源码打包契约（严禁破坏现有 `discard_v1` 基线与远程构建）**：
    - 现有 [candidate_features.py](../candidate_features.py) 在导入 `kanachan._candidate_features` 时强制校验 `SCHEMA_ID == "discard_afterstate_v1"` 与 `FEATURE_WIDTH == 46`，且 [hatch_build.py](../../hatch_build.py) 的 `NATIVE_MODULES` 白名单绑定了 `"kanachan/_candidate_features"`；
-   - 因此在升级 [tools/features/CMakeLists.txt](../../tools/features/CMakeLists.txt) 时：**必须原封不动保留 `SCHEMA_ID = "discard_afterstate_v1"`、`FEATURE_WIDTH = 46` 与 `discard_features(...)` 函数导出**（确保实验 1 的 `DenseDecisionDecoder + discard_v1` 对照基线继续零改动运行），并在同一扩展中新增独立常量 `STRUCTURED_V2_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与释放 GIL 的批量函数 `encode_structured_v2_batch(...)`（若选择拆分为独立扩展 `kanachan/_structured_v2`，则必须同步加入 `hatch_build.py::NATIVE_MODULES` 与 `tools/package_training_source.py`）。
-3. **双路径推理、`model_loader.py` (`weights_only=True`) 与 `DecisionMaker` 原生对接硬契约**：
+   - 因此在升级 [tools/features/CMakeLists.txt](../../tools/features/CMakeLists.txt) 时：**必须原封不动保留 `SCHEMA_ID = "discard_afterstate_v1"`、`FEATURE_WIDTH = 46` 与 `discard_features(...)` 函数导出**（确保实验 1 的 `DenseDecisionDecoder + discard_v1` 对照基线继续零改动运行），并在同一扩展中新增独立常量 `STRUCTURED_V2_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与释放 GIL 的批量函数 `encode_structured_v2_batch(...)`（若选择拆分为独立扩展 `kanachan/_structured_v2`，则必须同步加入 `hatch_build.py::NATIVE_MODULES`）；
+   - **远程训练源码包防漏检**：[tools/package_training_source.py](../../tools/package_training_source.py) 当前仅硬编码收录了 `"src/features/candidate_features.cpp"` 而未通配 `src/features/*.hpp` / `*.cpp`；新增 `mjsoul_hand_eval.hpp` 与 `structured_v2` 源码文件后，**必须同步将其加入 `package_training_source.py` 的 `REQUIRED` 与 glob 列表**，防止打包上传 RTX 5090 云端构建时缺失头文件。
+3. **`TensorDictSequential` 两段式 `"encode"` 打包接口与现有训练器分支挂载点**：
+   - 现有 [decision_factory.py](../nn/decision_factory.py)、[decision_checkpoint.py](core/decision_checkpoint.py)、[bc/train.py](bc/train.py)、[cql/train.py](cql/train.py) 与 [iql/train.py](iql/train.py) 统一采用 `TensorDictModule(backbone, in_keys=["sparse", "numeric", "progression", "candidates"], out_keys=["encode"])` 接下游 `head_tdm` 的两段式拓扑：
+     - 为零摩擦接入整套现有流水线，`StructuredDualDecoder` 主干统一将 `h_val: [B, D]` 与 `h_cand: [B, 32, D]`（`flat546` 模式下为 `h_val` 扩展）沿第 1 维打包输出为单一 **`encode: [B, 33, D]`**（其中 `encode[:, 0, :] == h_val`，`encode[:, 1:33, :] == h_cand`）；
+     - 状态价值头 `StructuredStateHead`（`in_keys=["encode"]`）直接切片 `encode[:, 0, :]` 输出 `state_value`（及可选 `final_rank_logits`）；候选动作/动作价值头 `StructuredActionHead`（`in_keys=["candidates", "encode"]`）同时读取 `h_val = encode[:, 0, :]` 与 `h_cand = encode[:, 1:33, :]` 输出 `logits` 或 `action_value`；
+   - **必改分支清单（防静默退化到旧慢速分支）**：引入 `config.encoder.architecture = "structured_dual_v2"` 时，必须同步更新所有原先写死 `== "dense_decoder"` 的判断点（严禁漏改导致检查点校验失效或同分决胜退化）：
+     1. [decision_checkpoint.py](core/decision_checkpoint.py#L28) `recipe()`：开启严格配方、数据 SHA256 与 RNG 绑定（使用独立 `ARCHITECTURE_ID = "mahjong_structured_dual_decoder_v2"`，绝不返回 `None`）；
+     2. [cql/train.py](cql/train.py#L1328) 与 [decision_value.py](../nn/decision_value.py)：走快速无冗余 `mc_components` / `td_components`、`q_only` 视图与 `transfer_bc_features`（迁移主干与隐藏层并将末层标量输出置零）；
+     3. [iql/train.py](iql/train.py#L1311)：`TwinQActor(..., tie_break_by_action_id=True)` 强制开启最小 `global_id` 平局决胜。
+4. **双路径推理、`model_loader.py` (`weights_only=True`) 与 `DecisionMaker` 原生对接硬契约**：
    - **便携序列化格式约束（防 `UnpicklingError` 与 GPU 设备脱节）**：[model_loader.py](../model_loader.py) 使用 `torch.load(..., weights_only=True)` 加载带魔数 `"__kanachan__": "11fc2bfe-c4c7-402e-b11e-7cb3ff6f9945"` 的描述字典，且仅当 `"device" in kwargs` 时才将 `map_location` 注入 `kwargs["device"]`（见 [model_loader.py#L71-L72](../model_loader.py#L71-L72)）。因此导出 `snapshots/model.kanachan` 的模块类：
      1. `__init__` 的 `args / kwargs` **仅允许包含 Python 基础标量/列表/字典、`torch.dtype`、`torch.device` 或嵌套 `dump_model/dump_object` 字典，严禁直接塞入自定义 `dataclass` 实例**；
      2. **必须在 `kwargs` 中显式接收 `device: torch.device` 与 `dtype: torch.dtype`**，将所有参数与 `register_buffer` 直接创建在目标 `device` 上；
