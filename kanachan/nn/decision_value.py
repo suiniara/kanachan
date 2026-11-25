@@ -37,7 +37,9 @@ def _transfer_structured_bc(backbone: StructuredDualDecoder, head, bc_model):
     if sig(backbone) != sig(teacher):
         raise ValueError("Structured V2 BC and Q backbone architectures differ.")
     backbone.load_state_dict(teacher.state_dict(), strict=True)
-    if type(head) is StructuredActionHead and head.head_type == teacher_head.head_type:
+    if type(head) is StructuredActionHead:
+        if head.head_type != teacher_head.head_type:
+            raise ValueError("Structured V2 BC and Q head_type differ.")
         if head.mlp is not None and teacher_head.mlp is not None:
             if head.mlp[0].weight.shape != teacher_head.mlp[0].weight.shape:
                 raise ValueError("BC and Q hidden head dimensions differ.")

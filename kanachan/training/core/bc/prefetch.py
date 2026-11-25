@@ -14,15 +14,34 @@ def _initialize_worker():
     torch.set_num_threads(1)
 
 
-def _derive(sparse, numeric, progression, candidates, mode="discard_v1", enable_early_shape_hint=False):
+def _derive(
+    sparse,
+    numeric,
+    progression,
+    candidates,
+    mode="discard_v1",
+    enable_early_shape_hint=False,
+    next_inputs=None,
+):
     if mode == "structured_v2":
         from kanachan.structured_v2 import derive_structured_v2_batch
 
-        return derive_structured_v2_batch(
+        cur = derive_structured_v2_batch(
             sparse, numeric, progression, candidates,
             enable_early_shape_hint=enable_early_shape_hint,
             include_room_level=False,
         )
+        if next_inputs is not None:
+            from kanachan.training.iql.joint_v2 import derive_next_structured_v2_batch
+
+            n_sp, n_nu, n_pr, n_ca, done = next_inputs
+            nxt = derive_next_structured_v2_batch(
+                {"sparse": n_sp, "numeric": n_nu, "progression": n_pr, "candidates": n_ca},
+                done,
+                enable_early_shape_hint=enable_early_shape_hint,
+            )
+            return (cur, nxt)
+        return cur
     if mode == "none":
         return None
     from kanachan.candidate_features import derive_candidate_features
@@ -32,8 +51,15 @@ def _derive(sparse, numeric, progression, candidates, mode="discard_v1", enable_
 
 def _attach_features(batch, result, mode):
     if mode == "structured_v2":
-        for key, value in result.items():
-            batch[key] = value
+        if isinstance(result, tuple):
+            cur, nxt = result
+            for key, value in cur.items():
+                batch[key] = value
+            for key, value in nxt.items():
+                batch["next", key] = value
+        else:
+            for key, value in result.items():
+                batch[key] = value
     elif result is not None:
         batch["candidate_afterstate"] = result
     return batch
@@ -130,6 +156,21 @@ class CandidateFeaturePrefetch:
                     )
                     self._put((None, future))
                 else:
+                    next_inputs = None
+                    if (
+                        self.mode == "structured_v2"
+                        and "next" in batch
+                        and "sparse" in batch["next"]
+                        and "done" in batch["next"]
+                    ):
+                        nxt = batch["next"]
+                        next_inputs = (
+                            nxt["sparse"],
+                            nxt["numeric"],
+                            nxt["progression"],
+                            nxt["candidates"],
+                            nxt["done"],
+                        )
                     future = self.pool.submit(
                         _derive,
                         batch["sparse"],
@@ -138,6 +179,7 @@ class CandidateFeaturePrefetch:
                         batch["candidates"],
                         self.mode,
                         self.enable_early_shape_hint,
+                        next_inputs,
                     )
                     self._put((batch, future))
             self._put(None)

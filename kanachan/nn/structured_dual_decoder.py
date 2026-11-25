@@ -639,12 +639,17 @@ class TrajectoryCausalDecoder(nn.Module):
 
         ev_types = new_ev[0, :, 0].long()
         ev_actors = new_ev[0, :, 1].long()
-        for t in range(new_len):
-            et = int(ev_types[t].item())
-            ar = int(ev_actors[t].item())
-            if et != 0 and 0 <= ar < 4:
-                cache.last_seat_hidden[0, ar] = h[0, t]
-                cache.has_seat_event[0, ar] = True
+        pos = torch.arange(new_len, device=h.device, dtype=torch.long)
+        seats_r = torch.arange(4, device=h.device, dtype=torch.long).unsqueeze(1)
+        match = (ev_types.unsqueeze(0) != 0) & (ev_actors.unsqueeze(0) == seats_r)
+        has_new = match.any(dim=-1)
+        scores = torch.where(match, pos.unsqueeze(0), torch.full_like(pos.unsqueeze(0), -1))
+        last_idx = scores.max(dim=-1).values.clamp_min(0)
+        picked_h = h[0, last_idx].unsqueeze(0)
+        cache.last_seat_hidden = torch.where(
+            has_new.view(1, 4, 1), picked_h, cache.last_seat_hidden
+        )
+        cache.has_seat_event = cache.has_seat_event | has_new.unsqueeze(0)
 
         fallback = self.no_event_seat_emb.weight.unsqueeze(0)
         seats = torch.where(
@@ -868,22 +873,23 @@ class DecisionStitchDecoder(nn.Module):
 
         if self.head_type == "factorized" and target_b34 is not None:
             assert c0_b34 is not None and c1_b34 is not None and src_rel is not None
-            # Tile edges: c0/c1 -> 12, target -> 11 (higher priority)
-            tile_rel = torch.full((bsz, kmax, 35), 16, dtype=torch.long, device=device)
-            src12 = torch.full((bsz, kmax, 1), 12, dtype=torch.long, device=device)
-            src11 = torch.full((bsz, kmax, 1), 11, dtype=torch.long, device=device)
-            tile_rel.scatter_(2, c0_b34.unsqueeze(-1), src12)
-            tile_rel.scatter_(2, c1_b34.unsqueeze(-1), src12)
-            tile_rel.scatter_(2, target_b34.unsqueeze(-1), src11)
-            tile_34 = tile_rel[:, :, :34]  # drops NULL_TILE=34 cleanly!
+            # Tile edges: c0/c1 -> 12, target -> 11 (higher priority); avoid scatter_ which syncs in deterministic mode
+            idx34 = torch.arange(34, device=device, dtype=torch.long).view(1, 1, 34)
+            tile_34 = torch.where(
+                target_b34.unsqueeze(-1) == idx34,
+                11,
+                torch.where(
+                    (c0_b34.unsqueeze(-1) == idx34) | (c1_b34.unsqueeze(-1) == idx34),
+                    12,
+                    16,
+                ),
+            )  # NULL_TILE=34 naturally excluded!
             rel[:, 45:, 10:44] = tile_34
             rel[:, 10:44, 45:] = tile_34.transpose(1, 2)
 
-            # Player source edges -> 13
-            pl_rel = torch.full((bsz, kmax, 5), 16, dtype=torch.long, device=device)
-            src13 = torch.full((bsz, kmax, 1), 13, dtype=torch.long, device=device)
-            pl_rel.scatter_(2, src_rel.unsqueeze(-1), src13)
-            pl_4 = pl_rel[:, :, :4]  # drops NULL_SOURCE=4 cleanly!
+            # Player source edges -> 13; NULL_SOURCE=4 naturally excluded!
+            idx4 = torch.arange(4, device=device, dtype=torch.long).view(1, 1, 4)
+            pl_4 = torch.where(src_rel.unsqueeze(-1) == idx4, 13, 16)
             rel[:, 45:, 6:10] = pl_4
             rel[:, 6:10, 45:] = pl_4.transpose(1, 2)
 
@@ -1108,6 +1114,8 @@ class StructuredDualDecoder(nn.Module):
         cand_mask: Tensor,
         cand_mode: Tensor,
         cand_dyn: Tensor,
+        *,
+        flatten_active: bool = True,
     ) -> dict[str, Tensor]:
         """Whole-round parallel Teacher Forcing forward (§3.2.4, §4.2).
 
@@ -1115,21 +1123,33 @@ class StructuredDualDecoder(nn.Module):
         round_event_len:    [B_r]
         decision_event_len: [B_r, T]
         decision_mask:      [B_r, T] bool
-        Step tensors can be [B_r, T, ...] (filtered via decision_mask) OR already
-        flattened [N_active, ...]; we accept [B_r, T, ...] uniformly.
+        When ``flatten_active=True`` (default), filters to active [N_active, ...] steps.
+        When ``flatten_active=False``, flattens statically to [B_r * T, ...] with zero GPU sync.
         """
         d1_mem_round, h_ev = self.decoder1.forward_round_events(
             round_events, round_event_len, decision_event_len
         )
         dmask = decision_mask.bool()
-        d1_flat = d1_mem_round[dmask]
-        tf_flat = tile_feats[dmask] if tile_feats.ndim == 4 else tile_feats
-        gf_flat = global_feats[dmask] if global_feats.ndim == 3 else global_feats
-        pf_flat = player_feats[dmask] if player_feats.ndim == 4 else player_feats
-        cids_flat = cand_ids[dmask] if cand_ids.ndim == 3 else cand_ids
-        cmask_flat = cand_mask[dmask] if cand_mask.ndim == 3 else cand_mask
-        cmode_flat = cand_mode[dmask] if cand_mode.ndim == 3 else cand_mode
-        cdyn_flat = cand_dyn[dmask] if cand_dyn.ndim == 4 else cand_dyn
+        if flatten_active:
+            d1_flat = d1_mem_round[dmask]
+            tf_flat = tile_feats[dmask] if tile_feats.ndim == 4 else tile_feats
+            gf_flat = global_feats[dmask] if global_feats.ndim == 3 else global_feats
+            pf_flat = player_feats[dmask] if player_feats.ndim == 4 else player_feats
+            cids_flat = cand_ids[dmask] if cand_ids.ndim == 3 else cand_ids
+            cmask_flat = cand_mask[dmask] if cand_mask.ndim == 3 else cand_mask
+            cmode_flat = cand_mode[dmask] if cand_mode.ndim == 3 else cand_mode
+            cdyn_flat = cand_dyn[dmask] if cand_dyn.ndim == 4 else cand_dyn
+        else:
+            bsz_r, tmax = dmask.shape[:2]
+            ntot = bsz_r * tmax
+            d1_flat = d1_mem_round.reshape(ntot, 5, self.dimension)
+            tf_flat = tile_feats.reshape(ntot, 34, TILE_FEATS_DIM)
+            gf_flat = global_feats.reshape(ntot, GLOBAL_FEATS_DIM)
+            pf_flat = player_feats.reshape(ntot, 4, PLAYER_FEATS_DIM)
+            cids_flat = cand_ids.reshape(ntot, MAX_CANDIDATES)
+            cmask_flat = cand_mask.reshape(ntot, MAX_CANDIDATES)
+            cmode_flat = cand_mode.reshape(ntot, MAX_CANDIDATES)
+            cdyn_flat = cand_dyn.reshape(ntot, MAX_CANDIDATES, CAND_DYN_DIM)
 
         d2_out = self.decoder2(
             d1_flat, gf_flat, pf_flat, tf_flat,
@@ -1455,8 +1475,6 @@ class NextEventHead(nn.Module):
             ).view(bsz, lmax - 1)
             td_mask = is_dahai.float()
             td_loss = (td_raw * td_mask).sum() / td_mask.sum().clamp_min(1.0)
-            if not bool(is_dahai.any().item()):
-                td_loss = td_logits.sum() * 0.0
 
             total = 1.0 * k_loss + 0.5 * a_loss + 1.0 * t_loss + 0.5 * td_loss
             return total, {

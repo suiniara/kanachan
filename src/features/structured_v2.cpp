@@ -1267,46 +1267,73 @@ PyObject* py_encode_structured_v2_batch(PyObject*, PyObject* args) {
       }
     }
 
-    std::vector<float> tile_buf(static_cast<std::size_t>(B) * 34 * TILE_FEATS_DIM);
-    std::vector<std::uint8_t> ev_buf(static_cast<std::size_t>(B) * l_max * EVENT_BYTES, 0);
-    std::vector<int32_t> evlen_buf(B);
-    std::vector<float> glob_buf(static_cast<std::size_t>(B) * GLOBAL_FEATS_DIM);
-    std::vector<float> play_buf(static_cast<std::size_t>(B) * 4 * PLAYER_FEATS_DIM);
-    std::vector<std::uint8_t> cmode_buf(static_cast<std::size_t>(B) * MAX_CANDIDATES);
-    std::vector<float> cdyn_buf(static_cast<std::size_t>(B) * MAX_CANDIDATES * CAND_DYN_DIM);
+    Py_ssize_t const n0 = static_cast<Py_ssize_t>(
+        static_cast<std::size_t>(B) * 34 * TILE_FEATS_DIM * sizeof(float));
+    Py_ssize_t const n1 = static_cast<Py_ssize_t>(
+        static_cast<std::size_t>(B) * l_max * EVENT_BYTES);
+    Py_ssize_t const n2 = static_cast<Py_ssize_t>(
+        static_cast<std::size_t>(B) * sizeof(int32_t));
+    Py_ssize_t const n3 = static_cast<Py_ssize_t>(
+        static_cast<std::size_t>(B) * GLOBAL_FEATS_DIM * sizeof(float));
+    Py_ssize_t const n4 = static_cast<Py_ssize_t>(
+        static_cast<std::size_t>(B) * 4 * PLAYER_FEATS_DIM * sizeof(float));
+    Py_ssize_t const n5 = static_cast<Py_ssize_t>(
+        static_cast<std::size_t>(B) * MAX_CANDIDATES);
+    Py_ssize_t const n6 = static_cast<Py_ssize_t>(
+        static_cast<std::size_t>(B) * MAX_CANDIDATES * CAND_DYN_DIM * sizeof(float));
 
-    for (int b = 0; b < B; ++b) {
-      auto const& s = samples[b];
-      std::memcpy(&tile_buf[static_cast<std::size_t>(b) * 34 * TILE_FEATS_DIM],
-                  s.tile_feats.data(), s.tile_feats.size() * sizeof(float));
-      std::memcpy(&ev_buf[static_cast<std::size_t>(b) * l_max * EVENT_BYTES],
-                  s.events.data(), static_cast<std::size_t>(s.event_len) * EVENT_BYTES);
-      evlen_buf[b] = static_cast<int32_t>(s.event_len);
-      std::memcpy(&glob_buf[static_cast<std::size_t>(b) * GLOBAL_FEATS_DIM],
-                  s.global_feats.data(), s.global_feats.size() * sizeof(float));
-      std::memcpy(&play_buf[static_cast<std::size_t>(b) * 4 * PLAYER_FEATS_DIM],
-                  s.player_feats.data(), s.player_feats.size() * sizeof(float));
-      std::memcpy(&cmode_buf[static_cast<std::size_t>(b) * MAX_CANDIDATES],
-                  s.cand_mode.data(), s.cand_mode.size());
-      std::memcpy(&cdyn_buf[static_cast<std::size_t>(b) * MAX_CANDIDATES * CAND_DYN_DIM],
-                  s.cand_dyn.data(), s.cand_dyn.size() * sizeof(float));
+    auto alloc_ba = [](Py_ssize_t n) -> PyObject* {
+      return PyByteArray_FromStringAndSize(n == 0 ? "" : nullptr, n);
+    };
+    PyObject* t0 = alloc_ba(n0);
+    PyObject* t1 = alloc_ba(n1);
+    PyObject* t2 = alloc_ba(n2);
+    PyObject* t3 = alloc_ba(n3);
+    PyObject* t4 = alloc_ba(n4);
+    PyObject* t5 = alloc_ba(n5);
+    PyObject* t6 = alloc_ba(n6);
+    PyObject* t7 = PyLong_FromLong(l_max);
+    if (!t0 || !t1 || !t2 || !t3 || !t4 || !t5 || !t6 || !t7) {
+      Py_XDECREF(t0); Py_XDECREF(t1); Py_XDECREF(t2); Py_XDECREF(t3);
+      Py_XDECREF(t4); Py_XDECREF(t5); Py_XDECREF(t6); Py_XDECREF(t7);
+      return nullptr;
     }
 
-    PyObject* t0 = PyBytes_FromStringAndSize(reinterpret_cast<char const*>(tile_buf.data()),
-                                             static_cast<Py_ssize_t>(tile_buf.size() * sizeof(float)));
-    PyObject* t1 = PyBytes_FromStringAndSize(reinterpret_cast<char const*>(ev_buf.data()),
-                                             static_cast<Py_ssize_t>(ev_buf.size()));
-    PyObject* t2 = PyBytes_FromStringAndSize(reinterpret_cast<char const*>(evlen_buf.data()),
-                                             static_cast<Py_ssize_t>(evlen_buf.size() * sizeof(int32_t)));
-    PyObject* t3 = PyBytes_FromStringAndSize(reinterpret_cast<char const*>(glob_buf.data()),
-                                             static_cast<Py_ssize_t>(glob_buf.size() * sizeof(float)));
-    PyObject* t4 = PyBytes_FromStringAndSize(reinterpret_cast<char const*>(play_buf.data()),
-                                             static_cast<Py_ssize_t>(play_buf.size() * sizeof(float)));
-    PyObject* t5 = PyBytes_FromStringAndSize(reinterpret_cast<char const*>(cmode_buf.data()),
-                                             static_cast<Py_ssize_t>(cmode_buf.size()));
-    PyObject* t6 = PyBytes_FromStringAndSize(reinterpret_cast<char const*>(cdyn_buf.data()),
-                                             static_cast<Py_ssize_t>(cdyn_buf.size() * sizeof(float)));
-    PyObject* t7 = PyLong_FromLong(l_max);
+    char* p0 = n0 ? PyByteArray_AS_STRING(t0) : nullptr;
+    char* p1 = n1 ? PyByteArray_AS_STRING(t1) : nullptr;
+    char* p2 = n2 ? PyByteArray_AS_STRING(t2) : nullptr;
+    char* p3 = n3 ? PyByteArray_AS_STRING(t3) : nullptr;
+    char* p4 = n4 ? PyByteArray_AS_STRING(t4) : nullptr;
+    char* p5 = n5 ? PyByteArray_AS_STRING(t5) : nullptr;
+    char* p6 = n6 ? PyByteArray_AS_STRING(t6) : nullptr;
+
+    {
+      GilReleaseGuard gil_release;
+      if (p1) {
+        std::memset(p1, 0, static_cast<std::size_t>(n1));
+      }
+      for (int b = 0; b < B; ++b) {
+        auto const& s = samples[b];
+        std::memcpy(p0 + static_cast<std::size_t>(b) * 34 * TILE_FEATS_DIM * sizeof(float),
+                    s.tile_feats.data(), s.tile_feats.size() * sizeof(float));
+        if (s.event_len > 0) {
+          std::memcpy(p1 + static_cast<std::size_t>(b) * l_max * EVENT_BYTES,
+                      s.events.data(), static_cast<std::size_t>(s.event_len) * EVENT_BYTES);
+        }
+        int32_t const evl = static_cast<int32_t>(s.event_len);
+        std::memcpy(p2 + static_cast<std::size_t>(b) * sizeof(int32_t),
+                    &evl, sizeof(int32_t));
+        std::memcpy(p3 + static_cast<std::size_t>(b) * GLOBAL_FEATS_DIM * sizeof(float),
+                    s.global_feats.data(), s.global_feats.size() * sizeof(float));
+        std::memcpy(p4 + static_cast<std::size_t>(b) * 4 * PLAYER_FEATS_DIM * sizeof(float),
+                    s.player_feats.data(), s.player_feats.size() * sizeof(float));
+        std::memcpy(p5 + static_cast<std::size_t>(b) * MAX_CANDIDATES,
+                    s.cand_mode.data(), s.cand_mode.size());
+        std::memcpy(p6 + static_cast<std::size_t>(b) * MAX_CANDIDATES * CAND_DYN_DIM * sizeof(float),
+                    s.cand_dyn.data(), s.cand_dyn.size() * sizeof(float));
+      }
+    }
+
     PyObject* tuple = PyTuple_Pack(8, t0, t1, t2, t3, t4, t5, t6, t7);
     Py_DECREF(t0); Py_DECREF(t1); Py_DECREF(t2); Py_DECREF(t3);
     Py_DECREF(t4); Py_DECREF(t5); Py_DECREF(t6); Py_DECREF(t7);

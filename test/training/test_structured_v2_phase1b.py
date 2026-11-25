@@ -53,6 +53,7 @@ from kanachan.structured_v2 import (
     permute_structured_batch,
 )
 from kanachan.training.bc.trajectory_v2 import (
+    ACTION_FAMILY_NAMES,
     TrajectoryBCModel,
     build_round_trajectories_from_raw,
     collate_round_batch,
@@ -359,11 +360,10 @@ def _ddp_target_sync_worker(rank: int, world_size: int, store_uri: str, tmp_dir:
             device=torch.device("cpu"),
             ddp_wrapped=ddp,
         )
-        dist.barrier()
+        ckpt = save_joint_iql_checkpoint(
+            ckpt_dir, mod, opt, step=2, cursor=2, recipe=recipe
+        )
         if rank == 0:
-            ckpt = save_joint_iql_checkpoint(
-                ckpt_dir, mod, opt, step=2, cursor=2, recipe=recipe
-            )
             # Confirm Polyak lag exists: target != online
             diff_lag = sum(
                 (p_t - p_o).abs().sum().item()
@@ -1121,7 +1121,8 @@ class TestStructuredV2Phase1B(unittest.TestCase):
                 m_cont.backbone, m_cont.policy_head,
                 [collate_round_batch(rounds[:2])], device=torch.device("cpu"),
             )
-            self.assertIn("discard", eval_res)
+            self.assertIn("DISCARD_DAMA", eval_res)
+            self.assertTrue(set(ACTION_FAMILY_NAMES).issubset(eval_res.keys()))
             self.assertIn("overall", eval_res)
 
         # 16B. JointStructuredIQLModule exact resume with FrozenGRP + Fail-Closed check

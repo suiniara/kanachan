@@ -590,9 +590,9 @@ def _gather_tile34_dim(t: torch.Tensor, inv_idx: torch.Tensor, dim: int) -> torc
 
 
 def permute_structured_batch(
-    batch: dict[str, torch.Tensor],
+    batch: Any,
     perm_idx: int | torch.Tensor,
-) -> dict[str, torch.Tensor]:
+) -> Any:
     """Apply S_3 suit permutation directly on precomputed structured_v2 tensors (§4.1.4)."""
     ref = batch["v2_tile_feats"] if "v2_tile_feats" in batch else batch["tile_feats"]
     bsz = ref.shape[0]
@@ -603,12 +603,13 @@ def permute_structured_batch(
     else:
         p_vec = perm_idx.to(device=device, dtype=torch.long)
 
-    p_b34 = torch.from_numpy(PERM_BASE34.copy()).to(device=device, dtype=torch.long)[p_vec]
     inv_b34 = torch.from_numpy(INV_PERM_BASE34.copy()).to(device=device, dtype=torch.long)[p_vec, :34]
     p_t37 = torch.from_numpy(PERM_TILE37.copy()).to(device=device, dtype=torch.long)[p_vec]
     p_act = torch.from_numpy(PERM_ACTION_ID.copy()).to(device=device, dtype=torch.long)[p_vec]
 
-    out = dict(batch)
+    out = batch.clone(recurse=False) if not isinstance(batch, dict) and hasattr(batch, "clone") else dict(batch)
+    if "next" in batch and batch["next"] is not None:
+        out["next"] = permute_structured_batch(batch["next"], p_vec)
 
     for key in ("v2_tile_feats", "tile_feats", "oracle_tile", "v2_oracle_tile"):
         if key in out:
@@ -725,28 +726,20 @@ def derive_structured_v2_batch(
         )
     )
     bsz = sp_cpu.shape[0]
-    tile_feats = torch.from_numpy(
-        np.frombuffer(tile_b, dtype=np.float32).reshape(bsz, 34, TILE_FEATS_DIM).copy()
-    )
-    events = torch.from_numpy(
-        np.frombuffer(ev_b, dtype=np.uint8).reshape(bsz, lmax, EVENT_BYTES).copy()
-    )
-    event_len = torch.from_numpy(
-        np.frombuffer(ev_len_b, dtype=np.int32).reshape(bsz).copy()
-    )
-    global_feats = torch.from_numpy(
-        np.frombuffer(glob_b, dtype=np.float32).reshape(bsz, GLOBAL_FEATS_DIM).copy()
-    )
-    player_feats = torch.from_numpy(
-        np.frombuffer(play_b, dtype=np.float32).reshape(bsz, 4, PLAYER_FEATS_DIM).copy()
-    )
-    cand_mode = torch.from_numpy(
-        np.frombuffer(cmode_b, dtype=np.uint8).reshape(bsz, MAX_CANDIDATES).copy()
-    )
-    cand_dyn = torch.from_numpy(
-        np.frombuffer(cdyn_b, dtype=np.float32).reshape(bsz, MAX_CANDIDATES, CAND_DYN_DIM).copy()
-    )
-    cand_ids = candidates.to(dtype=torch.int32).clone()
+
+    def _from_ba(buf: bytearray | bytes, dtype: torch.dtype, shape: tuple[int, ...]) -> torch.Tensor:
+        if bsz == 0 or len(buf) == 0:
+            return torch.empty(shape, dtype=dtype)
+        return torch.frombuffer(buf, dtype=dtype).reshape(shape)
+
+    tile_feats = _from_ba(tile_b, torch.float32, (bsz, 34, TILE_FEATS_DIM))
+    events = _from_ba(ev_b, torch.uint8, (bsz, lmax, EVENT_BYTES))
+    event_len = _from_ba(ev_len_b, torch.int32, (bsz,))
+    global_feats = _from_ba(glob_b, torch.float32, (bsz, GLOBAL_FEATS_DIM))
+    player_feats = _from_ba(play_b, torch.float32, (bsz, 4, PLAYER_FEATS_DIM))
+    cand_mode = _from_ba(cmode_b, torch.uint8, (bsz, MAX_CANDIDATES))
+    cand_dyn = _from_ba(cdyn_b, torch.float32, (bsz, MAX_CANDIDATES, CAND_DYN_DIM))
+    cand_ids = torch.from_numpy(ca_cpu).clone()
     cand_mask = cand_ids != PAD_ACTION_ID
 
     out = {
@@ -755,8 +748,8 @@ def derive_structured_v2_batch(
         "v2_event_len": event_len,
         "v2_global_feats": global_feats,
         "v2_player_feats": player_feats,
-        "v2_cand_ids": cand_ids.cpu(),
-        "v2_cand_mask": cand_mask.cpu(),
+        "v2_cand_ids": cand_ids,
+        "v2_cand_mask": cand_mask,
         "v2_cand_mode": cand_mode,
         "v2_cand_dyn": cand_dyn,
     }
