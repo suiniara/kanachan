@@ -94,7 +94,7 @@
   - `results` 为 14 个逗号分隔整数：`round_delta_scores[0..3], benchang, num_liqibangs, post_round_scores[0..3], final_game_scores[0..3]`。
 - **单步模式 vs 整局并行模式的数据源要求**：
   - 已被全局行打乱（shuffled）的 `train.bc.tsv` 直接走单步模式（可配合按 `len(progression)` 分桶的 `LengthBucketBatchSampler`）；
-  - 整局并行 Teacher Forcing（`forward_round_trajectory`）、20 维 `PureStateGRP` 训练以及 Stage-2 Offline IQL / `streaming_mc` **必须读取未打乱的连续半庄标注流**（同一 `(uuid, observer_seat)` 按对局时间连续排列）：按 `(uuid, observer_seat, chang, ju, ben)` 切分小局块，取该小局块最后一步的 `progression` 作为 `round_events` 全集（因 `progression` 在同小局内严格前缀增长），各决策步的 `len(progression)` 即为 `decision_event_len[t]`。
+  - 整局并行 Teacher Forcing（`forward_round_trajectory`）、20 维 `PureStateGRP` 训练以及 Stage-2 Offline IQL / `streaming_mc` **必须读取未打乱的完整 `source-v3` 半庄标注流**：`parse_bc_rounds()` 默认启用 `allow_incomplete=False, allow_unlabeled=False`，按 UUID 隔离局界、强制同一 UUID 跨 4 席 `final_game_scores` 与同物理小局 `round_summary/results` 一致，按 `(pr_len, -left_tiles, is_own_turn)` 规范时序拒绝重复步与分叉/非前缀历史，并校验首局 `(0,0,0)`、庄家起手 `(0,)`、全非立直/非模切动作逐步覆盖、胜局和牌/荒牌残张结尾与终局（东4/南4或击飞）完整性（仅当显式测试合成片段时才允许传入 `allow_incomplete=True`）；按 `(uuid, observer_seat, chang, ju, ben)` 切分小局块后取最长 `progression` 作为 `round_events` 全集，各决策步的事件长度即为 `decision_event_len[t]`。
 
 ---
 
@@ -484,7 +484,7 @@ flowchart TB
    - 仅在整局完整轨迹上启用，按每位观察者半庄总步数线性赋权 $w_t = T_{\text{ref}} / T_{\text{player}}$ 全局归一，保持梯度累积与多卡 DDP 数学等价。
 4. **9 类动作家族拆分验证指标（防止 85% 弃牌淹没关键决策质量）**：
    - 验证集除汇总 `val_nll` 与 `val_top1_acc`（仅统计 $K \ge 2$）外，强制按 9 个动作家族分别输出样本数、NLL 与 Top-1 准确率：`DISCARD_DAMA`, `DISCARD_RIICHI`, `CHI`, `PON`, `KAN (ANKAN/KAKAN/DAIMINKAN)`, `TSUMO`, `RON`, `SKIP/PASS`, `KYUSHU`。
-5. **优化步守卫**：FP16 `GradScaler` 发生溢出跳过 `optimizer.step()` 时，**严禁调用 `scheduler.step()`**；梯度累积末尾不足 `grad_accum_steps` 的残余微批按 `grad_accum_steps / accum_counter` 精确重缩梯度。
+5. **预更新数值安全与优化步守卫**：在 `train_trajectory_bc_steps` 与 `train_joint_iql_batches` 中，**所有优化器更新、梯度裁剪、Target Q EMA 与学习率调度之前**必须校验 loss 与梯度（FP32 模长归约 + `GradScaler` `found_inf` 汇总 + DDP `ReduceOp.MAX` 跨卡同步）。在 CUDA Fused AdamW 且无 `scheduler` 时，通过张量化 `grad_scale / found_inf` 注入与 `update_targets(valid=~step_bad)` 实现**零主机同步**原位屏蔽；非 fused / CPU / 启用调度器路径则在步前检查并跳过 `optimizer.step()` / `scheduler.step()` / Target EMA（同时正确触发 `GradScaler.update()` 回退尺度），杜绝 NaN/Inf 污染在线与目标权重，并持久记录 `optimizer_steps / skipped_steps / nonfinite_loss_steps / nonfinite_grad_steps`。 gradient 裁剪前用 `safe_norm` 替换非有限范数防 `0 * Inf` 传播，梯度累积末尾不足 `grad_accum_steps` 的残余微批按 `grad_accum_steps / accum_counter` 精确重缩梯度。
 
 ---
 
@@ -542,9 +542,10 @@ flowchart TB
 3. **分歧学习率与共享 `DecomposedTileEmbedding` 冻结耦合守卫**：
    - Stage 2 默认对 Decoder 1 非共享层施加低学习率乘子 **`decoder1_lr_scale = 0.25`**，保护 Stage-1 已训好的长程事件表征不被早期噪声 Q 梯度冲垮；
    - 若开启 `freeze_decoder1 = True`，由于 `tile_emb` 被 Decoder 1 与 Decoder 2 共享，默认同步冻结 `tile_emb`（`freeze_shared_tile_emb = None -> True`），防止已冻结的 Decoder 1 底层牌嵌入发生输入漂移；同时强制将未参与损失的辅助头参数置 `requires_grad_(False)`，确保 DDP 零孤儿参数报错。
-4. **可选分布式 QR-DQN + CQL 头（`use_cql_quantile_head: bool = False`）**：
-   - `QuantileQHead`：`RMSNorm(2d) -> Linear(2d, d) -> SiLU -> Linear(d, M=32)` 预测动作回报的 32 个分位数 $\tau_m = \frac{m + 0.5}{M}$；
-   - 损失为 Quantile Huber Regression（$\kappa = 1.0$）加在分位均值 $\bar{Q}(s,a) = \frac{1}{M}\sum_m Q_m(s,a)$ 上计算的合法候选 CQL 保守项（仅 $K \ge 2$）。
+4. **可选分布式 QR-DQN + CQL 头（`use_cql_quantile_head: bool = False`, `qr_double_q: bool = True`）**：
+   - `QuantileQHead` 与对应 Polyak 目标头 $Q^{\text{tgt}}_{\bar{\theta}}$（`quantile_q_target_head`，随 `update_targets(valid=...)` 仅在合法优化步后同步更新，检查点恢复保留 Polyak lag）：`RMSNorm(2d) -> Linear(2d, d) -> SiLU -> Linear(d, M)` 预测动作回报的 $M$ 个分位数 $\tau_m = \frac{m + 0.5}{M}$；
+   - **完整分布式 Bellman 目标**（严格 `.detach()` 零目标梯度，且 `done=True` 或 `discount == 0` 时严格不自举、不访问伪造 `next` 哨兵索引）：令 $a^* = \arg\max_{j:\,m_{t+1,j}=1}\frac{1}{M}\sum_m Q_{\theta}^{\text{sel}}(s_{t+1}, a_j)_m$（`qr_double_q=True` 使用在线头、否则目标头，同分按最小 `global_id` 决胜），目标分布 $Z_{\text{tgt}, k} = r_t + \gamma (1-\text{done}_t)\cdot \mathbb{1}[\gamma \ne 0] \cdot Q^{\text{tgt}}_{\bar{\theta}}(s_{t+1}, a^*)_k$；
+   - 损失为成对分位数 Huber 回归（对目标分位取均值、对预测分位求和再对批取均值，$\kappa \ge 0$ 且有限）加在分位均值 $\bar{Q}(s,a) = \frac{1}{M}\sum_m Q_m(s,a)$ 上计算的合法候选 CQL 保守项（严格仅限 $K \ge 2$，`quantile_cql_alpha` 与 `cql_temperature` 写入不可变训练配方绑定）。
 
 ---
 
@@ -589,7 +590,8 @@ flowchart TB
 1. **独立架构标识与 Fail-Closed 恢复检查**：
    - 新建常量 `ARCHITECTURE_ID = "mahjong_structured_dual_decoder_v2"`、`STRUCTURED_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与 `KANACHAN_ACTION_MANIFEST_SHA256`；
    - 严禁与 `"mahjong_dense_block_decoder_v1"` 混用模型构造分支或复用旧优化器/回放检查点；
-   - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、数据 SHA256、奖励/GRP SHA256、精度配方、优化器/调度器/`GradScaler`、回放游标以及 CPU/CUDA/增广独立 `Generator` RNG 状态；任一摘要不一致直接抛错拒绝恢复。
+   - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、IQL 分布式超参（`quantile_cql_alpha`, `cql_temperature`, `qr_double_q`）、数据 SHA256、奖励/GRP SHA256、精度配方、数值安全统计（`numerical_stats`）、优化器/调度器/`GradScaler`、回放游标以及多卡独立 `rng_by_rank` 状态；任一摘要不一致直接抛错拒绝恢复。
+   - 便携导出归一化：`dump_actor()` 强制将 `state["state_dict"]` 中的浮点权重统一转移为 `(device="cpu", dtype=save_dtype)`（非浮点张量至 `cpu`）后原子落盘，确保从 GPU/混精训练导出的 `model.kanachan` 在任意 CPU/CUDA 设备均可零报错 `weights_only=True` 重载并对接 `DecisionMaker`。
 2. **C++ 扩展模块向后兼容、Wheel 钩子与源码打包契约（严禁破坏现有 `discard_v1` 基线与远程构建）**：
    - 现有 [candidate_features.py](../candidate_features.py) 在导入 `kanachan._candidate_features` 时强制校验 `SCHEMA_ID == "discard_afterstate_v1"` 与 `FEATURE_WIDTH == 46`，且 [hatch_build.py](../../hatch_build.py) 的 `NATIVE_MODULES` 白名单绑定了 `"kanachan/_candidate_features"`；
    - 因此在升级 [tools/features/CMakeLists.txt](../../tools/features/CMakeLists.txt) 时：**必须原封不动保留 `SCHEMA_ID = "discard_afterstate_v1"`、`FEATURE_WIDTH = 46` 与 `discard_features(...)` 函数导出**（确保实验 1 的 `DenseDecisionDecoder + discard_v1` 对照基线继续零改动运行），并在同一扩展中新增独立常量 `STRUCTURED_V2_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与释放 GIL 的批量函数 `encode_structured_v2_batch(...)`（若选择拆分为独立扩展 `kanachan/_structured_v2`，则必须同步加入 `hatch_build.py::NATIVE_MODULES`）；

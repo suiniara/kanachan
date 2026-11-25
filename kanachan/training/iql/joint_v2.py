@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -136,6 +137,8 @@ def build_joint_iql_recipe(
     if module.quantile_q_head is not None:
         iql_cfg["num_quantiles"] = int(module.quantile_q_head.num_quantiles)
         iql_cfg["qr_double_q"] = bool(module.qr_double_q)
+        iql_cfg["quantile_cql_alpha"] = float(module.quantile_cql_alpha)
+        iql_cfg["cql_temperature"] = float(module.cql_temperature)
     return {
         "format_version": 1,
         "architecture": ARCHITECTURE_ID,
@@ -164,6 +167,26 @@ def build_joint_iql_recipe(
     }
 
 
+def build_joint_iql_optimizer(
+    module: JointStructuredIQLModule,
+    *,
+    base_lr: float,
+    weight_decay: float,
+    decoder1_lr_scale: float = 0.25,
+    device: torch.device | None = None,
+    fused: bool | None = None,
+) -> torch.optim.AdamW:
+    """Construct AdamW with parameter decay/lr grouping and fused CUDA guard support."""
+    dev = device or next(module.parameters()).device
+    use_fused = (dev.type == "cuda") if fused is None else bool(fused)
+    groups = module.parameter_groups(
+        base_lr=base_lr,
+        weight_decay=weight_decay,
+        decoder1_lr_scale=decoder1_lr_scale,
+    )
+    return torch.optim.AdamW(groups, fused=use_fused)
+
+
 def save_joint_iql_checkpoint(
     ckpt_dir: Path,
     module: JointStructuredIQLModule,
@@ -174,6 +197,7 @@ def save_joint_iql_checkpoint(
     recipe: dict[str, Any],
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     grad_scaler: GradScaler | None = None,
+    numerical_stats: dict[str, int] | None = None,
 ) -> Path:
     """Rank-0 exclusive checkpoint/actor write with per-rank RNG gather and error broadcast."""
     raw = module.module if isinstance(module, DistributedDataParallel) else module
@@ -196,11 +220,13 @@ def save_joint_iql_checkpoint(
     if rank == 0:
         try:
             ckpt_dir.mkdir(parents=True, exist_ok=True)
+            stats_clean = {str(k): int(v) for k, v in (numerical_stats or {}).items()}
             payload = {
                 "step": int(step),
                 "cursor": int(cursor),
                 "world_size": int(world_size),
                 "recipe": recipe,
+                "numerical_stats": stats_clean,
                 "model": cpu_state(raw.state_dict()),
                 "optimizer": cpu_state(optimizer.state_dict()),
                 "scheduler": cpu_state(scheduler.state_dict()) if scheduler is not None else None,
@@ -232,6 +258,7 @@ def load_joint_iql_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     grad_scaler: GradScaler | None = None,
     map_location: torch.device | str = "cpu",
+    stats_out: dict[str, int] | None = None,
 ) -> tuple[int, int]:
     """Fail-closed restore preserving Target Q Polyak lag, DDP sync, and per-rank RNG."""
     del map_location  # Load on CPU first, then place optimizer state beside module parameters.
@@ -250,6 +277,11 @@ def load_joint_iql_checkpoint(
     if grad_scaler is not None and grad_scaler.is_enabled() and payload.get("grad_scaler") is not None:
         grad_scaler.load_state_dict(payload["grad_scaler"])
 
+    if stats_out is not None:
+        stats_out.clear()
+        for k, v in (payload.get("numerical_stats") or {}).items():
+            stats_out[str(k)] = int(v)
+
     is_dist = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_dist else 0
     world_size = dist.get_world_size() if is_dist else 1
@@ -265,6 +297,20 @@ def load_joint_iql_checkpoint(
             raise ValueError("Multi-rank DDP resume requires per-rank 'rng_by_rank' state.")
         restore_rng(payload["rng"])
     return int(payload["step"]), int(payload["cursor"])
+
+
+def _compute_grad_norm_and_nonfinite(
+    grads: list[Tensor],
+    *,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Compute scalar FP32 total L2 gradient norm and non-finite flag with zero host sync."""
+    if not grads:
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        return zero, torch.zeros((), device=device, dtype=torch.bool)
+    per_norms = [torch.linalg.vector_norm(g, ord=2, dtype=torch.float32) for g in grads]
+    total_norm = torch.linalg.vector_norm(torch.stack(per_norms), ord=2)
+    return total_norm, ~torch.isfinite(total_norm)
 
 
 def train_joint_iql_batches(
@@ -284,14 +330,21 @@ def train_joint_iql_batches(
     ddp_wrapped: DistributedDataParallel | None = None,
     log_interval: int = 50,
     check_finite_interval: int = 50,
+    max_nonfinite_steps: int | None = None,
+    loss_transform: Callable[[Tensor, int], Tensor] | None = None,
+    post_backward_hook: Callable[[torch.nn.Module, torch.optim.Optimizer, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Train JointStructuredIQLModule over ordered TensorDict transition batches."""
+    """Train JointStructuredIQLModule with strict pre-update numerical safety guards."""
     raw = module.module if isinstance(module, DistributedDataParallel) else module
     assert isinstance(raw, JointStructuredIQLModule)
     raw.sync_targets_ddp()
 
+    is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
+    scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
+
     start_step = 0
     cursor = 0
+    stats_restored: dict[str, int] = {}
     if resume_from is not None:
         start_step, cursor = load_joint_iql_checkpoint(
             resume_from,
@@ -299,34 +352,75 @@ def train_joint_iql_batches(
             optimizer,
             expected_recipe=recipe,
             scheduler=scheduler,
-            grad_scaler=grad_scaler,
+            grad_scaler=scaler,
             map_location=device,
+            stats_out=stats_restored,
         )
 
-    is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
-    scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
     runner = ddp_wrapped if ddp_wrapped is not None else module
     runner.train()
-    trainable = [p for p in runner.parameters() if p.requires_grad]
+
+    is_dist = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if is_dist else 1
+    can_gpu_fused_guard = (
+        device.type == "cuda"
+        and bool(optimizer.param_groups)
+        and all(bool(g.get("fused", False)) for g in optimizer.param_groups)
+        and isinstance(optimizer, torch.optim.AdamW)
+        and scheduler is None
+    )
+    one_f32 = torch.ones((), device=device, dtype=torch.float32)
+    zero_f32 = torch.zeros((), device=device, dtype=torch.float32)
+    clip_f32 = torch.full((), float(max_grad_norm), device=device, dtype=torch.float32)
+
+    optimizer_steps_t = torch.full(
+        (), int(stats_restored.get("optimizer_steps", 0)), device=device, dtype=torch.int64
+    )
+    skipped_steps_t = torch.full(
+        (), int(stats_restored.get("skipped_steps", 0)), device=device, dtype=torch.int64
+    )
+    nonfinite_loss_steps_t = torch.full(
+        (), int(stats_restored.get("nonfinite_loss_steps", 0)), device=device, dtype=torch.int64
+    )
+    nonfinite_grad_steps_t = torch.full(
+        (), int(stats_restored.get("nonfinite_grad_steps", 0)), device=device, dtype=torch.int64
+    )
 
     step = start_step
     last_metrics: dict[str, float] = {}
-    nonfinite_accum = torch.zeros((), device=device, dtype=torch.bool)
+    last_stats: dict[str, int] = {
+        "optimizer_steps": int(stats_restored.get("optimizer_steps", 0)),
+        "skipped_steps": int(stats_restored.get("skipped_steps", 0)),
+        "nonfinite_loss_steps": int(stats_restored.get("nonfinite_loss_steps", 0)),
+        "nonfinite_grad_steps": int(stats_restored.get("nonfinite_grad_steps", 0)),
+    }
     last_out: dict[str, Tensor] | None = None
 
-    def _flush_metrics(out_map: dict[str, Tensor]) -> dict[str, float]:
-        nonlocal nonfinite_accum
+    def _flush_metrics(out_map: dict[str, Tensor]) -> tuple[dict[str, float], dict[str, int]]:
         keys = list(out_map.keys())
         packed = torch.stack(
-            [nonfinite_accum.float()] + [out_map[k].detach().float() for k in keys]
+            [
+                optimizer_steps_t.double(),
+                skipped_steps_t.double(),
+                nonfinite_loss_steps_t.double(),
+                nonfinite_grad_steps_t.double(),
+            ]
+            + [out_map[k].detach().double() for k in keys]
         ).cpu().tolist()
-        nonfinite_accum.zero_()
-        if packed[0] > 0.0:
-            raise RuntimeError("Joint Structured IQL loss became non-finite.")
-        metrics_f = {k: float(v) for k, v in zip(keys, packed[1:], strict=True)}
-        if not math.isfinite(metrics_f["loss"]):
-            raise RuntimeError("Joint Structured IQL loss became non-finite.")
-        return metrics_f
+        stats = {
+            "optimizer_steps": int(round(packed[0])),
+            "skipped_steps": int(round(packed[1])),
+            "nonfinite_loss_steps": int(round(packed[2])),
+            "nonfinite_grad_steps": int(round(packed[3])),
+        }
+        metrics_f = {k: float(v) for k, v in zip(keys, packed[4:], strict=True)}
+        if max_nonfinite_steps is not None and stats["skipped_steps"] > int(max_nonfinite_steps):
+            raise RuntimeError(
+                f"Exceeded max_nonfinite_steps={max_nonfinite_steps}: skipped={stats['skipped_steps']} "
+                f"(nonfinite_loss={stats['nonfinite_loss_steps']}, "
+                f"nonfinite_grad={stats['nonfinite_grad_steps']})."
+            )
+        return metrics_f, stats
 
     for idx in range(cursor, len(batches)):
         batch = batches[idx].to(device=device, non_blocking=True)
@@ -339,28 +433,104 @@ def train_joint_iql_batches(
         ):
             out = runner(batch, amp_dtype=amp_dtype)
             loss = out["loss"]
+            if loss_transform is not None:
+                loss = loss_transform(loss, step)
 
-        nonfinite_accum = nonfinite_accum | (~torch.isfinite(loss.detach()))
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        if trainable:
-            torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+        loss_bad = (~torch.isfinite(loss.detach())).reshape(())
+        if loss.requires_grad:
+            scaler.scale(loss).backward()
+        if post_backward_hook is not None:
+            post_backward_hook(runner, optimizer, step)
         if scaler.is_enabled():
-            old_scale = scaler.get_scale()
-            scaler.step(optimizer)
-            scaler.update()
-            step_skipped = scaler.get_scale() < old_scale
+            scaler.unscale_(optimizer)
+
+        params_with_grad: list[Tensor] = []
+        grads: list[Tensor] = []
+        for group in optimizer.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    params_with_grad.append(p)
+                    grads.append(p.grad)
+
+        grad_norm, grad_bad = _compute_grad_norm_and_nonfinite(grads, device=device)
+        if scaler.is_enabled():
+            opt_state = scaler._per_optimizer_states[id(optimizer)]
+            found_map = opt_state["found_inf_per_device"]
+            scaler_bad = zero_f32 > 1.0
+            for v in found_map.values():
+                scaler_bad = scaler_bad | (v.to(device=device, dtype=torch.float32) > 0.0)
+            grad_bad = grad_bad | scaler_bad
+        step_bad = loss_bad | grad_bad
+
+        if is_dist and world_size > 1:
+            sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
+            flags_sync = torch.stack([loss_bad, grad_bad]).to(device=sync_dev, dtype=torch.int32)
+            dist.all_reduce(flags_sync, op=dist.ReduceOp.MAX)
+            flags_dev = (flags_sync > 0).to(device=device)
+            loss_bad = flags_dev[0]
+            grad_bad = flags_dev[1]
+            step_bad = loss_bad | grad_bad
+
+        if params_with_grad and max_grad_norm > 0.0:
+            safe_norm = torch.where(step_bad, clip_f32, grad_norm)
+            torch.nn.utils.clip_grads_with_norm_(
+                params_with_grad, float(max_grad_norm), safe_norm
+            )
+
+        found_inf_f32 = step_bad.to(dtype=torch.float32)
+        if scaler.is_enabled():
+            opt_state = scaler._per_optimizer_states[id(optimizer)]
+            found_map = opt_state["found_inf_per_device"]
+            if found_map:
+                for d_key in list(found_map.keys()):
+                    cur = found_map[d_key]
+                    found_map[d_key] = torch.maximum(
+                        cur, found_inf_f32.to(device=cur.device, dtype=cur.dtype)
+                    )
+            else:
+                found_map[device] = found_inf_f32
+
+        if can_gpu_fused_guard:
+            if scaler.is_enabled():
+                optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
+                optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
+                try:
+                    optimizer.step()
+                finally:
+                    if hasattr(optimizer, "grad_scale"):
+                        del optimizer.grad_scale  # type: ignore[attr-defined]
+                    if hasattr(optimizer, "found_inf"):
+                        del optimizer.found_inf  # type: ignore[attr-defined]
+            raw.update_targets(valid=~step_bad)
         else:
-            optimizer.step()
-            step_skipped = False
-        if not step_skipped:
-            if scheduler is not None:
-                scheduler.step()
-            raw.update_targets()
+            bad_host = bool(step_bad.item())
+            if not bad_host:
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                if scheduler is not None:
+                    scheduler.step()
+                raw.update_targets()
+            elif scaler.is_enabled():
+                scaler.update()
+
+        optimizer.zero_grad(set_to_none=True)
 
         step += 1
         cursor = idx + 1
         last_out = out
+        step_bad_i = step_bad.to(dtype=torch.int64)
+        skipped_steps_t.add_(step_bad_i)
+        optimizer_steps_t.add_(1 - step_bad_i)
+        nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
+        nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
+
         need_ckpt = ckpt_dir is not None and checkpoint_every > 0 and step % checkpoint_every == 0
         need_sync = (
             device.type == "cpu"
@@ -370,21 +540,38 @@ def train_joint_iql_batches(
             or (log_interval > 0 and step % log_interval == 0)
         )
         if need_sync:
-            last_metrics = _flush_metrics(out)
+            last_metrics, last_stats = _flush_metrics(out)
         if need_ckpt:
+            assert ckpt_dir is not None
             save_joint_iql_checkpoint(
-                ckpt_dir, raw, optimizer, step=step, cursor=cursor,
-                recipe=recipe, scheduler=scheduler, grad_scaler=scaler,
+                ckpt_dir,
+                raw,
+                optimizer,
+                step=step,
+                cursor=cursor,
+                recipe=recipe,
+                scheduler=scheduler,
+                grad_scaler=scaler,
+                numerical_stats=last_stats,
             )
 
     if last_out is not None and not last_metrics:
-        last_metrics = _flush_metrics(last_out)
+        last_metrics, last_stats = _flush_metrics(last_out)
 
-    return {"step": step, "cursor": cursor, "metrics": last_metrics}
+    return {
+        "step": step,
+        "optimizer_steps": last_stats["optimizer_steps"],
+        "skipped_steps": last_stats["skipped_steps"],
+        "nonfinite_loss_steps": last_stats["nonfinite_loss_steps"],
+        "nonfinite_grad_steps": last_stats["nonfinite_grad_steps"],
+        "cursor": cursor,
+        "metrics": last_metrics,
+    }
 
 
 __all__ = [
     "attach_structured_v2_transition_features",
+    "build_joint_iql_optimizer",
     "build_joint_iql_recipe",
     "derive_next_structured_v2_batch",
     "load_joint_iql_checkpoint",

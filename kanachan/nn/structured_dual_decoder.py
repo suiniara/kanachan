@@ -495,7 +495,12 @@ class TrajectoryCausalDecoder(nn.Module):
             has_ev = max_pos >= 0
             safe_pos = max_pos.clamp_min(0)
             gathered = h_ev[b_idx, safe_pos]
-            fallback = self.no_event_seat_emb.weight[r].unsqueeze(0).expand(bsz, -1)
+            fallback = (
+                self.no_event_seat_emb.weight[r]
+                .to(dtype=gathered.dtype)
+                .unsqueeze(0)
+                .expand(bsz, -1)
+            )
             seat_mems.append(torch.where(has_ev.unsqueeze(-1), gathered, fallback))
         return torch.cat([h_last, torch.stack(seat_mems, dim=1)], dim=1)  # [B, 5, D]
 
@@ -509,9 +514,14 @@ class TrajectoryCausalDecoder(nn.Module):
         bsz = events.shape[0]
         if self.num_layers == 0:
             assert self.disabled_d1_mem is not None
-            d1_mem = self.disabled_d1_mem.weight.unsqueeze(0).expand(bsz, 5, -1)
+            h_seq = self.embed_events(events)
+            d1_mem = (
+                self.disabled_d1_mem.weight.to(dtype=h_seq.dtype)
+                .unsqueeze(0)
+                .expand(bsz, 5, -1)
+            )
             if return_seq:
-                return d1_mem, self.embed_events(events)
+                return d1_mem, h_seq
             return d1_mem
 
         h = self.embed_events(events)
@@ -530,10 +540,12 @@ class TrajectoryCausalDecoder(nn.Module):
         tmax = decision_event_len.shape[1]
         if self.num_layers == 0:
             assert self.disabled_d1_mem is not None
-            d1_mem = self.disabled_d1_mem.weight.view(1, 1, 5, self.d_model).expand(
-                bsz_r, tmax, 5, self.d_model
-            )
             h_ev = self.embed_events(round_events)
+            d1_mem = (
+                self.disabled_d1_mem.weight.to(dtype=h_ev.dtype)
+                .view(1, 1, 5, self.d_model)
+                .expand(bsz_r, tmax, 5, self.d_model)
+            )
             return d1_mem, h_ev
 
         h = self.embed_events(round_events)
@@ -557,7 +569,12 @@ class TrajectoryCausalDecoder(nn.Module):
             has_ev = pos_at_dec >= 0
             safe_pos = pos_at_dec.clamp_min(0).unsqueeze(-1).expand(-1, -1, self.d_model)
             gathered = torch.gather(h_ev, 1, safe_pos)
-            fallback = self.no_event_seat_emb.weight[r].view(1, 1, self.d_model).expand_as(gathered)
+            fallback = (
+                self.no_event_seat_emb.weight[r]
+                .to(dtype=gathered.dtype)
+                .view(1, 1, self.d_model)
+                .expand_as(gathered)
+            )
             seat_cols.append(torch.where(has_ev.unsqueeze(-1), gathered, fallback))
 
         d1_mem = torch.cat([h_last, torch.stack(seat_cols, dim=2)], dim=2)  # [B_r, T, 5, D]
@@ -601,7 +618,9 @@ class TrajectoryCausalDecoder(nn.Module):
             start = cache.consumed_len
 
         if start == cur_len and cache.last_hidden is not None and cache.last_seat_hidden is not None:
-            fallback = self.no_event_seat_emb.weight.unsqueeze(0)
+            fallback = self.no_event_seat_emb.weight.to(
+                dtype=cache.last_seat_hidden.dtype
+            ).unsqueeze(0)
             seats = torch.where(
                 cache.has_seat_event.unsqueeze(-1),
                 cache.last_seat_hidden,
@@ -651,7 +670,9 @@ class TrajectoryCausalDecoder(nn.Module):
         )
         cache.has_seat_event = cache.has_seat_event | has_new.unsqueeze(0)
 
-        fallback = self.no_event_seat_emb.weight.unsqueeze(0)
+        fallback = self.no_event_seat_emb.weight.to(
+            dtype=cache.last_seat_hidden.dtype
+        ).unsqueeze(0)
         seats = torch.where(
             cache.has_seat_event.unsqueeze(-1),
             cache.last_seat_hidden,

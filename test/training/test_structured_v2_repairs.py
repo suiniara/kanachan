@@ -430,7 +430,7 @@ class TestSourceV3FinalRank(unittest.TestCase):
                 lines.append(_make_bc_row(f"g-{seat}", seat=seat, round_summary="5", final_scores=scores))
                 lines.append(_make_bc_row(f"g-{seat}", seat=seat, step_events=(16,), round_summary="17,19,22", final_scores=scores))
             p.write_text("".join(lines), encoding="utf-8")
-            rounds = parse_bc_rounds(p)
+            rounds = parse_bc_rounds(p, allow_incomplete=True)
             self.assertEqual(len(rounds), 4)
             for seat, r in enumerate(rounds):
                 self.assertIsNotNone(r.final_rank)
@@ -455,7 +455,7 @@ class TestSourceV3FinalRank(unittest.TestCase):
                     for seat in (1, 2, 3, 0)
                 ]
                 p.write_text("".join(lines), encoding="utf-8")
-                rounds = parse_bc_rounds(p)
+                rounds = parse_bc_rounds(p, allow_incomplete=True)
                 got = [int(r.final_rank[0].item()) for r in rounds]
                 self.assertEqual(got, [exp_ranks[1], exp_ranks[2], exp_ranks[3], exp_ranks[0]])
 
@@ -475,7 +475,7 @@ class TestSourceV3FinalRank(unittest.TestCase):
                 p = Path(tmp) / f"{name}.tsv"
                 p.write_text(content, encoding="utf-8")
                 with self.assertRaises(ValueError, msg=f"Expected ValueError for {name}"):
-                    parse_bc_rounds(p)
+                    parse_bc_rounds(p, allow_incomplete=True)
 
             # Inconsistent final scores within same (uuid, seat) must fail
             p_inc = Path(tmp) / "inconsistent.tsv"
@@ -485,13 +485,13 @@ class TestSourceV3FinalRank(unittest.TestCase):
                 encoding="utf-8",
             )
             with self.assertRaises(ValueError):
-                parse_bc_rounds(p_inc)
+                parse_bc_rounds(p_inc, allow_incomplete=True)
 
     def test_explicit_unlabeled_6col_and_final_rank_head_supervision(self):
         with tempfile.TemporaryDirectory() as tmp:
             p6 = Path(tmp) / "unlabeled.tsv"
             p6.write_text(_make_bc_row("unlab", seat=1, num_cols=6), encoding="utf-8")
-            rounds_unlab = parse_bc_rounds(p6, allow_unlabeled=True)
+            rounds_unlab = parse_bc_rounds(p6, allow_unlabeled=True, allow_incomplete=True)
             self.assertEqual(len(rounds_unlab), 1)
             self.assertIsNone(rounds_unlab[0].final_rank)
             with self.assertRaises(ValueError):
@@ -507,7 +507,7 @@ class TestSourceV3FinalRank(unittest.TestCase):
                 lines.append(_make_bc_row(f"sup-{g}", seat=3, round_summary="5", final_scores=sc, scores_rel=rel))
                 lines.append(_make_bc_row(f"sup-{g}", seat=3, step_events=(16,), round_summary="5", final_scores=sc, scores_rel=rel))
             p8.write_text("".join(lines), encoding="utf-8")
-            rounds_lab = parse_bc_rounds(p8)
+            rounds_lab = parse_bc_rounds(p8, allow_incomplete=True)
             coll = collate_round_batch(rounds_lab)
             self.assertEqual(coll["final_rank"][0, :2].tolist(), [0, 0])
             self.assertEqual(coll["final_rank"][1, :2].tolist(), [3, 3])
@@ -571,34 +571,52 @@ class TestSourceV3FinalRank(unittest.TestCase):
             expected_rank = int(scores_to_ranks(row0[6][10:14].unsqueeze(0))[0, int(row0[0][6].item()) - 71].item())
             # Observer is seat=1 (sp[6]=72); seats 1 & 2 tie at 39200 -> seat 1 gets rank 0!
             self.assertEqual(expected_rank, 0)
-            rounds = parse_bc_rounds(p)
+            rounds = parse_bc_rounds(p, allow_incomplete=True)
             self.assertEqual(len(rounds), 1)
             self.assertEqual(rounds[0].final_rank.tolist(), [0, 0])
 
         if VAL_DATA_PATH.is_file():
-            rounds = parse_bc_rounds(VAL_DATA_PATH, max_lines=200)
-            self.assertGreater(len(rounds), 5)
-            # Independently verify every step rank on those 200 lines against CoreBCDataIterator + scores_to_ranks
-            expected_by_key: dict[tuple, list[int]] = {}
-            it = CoreBCDataIterator(
-                path=VAL_DATA_PATH, num_skip_samples=0, rewrite_rooms=None, rewrite_grades=None, local_rank=0
-            )
+            # Harvest complete real games from source-v3 dataset and verify strict complete-game parsing!
+            game_lines: dict[str, list[str]] = {}
+            max_idx: dict[str, int] = {}
             with gzip.open(VAL_DATA_PATH, "rt", encoding="utf-8") as fp:
-                for i, line in enumerate(fp):
-                    if i >= 200:
+                for idx_line, line in enumerate(fp):
+                    if idx_line >= 15000:
                         break
+                    u = line.split("\t", 1)[0]
+                    game_lines.setdefault(u, []).append(line)
+                    max_idx[u] = idx_line
+            complete_lines: list[str] = []
+            picked_games = 0
+            for u, lines_u in game_lines.items():
+                if max_idx[u] < 10000 and len(lines_u) >= 80:
+                    complete_lines.extend(lines_u)
+                    picked_games += 1
+                    if picked_games >= 2:
+                        break
+            self.assertGreaterEqual(picked_games, 1)
+            with tempfile.TemporaryDirectory() as tmp2:
+                real_p = Path(tmp2) / "real_complete.tsv"
+                real_p.write_text("".join(complete_lines), encoding="utf-8")
+                rounds = parse_bc_rounds(real_p)
+                self.assertGreater(len(rounds), 10)
+                expected_by_key: dict[tuple, list[int]] = {}
+                it = CoreBCDataIterator(
+                    path=real_p, num_skip_samples=0, rewrite_rooms=None, rewrite_grades=None, local_rank=0
+                )
+                for line in complete_lines:
                     uuid = line.split("\t", 1)[0]
                     sp, nu, _pr, _ca, _act, _rs, res = it.parse_line(line)
                     seat = int(sp[6].item()) - 71
                     rnk = int(scores_to_ranks(res[10:14].unsqueeze(0))[0, seat].item())
                     k = (uuid, int(sp[6].item()), int(sp[7].item()), int(sp[8].item()), int(nu[0].item()))
                     expected_by_key.setdefault(k, []).append(rnk)
-            del it
-            for r in rounds:
-                self.assertIsNotNone(r.final_rank)
-                self.assertTrue(((r.final_rank >= 0) & (r.final_rank < 4)).all())
-                self.assertEqual(torch.unique(r.final_rank).numel(), 1)
-            self.assertEqual(sum(int(r.final_rank.numel()) for r in rounds), 200)
+                del it
+                for r in rounds:
+                    self.assertIsNotNone(r.final_rank)
+                    self.assertTrue(((r.final_rank >= 0) & (r.final_rank < 4)).all())
+                    self.assertEqual(torch.unique(r.final_rank).numel(), 1)
+                self.assertEqual(sum(int(r.final_rank.numel()) for r in rounds), len(complete_lines))
 
 
 class TestDDPCheckpointAndPerRankRNG(unittest.TestCase):
@@ -916,7 +934,10 @@ class TestGPUHotPathZeroSyncAndAudit(unittest.TestCase):
             # Specifically verifies init_from_bc copies CPU BC model onto CUDA device cleanly!
             mod.init_from_bc(bc_bb, bc_head, keep_bc_anchor=True)
             mod.configure_freeze(final_rank_weight=0.10)
-            opt = torch.optim.AdamW(mod.parameter_groups(base_lr=3e-4, weight_decay=0.01))
+            opt = torch.optim.AdamW(
+                mod.parameter_groups(base_lr=3e-4, weight_decay=0.01),
+                fused=(dev.type == "cuda"),
+            )
             rec = build_joint_iql_recipe(mod, base_lr=3e-4, weight_decay=0.01, decoder1_lr_scale=0.25)
 
             # Warmup 1 step then run 8 intermediate steps under sync_debug_mode=2 ("error")
@@ -968,7 +989,10 @@ class TestGPUHotPathZeroSyncAndAudit(unittest.TestCase):
                     n_d1_layers=1, n_d2_layers=1, use_cql_quantile_head=True, num_quantiles=8,
                     final_rank=True, final_rank_weight=0.10, kl_coef=0.05, device=dev, dtype=torch.float32,
                 )
-                opt_r = torch.optim.AdamW(mod_r.parameter_groups(base_lr=3e-4, weight_decay=0.01))
+                opt_r = torch.optim.AdamW(
+                    mod_r.parameter_groups(base_lr=3e-4, weight_decay=0.01),
+                    fused=(dev.type == "cuda"),
+                )
                 load_joint_iql_checkpoint(ckpt, mod_r, opt_r, expected_recipe=rec)
                 for k, v in mod.state_dict().items():
                     torch.testing.assert_close(v, mod_r.state_dict()[k], atol=0, rtol=0)

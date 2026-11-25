@@ -633,7 +633,9 @@ def permute_structured_batch(
                 2,
                 ev_t,
             )
-            ev[..., 3:6] = mapped.to(ev.dtype)
+            ev[..., 3:6] = torch.where(
+                ev[..., :1] > 0, mapped.to(ev.dtype), ev[..., 3:6]
+            )
             out[key] = ev
 
     def _remap_cand_group(prefix: str, action_key: str | None = None) -> None:

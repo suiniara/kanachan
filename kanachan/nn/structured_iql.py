@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 from typing import Any
 
@@ -253,7 +254,7 @@ def quantile_cql_loss(
         )
         q_chosen = q_f[b_idx, act_l]  # [B, M]
 
-        tgt = target_returns.float()
+        tgt = target_returns.detach().float()
         if tgt.ndim == 1:
             tgt = tgt.unsqueeze(1)  # [B, 1]
         elif tgt.ndim != 2:
@@ -263,8 +264,14 @@ def quantile_cql_loss(
         delta = tgt.unsqueeze(1) - q_chosen.unsqueeze(2)
         abs_d = delta.abs()
         kappa_f = float(kappa)
-        if kappa_f < 0.0:
-            raise ValueError(f"kappa must be non-negative, got {kappa_f}.")
+        if not math.isfinite(kappa_f) or kappa_f < 0.0:
+            raise ValueError(f"kappa must be finite and non-negative, got {kappa_f}.")
+        alpha_f = float(alpha)
+        if not math.isfinite(alpha_f) or alpha_f < 0.0:
+            raise ValueError(f"alpha must be finite and non-negative, got {alpha_f}.")
+        temp_f = float(temperature)
+        if not math.isfinite(temp_f) or temp_f <= 0.0:
+            raise ValueError(f"temperature must be finite and positive, got {temp_f}.")
         if kappa_f > 0.0:
             huber_norm = torch.where(
                 abs_d <= kappa_f,
@@ -286,12 +293,12 @@ def quantile_cql_loss(
         masked_q = q_mean.masked_fill(~cand_mask, -torch.inf)
         q_sa = q_mean[b_idx, act_l]
         cql_gap = (
-            temperature * torch.logsumexp(masked_q / temperature, dim=-1) - q_sa
+            temp_f * torch.logsumexp(masked_q / temp_f, dim=-1) - q_sa
         )
         has_choice = cand_mask.sum(dim=-1) >= 2
         has_f = has_choice.float()
         cql_loss = (cql_gap * has_f).sum() / has_f.sum().clamp_min(1.0)
-        total = qr_loss + alpha * cql_loss
+        total = qr_loss + alpha_f * cql_loss
         return total, {
             "qr_loss": qr_loss.detach(),
             "cql_loss": cql_loss.detach(),
@@ -659,11 +666,27 @@ class JointStructuredIQLModule(nn.Module):
         return tuple(pairs)
 
     @torch.no_grad()
-    def update_targets(self, tau: float | None = None) -> None:
+    def update_targets(
+        self,
+        tau: float | None = None,
+        *,
+        valid: Tensor | bool = True,
+    ) -> None:
         t = float(self.target_ema_tau if tau is None else tau)
+        if isinstance(valid, bool):
+            if not valid:
+                return
+            for src, tgt in self._target_pairs():
+                for ps, pt in zip(src.parameters(), tgt.parameters(), strict=True):
+                    pt.data.mul_(1.0 - t).add_(ps.data, alpha=t)
+            return
+
+        valid_b = valid.detach().bool()
         for src, tgt in self._target_pairs():
             for ps, pt in zip(src.parameters(), tgt.parameters(), strict=True):
-                pt.data.mul_(1.0 - t).add_(ps.data, alpha=t)
+                vb = valid_b.to(device=pt.device)
+                updated = pt.data * (1.0 - t) + ps.data * t
+                pt.data.copy_(torch.where(vb, updated, pt.data))
 
     @torch.no_grad()
     def sync_targets_ddp(self) -> None:
@@ -725,11 +748,7 @@ class JointStructuredIQLModule(nn.Module):
             q_hat = torch.minimum(q1_tgt, q2_tgt)[b_idx, action].float().detach()
 
             non_term = (~done) & (gamma_t != 0.0)
-            need_next = (
-                (self.discount_factor != 0.0)
-                or ("discount" in nxt)
-                or (self.quantile_q_head is not None)
-            )
+            need_next = (self.discount_factor != 0.0) or ("discount" in nxt)
             next_v = torch.zeros_like(reward)
             qr_target_quantiles: Tensor | None = None
             if need_next:
@@ -740,7 +759,7 @@ class JointStructuredIQLModule(nn.Module):
                     cache_enabled=False,
                 ):
                     next_enc, next_cands = _encode_next_states_zero_sync(
-                        self.backbone, batch, done
+                        self.backbone, batch, ~non_term
                     )
                 nv_out = self.value_head(next_enc)
                 nv = nv_out[0] if isinstance(nv_out, tuple) else nv_out
@@ -762,6 +781,12 @@ class JointStructuredIQLModule(nn.Module):
                         next_tgt_q,
                         next_sel_q,
                     )
+            elif self.quantile_q_head is not None:
+                qr_target_quantiles = (
+                    reward.unsqueeze(1)
+                    .expand(-1, self.quantile_q_head.num_quantiles)
+                    .detach()
+                )
 
             td_target = torch.where(
                 non_term, reward + gamma_t * next_v, reward
@@ -972,6 +997,17 @@ class JointStructuredIQLModule(nn.Module):
             ],
             {},
         )
+        cpu_sd: dict[str, Any] = {}
+        for k, v in state["state_dict"].items():
+            if isinstance(v, Tensor):
+                cpu_sd[k] = (
+                    v.detach().to(device="cpu", dtype=save_dtype)
+                    if v.is_floating_point()
+                    else v.detach().to(device="cpu")
+                )
+            else:
+                cpu_sd[k] = v
+        state["state_dict"] = cpu_sd
         atomic_save(Path(output_path), state)
 
 

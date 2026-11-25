@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import datetime
+import gzip
 import json
 import os
 import random
@@ -747,13 +748,33 @@ class TestStructuredV2Phase1B(unittest.TestCase):
 
     # Test #12: forward vs forward_round_trajectory vs forward_step_cached + KVCache reset
     def test_12_three_mode_forward_equivalence_and_kvcache_reset(self):
+        rounds: list[Any] = []
         if VAL_DATA_PATH.is_file():
-            rounds = [
-                r for r in parse_bc_rounds(VAL_DATA_PATH, max_rounds=40, max_lines=500)
-                if len(r.decision_event_len) >= 3
-            ][:6]
-        else:
-            rounds = []
+            game_lines: dict[str, list[str]] = {}
+            max_idx: dict[str, int] = {}
+            with gzip.open(VAL_DATA_PATH, "rt", encoding="utf-8") as fp:
+                for idx_line, line in enumerate(fp):
+                    if idx_line >= 15000:
+                        break
+                    u = line.split("\t", 1)[0]
+                    game_lines.setdefault(u, []).append(line)
+                    max_idx[u] = idx_line
+            complete_lines: list[str] = []
+            picked_games = 0
+            for u, lines_u in game_lines.items():
+                if max_idx[u] < 10000 and len(lines_u) >= 80:
+                    complete_lines.extend(lines_u)
+                    picked_games += 1
+                    if picked_games >= 2:
+                        break
+            if complete_lines:
+                with tempfile.TemporaryDirectory() as tmp_val:
+                    val_sub = Path(tmp_val) / "val_complete.tsv"
+                    val_sub.write_text("".join(complete_lines), encoding="utf-8")
+                    rounds = [
+                        r for r in parse_bc_rounds(val_sub)
+                        if len(r.decision_event_len) >= 3
+                    ][:6]
         if not rounds:
             closed = {
                 1: 1, 2: 1, 3: 1, 11: 1, 12: 1, 13: 1,

@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -129,13 +130,24 @@ def _parse_int_csv(raw: str, field_name: str, ctx: str) -> list[int]:
 _SCORE_BOUND = 10_000_000
 
 
-def parse_bc_line(
+def _parse_bc_line_full(
     line: str,
     *,
     allow_unlabeled: bool = True,
     line_no: int | None = None,
-) -> tuple[str, list[int], list[int], list[int], list[int], int, tuple[int, int, int, int] | None]:
-    """Parse one source-v3 BC line (8 cols with 14-int results) or explicit 6-col unlabeled row."""
+) -> tuple[
+    str,
+    list[int],
+    list[int],
+    list[int],
+    list[int],
+    int,
+    tuple[int, int, int, int] | None,
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+    int,
+]:
+    """Parse one source-v3 BC line (8 cols) or 6-col unlabeled row, returning summary metadata."""
     stripped = line.rstrip("\r\n")
     ctx = f"line {line_no}" if line_no is not None else "BC line"
     if not stripped:
@@ -195,7 +207,7 @@ def parse_bc_line(
         raise ValueError(f"{ctx}: Action index {act} out of legal range [0, {len(ca_raw)}).")
 
     if len(parts) == 6:
-        return uuid, sp, nu, pr, ca, act, None
+        return uuid, sp, nu, pr, ca, act, None, None, None, len(pr_raw)
 
     # Validate 7th column (round_summary) and 8th column (14-int results)
     rs_raw = _parse_int_csv(parts[6], "round_summary", ctx)
@@ -214,7 +226,200 @@ def parse_bc_line(
         raise ValueError(f"{ctx}: Score out of valid bounds in results: {res_raw}.")
 
     final_scores = (res_raw[10], res_raw[11], res_raw[12], res_raw[13])
-    return uuid, sp, nu, pr, ca, act, final_scores
+    return uuid, sp, nu, pr, ca, act, final_scores, tuple(rs_raw), tuple(res_raw), len(pr_raw)
+
+
+def parse_bc_line(
+    line: str,
+    *,
+    allow_unlabeled: bool = True,
+    line_no: int | None = None,
+) -> tuple[str, list[int], list[int], list[int], list[int], int, tuple[int, int, int, int] | None]:
+    """Parse one source-v3 BC line (8 cols with 14-int results) or explicit 6-col unlabeled row."""
+    return _parse_bc_line_full(line, allow_unlabeled=allow_unlabeled, line_no=line_no)[:7]
+
+
+def _decode_prog_token(tok: int) -> tuple[str, int, bool]:
+    """Decode one progression action token into (kind, actor_abs, is_riichi_discard)."""
+    if 5 <= tok < 597:
+        v = tok - 5
+        return "dahai", v // 148, bool((v % 148) & 1)
+    if 597 <= tok < 957:
+        return "chi", (tok - 597) // 90, False
+    if 957 <= tok < 1437:
+        return "pon", (tok - 957) // 120, False
+    if 1437 <= tok < 1881:
+        return "dmk", (tok - 1437) // 111, False
+    if 1881 <= tok < 2017:
+        return "ankan", (tok - 1881) // 34, False
+    if 2017 <= tok < 2165:
+        return "kakan", (tok - 2017) // 37, False
+    raise ValueError(f"Unsupported or invalid progression token: {tok}.")
+
+
+def _order_and_validate_prefix_steps(
+    sp_t: Tensor,
+    nu_t: Tensor,
+    pr_t: Tensor,
+    ca_t: Tensor,
+    feats: dict[str, Tensor],
+    *,
+    ctx: Any,
+    check_v2_events: bool = True,
+) -> list[int]:
+    """Order steps chronologically and reject duplicates or divergent/non-prefix histories."""
+    n_steps = int(sp_t.shape[0])
+    pr_lens_arr = (pr_t != NUM_TYPES_OF_PROGRESSION_FEATURES).sum(dim=-1).tolist()
+    left_arr = (sp_t[:, 9] - 82).tolist()
+    is_own_arr = (
+        ((ca_t < 221) & (ca_t < NUM_TYPES_OF_ACTIONS)).any(dim=-1).to(torch.int64).tolist()
+    )
+    order = sorted(
+        range(n_steps),
+        key=lambda u: (int(pr_lens_arr[u]), -int(left_arr[u]), int(is_own_arr[u]), u),
+    )
+
+    ev_lens = feats["v2_event_len"]
+    v2_events = feats["v2_events"]
+    for pos in range(1, len(order)):
+        prev_u = order[pos - 1]
+        u = order[pos]
+        prev_plen = int(pr_lens_arr[prev_u])
+        u_plen = int(pr_lens_arr[u])
+        prev_pr = pr_t[prev_u, :prev_plen]
+        u_pr_prefix = pr_t[u, :prev_plen]
+
+        if (
+            prev_plen == u_plen
+            and int(left_arr[prev_u]) == int(left_arr[u])
+            and int(is_own_arr[prev_u]) == int(is_own_arr[u])
+            and torch.equal(prev_pr, pr_t[u, :u_plen])
+        ):
+            raise ValueError(f"Duplicate decision step in round {ctx} at progression length {u_plen}.")
+
+        if u_plen < prev_plen or not torch.equal(prev_pr, u_pr_prefix):
+            raise ValueError(
+                f"Divergent or non-prefix progression history in round {ctx} "
+                f"(lengths {prev_plen} -> {u_plen})."
+            )
+
+        if check_v2_events:
+            prev_ev_len = int(ev_lens[prev_u].item())
+            u_ev_len = int(ev_lens[u].item())
+            if u_ev_len < prev_ev_len or not torch.equal(
+                v2_events[prev_u, :prev_ev_len], v2_events[u, :prev_ev_len]
+            ):
+                raise ValueError(f"Divergent v2_events stream in round {ctx}.")
+
+    return order
+
+
+def _validate_games_completeness(
+    game_meta: dict[str, tuple[int, int]],
+    phys_rounds: dict[tuple[str, int, int, int], dict[str, Any]],
+) -> None:
+    """Enforce complete-game & complete-round structural integrity across source-v3 games."""
+    rounds_by_uuid: dict[str, list[tuple[int, int, int, dict[str, Any]]]] = {}
+    for (uuid, chang, ju, ben), info in phys_rounds.items():
+        # Verify cross-seat consistency within physical round (same max_pr prefix & round outcome)
+        max_pr: tuple[int, ...] = max(info["all_prs"], key=len)
+        if not max_pr or max_pr[0] != 0:
+            raise ValueError(f"Physical round ({uuid}, {chang}, {ju}, {ben}) has invalid progression start.")
+        for pr_seq in info["all_prs"]:
+            if pr_seq != max_pr[: len(pr_seq)]:
+                raise ValueError(
+                    f"Observer seats disagree on progression inside round ({uuid}, {chang}, {ju}, {ben})."
+                )
+
+        # Dealer must open the round at progression == (0,)
+        seat_prs: dict[int, set[tuple[int, ...]]] = info["seat_prs"]
+        if ju not in seat_prs or (0,) not in seat_prs[ju]:
+            raise ValueError(
+                f"Truncated round start in ({uuid}, {chang}, {ju}, {ben}): missing dealer {ju} opening step."
+            )
+
+        # Every non-riichi action (or non-dahai action even during riichi) must have a recorded step
+        riichi_active = [False, False, False, False]
+        for i in range(1, len(max_pr)):
+            kind, actor, is_riichi = _decode_prog_token(max_pr[i])
+            if (not riichi_active[actor]) or (kind != "dahai"):
+                prefix_i = max_pr[:i]
+                if prefix_i not in seat_prs.get(actor, ()):
+                    raise ValueError(
+                        f"Incomplete round ({uuid}, {chang}, {ju}, {ben}): missing seat {actor} "
+                        f"decision at progression length {i} for {kind}."
+                    )
+            if is_riichi:
+                riichi_active[actor] = True
+
+        # Validate trailing decision steps against round_summary
+        rs_raw: tuple[int, ...] = info["rs_raw"]
+        seat_actions_at_max: dict[int, set[int]] = info["seat_actions_at_max"]
+        if rs_raw[0] <= 15:
+            # Every winner encoded in round_summary must have declared Tsumo (219) or Ron (543..545) at max_pr
+            for code in rs_raw:
+                if code <= 3:
+                    winner = code
+                    expected_acts = {219}
+                elif code <= 15:
+                    winner = (code - 4) // 3
+                    expected_acts = {543, 544, 545}
+                else:
+                    continue
+                if not (seat_actions_at_max.get(winner, set()) & expected_acts):
+                    raise ValueError(
+                        f"Incomplete win round ({uuid}, {chang}, {ju}, {ben}): missing winning decision "
+                        f"for seat {winner} (round_summary={rs_raw})."
+                    )
+        elif 16 <= rs_raw[0] <= 27:
+            # Exhaustive wall draw must reach late wall (accounting for auto-tsumogiri / 4-kan remainder <= 4)
+            if info["min_left"] > 4:
+                raise ValueError(
+                    f"Truncated exhaustive-draw round ({uuid}, {chang}, {ju}, {ben}): "
+                    f"min left_tiles={info['min_left']} > 4."
+                )
+
+        rounds_by_uuid.setdefault(uuid, []).append((chang, ju, ben, info))
+
+    for uuid, rlist in rounds_by_uuid.items():
+        rlist.sort(key=lambda item: (item[0], item[1], item[2]))
+        if (rlist[0][0], rlist[0][1], rlist[0][2]) != (0, 0, 0):
+            raise ValueError(
+                f"Truncated game {uuid}: first observed round is {(rlist[0][0], rlist[0][1], rlist[0][2])}, expected (0, 0, 0)."
+            )
+        for pos in range(1, len(rlist)):
+            pc, pj, pb, _ = rlist[pos - 1]
+            cc, cj, cb, _ = rlist[pos]
+            p_idx = pc * 4 + pj
+            c_idx = cc * 4 + cj
+            same_dealer_cont = (c_idx == p_idx) and (cb == pb + 1)
+            next_dealer_step = (c_idx == p_idx + 1) and (cb in (0, pb + 1))
+            if not (same_dealer_cont or next_dealer_step):
+                raise ValueError(
+                    f"Truncated or non-contiguous game {uuid}: round {(pc, pj, pb)} -> {(cc, cj, cb)}."
+                )
+
+        lc, lj, _lb, last_info = rlist[-1]
+        game_mode = game_meta[uuid][1]
+        min_end_idx = 3 if game_mode == 5 else 7  # Tonpuusen East-4 (3) vs Hanchan South-4 (7)
+        post_scores = tuple(int(x) for x in last_info["results"][6:10])
+        final_scores = tuple(int(x) for x in last_info["results"][10:14])
+        if not any(s < 0 for s in post_scores) and (lc * 4 + lj) < min_end_idx:
+            raise ValueError(
+                f"Truncated game {uuid}: ended early at (chang={lc}, ju={lj}) with post_scores={post_scores}."
+            )
+        if post_scores != final_scores:
+            kyot = int(last_info["results"][5])
+            draw_kyotaku_match = (
+                last_info["rs_raw"][0] >= 16
+                and kyot > 0
+                and sorted(final_scores[i] - post_scores[i] for i in range(4)) == [0, 0, 0, 1000 * kyot]
+            )
+            if not draw_kyotaku_match:
+                raise ValueError(
+                    f"Truncated game {uuid}: final round post_scores={post_scores} "
+                    f"do not match final_game_scores={final_scores}."
+                )
 
 
 def parse_bc_rounds(
@@ -223,44 +428,132 @@ def parse_bc_rounds(
     max_rounds: int | None = None,
     max_lines: int | None = None,
     enable_early_shape_hint: bool = False,
-    allow_unlabeled: bool = True,
+    allow_unlabeled: bool = False,
+    allow_incomplete: bool = False,
 ) -> list[RoundTrajectory]:
-    """Read source-v3 BC TSV/TSV.GZ lines, compute native FinalRank labels, and group rounds."""
-    raw_groups: list[tuple[tuple[Any, ...], list[tuple[list[int], list[int], list[int], list[int], int, int]]]] = []
+    """Read source-v3 BC TSV/TSV.GZ lines, validate isolation/completeness, and group rounds."""
+    raw_groups: list[
+        tuple[
+            tuple[Any, ...],
+            list[tuple[list[int], list[int], list[int], list[int], int, int, tuple[int, ...], int]],
+        ]
+    ] = []
     index_by_key: dict[tuple[Any, ...], int] = {}
-    scores_by_game_seat: dict[tuple[str, int], tuple[int, int, int, int] | None] = {}
+    scores_by_game: dict[str, tuple[int, int, int, int] | None] = {}
+    game_meta: dict[str, tuple[int, int]] = {}
+    seen_labeled: bool | None = None
 
-    parsed_rows: list[tuple[tuple[Any, ...], list[int], list[int], list[int], list[int], int, tuple[int, int, int, int] | None]] = []
+    phys_rounds: dict[tuple[str, int, int, int], dict[str, Any]] = {}
+    parsed_rows: list[
+        tuple[
+            tuple[Any, ...],
+            list[int],
+            list[int],
+            list[int],
+            list[int],
+            int,
+            tuple[int, int, int, int] | None,
+            tuple[int, ...] | None,
+            tuple[int, ...] | None,
+            int,
+        ]
+    ] = []
+
     with _open_tsv(path) as fp:
         for line_no, line in enumerate(fp):
             if max_lines is not None and line_no >= max_lines:
                 break
-            uuid, sp, nu, pr, ca, act, final_scores = parse_bc_line(
+            uuid, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len = _parse_bc_line_full(
                 line, allow_unlabeled=allow_unlabeled, line_no=line_no + 1
             )
+            is_labeled = final_scores is not None
+            if seen_labeled is None:
+                seen_labeled = is_labeled
+            elif seen_labeled != is_labeled:
+                raise ValueError(
+                    f"line {line_no + 1} ({uuid}): Mixed 6-column unlabeled and 8-column labeled rows."
+                )
+
             seat = sp[SEAT_INDEX] - SEAT_OFFSET
-            if not 0 <= seat < 4:
-                raise ValueError(f"line {line_no + 1} ({uuid}): Invalid observer seat {seat}.")
-            gs_key = (uuid, seat)
-            if gs_key in scores_by_game_seat:
-                if scores_by_game_seat[gs_key] != final_scores:
+            chang = sp[7] - 75
+            ju = sp[8] - 78
+            if not 0 <= seat < 4 or not 0 <= chang < 3 or not 0 <= ju < 4:
+                raise ValueError(f"line {line_no + 1} ({uuid}): Invalid observer seat/chang/ju.")
+
+            meta = (sp[0], sp[1])
+            if uuid in game_meta:
+                if game_meta[uuid] != meta:
                     raise ValueError(
-                        f"line {line_no + 1} ({uuid}): Inconsistent final_game_scores for seat {seat}: "
-                        f"{scores_by_game_seat[gs_key]} vs {final_scores}."
+                        f"line {line_no + 1} ({uuid}): Inconsistent room/mode {game_meta[uuid]} vs {meta}."
                     )
             else:
-                scores_by_game_seat[gs_key] = final_scores
+                game_meta[uuid] = meta
 
-            # Group by (uuid, seat, chang, ju, ben)
+            if uuid in scores_by_game:
+                if scores_by_game[uuid] != final_scores:
+                    raise ValueError(
+                        f"line {line_no + 1} ({uuid}): Inconsistent final_game_scores for game {uuid} "
+                        f"(seat {seat}): {scores_by_game[uuid]} vs {final_scores}."
+                    )
+            else:
+                scores_by_game[uuid] = final_scores
+
+            if rs_raw is not None and res_raw is not None:
+                phys_key = (uuid, chang, ju, nu[0])
+                pinfo = phys_rounds.get(phys_key)
+                if pinfo is None:
+                    pinfo = {
+                        "rs_raw": rs_raw,
+                        "results": res_raw,
+                        "all_prs": [],
+                        "seat_prs": {},
+                        "seat_actions_at_max": {},
+                        "min_left": sp[9] - 82,
+                    }
+                    phys_rounds[phys_key] = pinfo
+                else:
+                    if (not allow_incomplete) and (
+                        pinfo["rs_raw"] != rs_raw or pinfo["results"] != res_raw
+                    ):
+                        raise ValueError(
+                            f"line {line_no + 1} ({uuid}): Conflicting round_summary/results within "
+                            f"physical round {(chang, ju, nu[0])}."
+                        )
+                pr_tuple = tuple(pr[:pr_len])
+                pinfo["all_prs"].append(pr_tuple)
+                pinfo["seat_prs"].setdefault(seat, set()).add(pr_tuple)
+                pinfo["min_left"] = min(int(pinfo["min_left"]), int(sp[9] - 82))
+
             key = (uuid, sp[SEAT_INDEX], sp[7], sp[8], nu[0])
             idx = index_by_key.get(key)
             if idx is None:
-                if max_rounds is not None and len(index_by_key) >= max_rounds:
-                    continue
                 idx = len(index_by_key)
                 index_by_key[key] = idx
                 raw_groups.append((key, []))
-            parsed_rows.append((key, sp, nu, pr, ca, act, final_scores))
+            parsed_rows.append((key, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len))
+
+    if not parsed_rows:
+        return []
+    if not allow_incomplete and seen_labeled is False:
+        raise ValueError(
+            "Complete game/round reconstruction requires 8-column source-v3 rows with round_summary and results."
+        )
+
+    # Record each seat's chosen action at that physical round's longest progression for trailing win checks
+    if phys_rounds:
+        max_len_by_phys = {
+            pk: max(len(x) for x in pinfo["all_prs"]) for pk, pinfo in phys_rounds.items()
+        }
+        for key, sp, nu, pr, ca, act, _fs, rs_raw, _rr, pr_len in parsed_rows:
+            if rs_raw is None:
+                continue
+            pk = (key[0], sp[7] - 75, sp[8] - 78, nu[0])
+            if pr_len == max_len_by_phys[pk]:
+                seat = sp[SEAT_INDEX] - SEAT_OFFSET
+                phys_rounds[pk]["seat_actions_at_max"].setdefault(seat, set()).add(ca[act])
+
+    if not allow_incomplete:
+        _validate_games_completeness(game_meta, phys_rounds)
 
     # Compute native tie-broken final_rank via scores_to_ranks for all labeled rows
     labeled_idx = [i for i, r in enumerate(parsed_rows) if r[6] is not None]
@@ -276,10 +569,10 @@ def parse_bc_rounds(
         for row_idx, rnk in zip(labeled_idx, own_ranks, strict=True):
             computed_ranks[row_idx] = int(rnk)
 
-    for row_idx, (key, sp, nu, pr, ca, act, _final_scores) in enumerate(parsed_rows):
+    for row_idx, (key, sp, nu, pr, ca, act, _fs, rs_raw, _rr, pr_len) in enumerate(parsed_rows):
         g_idx = index_by_key[key]
         final_rank = computed_ranks.get(row_idx, -1)
-        raw_groups[g_idx][1].append((sp, nu, pr, ca, act, final_rank))
+        raw_groups[g_idx][1].append((sp, nu, pr, ca, act, final_rank, rs_raw or (), pr_len))
 
     rounds: list[RoundTrajectory] = []
     for key, steps in raw_groups:
@@ -295,51 +588,36 @@ def parse_bc_rounds(
             enable_early_shape_hint=enable_early_shape_hint,
             include_room_level=False,
         )
+        order = _order_and_validate_prefix_steps(sp_t, nu_t, pr_t, ca_t, feats, ctx=key)
+        sub_idx = torch.tensor(order, dtype=torch.long)
         ev_lens = feats["v2_event_len"]
-        # Sort by progression length ascending, then partition into valid prefix chains.
-        order = torch.argsort(ev_lens, stable=True).tolist()
-        chains: list[list[int]] = []
-        for u in order:
-            u_len = int(ev_lens[u].item())
-            u_ev = feats["v2_events"][u, :u_len]
-            placed = False
-            for chain in chains:
-                prev_u = chain[-1]
-                prev_len = int(ev_lens[prev_u].item())
-                if u_len >= prev_len and torch.equal(feats["v2_events"][prev_u, :prev_len], u_ev[:prev_len]):
-                    chain.append(u)
-                    placed = True
-                    break
-            if not placed:
-                chains.append([u])
-
-        for chain in chains:
-            sub_idx = torch.tensor(chain, dtype=torch.long)
-            last_i = chain[-1]
-            l_r = int(ev_lens[last_i].item())
-            r_events = feats["v2_events"][last_i, :l_r].clone()
-            rk_sub = [rk_vals[i] for i in chain]
-            has_lab = [r >= 0 for r in rk_sub]
-            if any(has_lab) and not all(has_lab):
-                raise ValueError(f"Round group {key} mixes labeled and unlabeled steps.")
-            rk_t = torch.tensor(rk_sub, dtype=torch.long) if all(has_lab) else None
-            rounds.append(
-                RoundTrajectory(
-                    round_events=r_events,
-                    round_event_len=l_r,
-                    decision_event_len=ev_lens[sub_idx].to(torch.int32),
-                    v2_tile_feats=feats["v2_tile_feats"][sub_idx],
-                    v2_global_feats=feats["v2_global_feats"][sub_idx],
-                    v2_player_feats=feats["v2_player_feats"][sub_idx],
-                    v2_cand_ids=feats["v2_cand_ids"][sub_idx],
-                    v2_cand_mask=feats["v2_cand_mask"][sub_idx],
-                    v2_cand_mode=feats["v2_cand_mode"][sub_idx],
-                    v2_cand_dyn=feats["v2_cand_dyn"][sub_idx],
-                    candidates=ca_t[sub_idx],
-                    action_idx=act_t[sub_idx],
-                    final_rank=rk_t,
-                )
+        last_i = order[-1]
+        l_r = int(ev_lens[last_i].item())
+        r_events = feats["v2_events"][last_i, :l_r].clone()
+        rk_sub = [rk_vals[i] for i in order]
+        has_lab = [r >= 0 for r in rk_sub]
+        if any(has_lab) and not all(has_lab):
+            raise ValueError(f"Round group {key} mixes labeled and unlabeled steps.")
+        rk_t = torch.tensor(rk_sub, dtype=torch.long) if all(has_lab) else None
+        rounds.append(
+            RoundTrajectory(
+                round_events=r_events,
+                round_event_len=l_r,
+                decision_event_len=ev_lens[sub_idx].to(torch.int32),
+                v2_tile_feats=feats["v2_tile_feats"][sub_idx],
+                v2_global_feats=feats["v2_global_feats"][sub_idx],
+                v2_player_feats=feats["v2_player_feats"][sub_idx],
+                v2_cand_ids=feats["v2_cand_ids"][sub_idx],
+                v2_cand_mask=feats["v2_cand_mask"][sub_idx],
+                v2_cand_mode=feats["v2_cand_mode"][sub_idx],
+                v2_cand_dyn=feats["v2_cand_dyn"][sub_idx],
+                candidates=ca_t[sub_idx],
+                action_idx=act_t[sub_idx],
+                final_rank=rk_t,
             )
+        )
+    if max_rounds is not None:
+        return rounds[:max_rounds]
     return rounds
 
 
@@ -354,7 +632,7 @@ def build_round_trajectories_from_raw(
     final_ranks: Tensor | None = None,
     enable_early_shape_hint: bool = False,
 ) -> list[RoundTrajectory]:
-    """Group pre-loaded 4-field tensors into RoundTrajectory objects (in-memory helper)."""
+    """Group pre-loaded 4-field tensors into validated single-prefix RoundTrajectory objects."""
     feats = derive_structured_v2_batch(
         sp, nu, pr, ca,
         enable_early_shape_hint=enable_early_shape_hint,
@@ -368,11 +646,21 @@ def build_round_trajectories_from_raw(
         rk_all = final_ranks.long()
         if not ((rk_all == -1) | ((rk_all >= 0) & (rk_all < 4))).all():
             raise ValueError("final_ranks values must be -1 or in [0, 3].")
+        any_lab = bool((rk_all >= 0).any().item())
+        all_lab = bool((rk_all >= 0).all().item())
+        if any_lab and not all_lab:
+            raise ValueError(
+                "build_round_trajectories_from_raw: cannot mix labeled and unlabeled final_ranks across rounds."
+            )
+
     rounds: list[RoundTrajectory] = []
-    for idxs in grouped.values():
+    for gid, idxs in grouped.items():
         sub = torch.tensor(idxs, dtype=torch.long)
-        ev_lens = feats["v2_event_len"][sub]
-        order = sub[torch.argsort(ev_lens, stable=True)]
+        sub_feats = {k: v[sub] for k, v in feats.items()}
+        local_order = _order_and_validate_prefix_steps(
+            sp[sub], nu[sub], pr[sub], ca[sub], sub_feats, ctx=gid, check_v2_events=False
+        )
+        order = sub[torch.tensor(local_order, dtype=torch.long)]
         last_i = int(order[-1].item())
         l_r = int(feats["v2_event_len"][last_i].item())
         rk_round: Tensor | None = None
@@ -380,8 +668,6 @@ def build_round_trajectories_from_raw(
             rk_vals = final_ranks[order].long()
             if bool((rk_vals >= 0).all().item()):
                 rk_round = rk_vals
-            elif bool((rk_vals >= 0).any().item()):
-                raise ValueError("build_round_trajectories_from_raw: mixed labeled and unlabeled final_ranks in one round.")
         rounds.append(
             RoundTrajectory(
                 round_events=feats["v2_events"][last_i, :l_r].clone(),
@@ -484,7 +770,7 @@ def _permute_events_only(events: Tensor, perm_idx: int) -> Tensor:
     ev = events.clone()
     p37 = torch.as_tensor(PERM_TILE37[perm_idx].copy(), dtype=ev.dtype, device=ev.device)
     for col in (3, 4, 5):
-        valid = ev[..., col] < 37
+        valid = (ev[..., 0] > 0) & (ev[..., col] < 37)
         idx = ev[..., col].clamp(0, 36).long()
         ev[..., col] = torch.where(valid, p37[idx], ev[..., col])
     return ev
@@ -852,11 +1138,10 @@ class TrajectoryBCModel(nn.Module):
                 val_out, rank_logits = self.state_head(encode)
                 rk_tgt = batch["final_rank"].reshape(ntot).long()
                 require_tensor(
-                    (~dmask | (rk_tgt == -1) | ((rk_tgt >= 0) & (rk_tgt < 4))).all(),
-                    "Invalid final_rank target; expected -1 or [0, 3].",
+                    (~dmask | ((rk_tgt >= 0) & (rk_tgt < 4))).all(),
+                    "Invalid final_rank target; expected [0, 3] when final_rank_weight > 0.0.",
                 )
-                labeled = dmask & (rk_tgt >= 0)
-                lab_f = labeled.float()
+                lab_f = dmask.float()
                 rk_ce = F.cross_entropy(
                     rank_logits.float(), rk_tgt.clamp(0, 3), reduction="none"
                 )
@@ -983,6 +1268,17 @@ class TrajectoryBCModel(nn.Module):
             ],
             {},
         )
+        cpu_sd: dict[str, Any] = {}
+        for k, v in state["state_dict"].items():
+            if isinstance(v, Tensor):
+                cpu_sd[k] = (
+                    v.detach().to(device="cpu", dtype=save_dtype)
+                    if v.is_floating_point()
+                    else v.detach().to(device="cpu")
+                )
+            else:
+                cpu_sd[k] = v
+        state["state_dict"] = cpu_sd
         atomic_save(Path(output_path), state)
 
 
@@ -997,6 +1293,7 @@ def save_trajectory_bc_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     grad_scaler: GradScaler | None = None,
     aug_generator: torch.Generator | None = None,
+    numerical_stats: dict[str, int] | None = None,
 ) -> Path:
     raw = model.module if isinstance(model, DistributedDataParallel) else model
     assert isinstance(raw, TrajectoryBCModel)
@@ -1017,10 +1314,12 @@ def save_trajectory_bc_checkpoint(
     if rank == 0:
         try:
             ckpt_dir.mkdir(parents=True, exist_ok=True)
+            stats_clean = {str(k): int(v) for k, v in (numerical_stats or {}).items()}
             payload = {
                 "step": int(step),
                 "world_size": int(world_size),
                 "recipe": recipe,
+                "numerical_stats": stats_clean,
                 "model": cpu_state(raw.state_dict()),
                 "optimizer": cpu_state(optimizer.state_dict()),
                 "scheduler": cpu_state(scheduler.state_dict()) if scheduler is not None else None,
@@ -1055,6 +1354,7 @@ def load_trajectory_bc_checkpoint(
     grad_scaler: GradScaler | None = None,
     aug_generator: torch.Generator | None = None,
     map_location: torch.device | str = "cpu",
+    stats_out: dict[str, int] | None = None,
 ) -> int:
     del map_location  # Load on CPU first to preserve rank/device isolation and avoid VRAM spikes.
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
@@ -1071,6 +1371,11 @@ def load_trajectory_bc_checkpoint(
         grad_scaler.load_state_dict(payload["grad_scaler"])
     if sampler is not None:
         sampler.load_state_dict(payload["sampler"])
+
+    if stats_out is not None:
+        stats_out.clear()
+        for k, v in (payload.get("numerical_stats") or {}).items():
+            stats_out[str(k)] = int(v)
 
     is_dist = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_dist else 0
@@ -1090,6 +1395,20 @@ def load_trajectory_bc_checkpoint(
     if aug_generator is not None and payload.get("aug_rng") is not None:
         aug_generator.set_state(payload["aug_rng"].cpu())
     return int(payload["step"])
+
+
+def _compute_bc_grad_norm_and_nonfinite(
+    grads: list[Tensor],
+    *,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Compute scalar FP32 total L2 gradient norm and non-finite flag with zero host sync."""
+    if not grads:
+        zero = torch.zeros((), device=device, dtype=torch.float32)
+        return zero, torch.zeros((), device=device, dtype=torch.bool)
+    per_norms = [torch.linalg.vector_norm(g, ord=2, dtype=torch.float32) for g in grads]
+    total_norm = torch.linalg.vector_norm(torch.stack(per_norms), ord=2)
+    return total_norm, ~torch.isfinite(total_norm)
 
 
 def train_trajectory_bc_steps(
@@ -1113,8 +1432,11 @@ def train_trajectory_bc_steps(
     data_sha256: str = "",
     log_interval: int = 50,
     check_finite_interval: int = 50,
+    max_nonfinite_steps: int | None = None,
+    loss_transform: Callable[[Tensor, int], Tensor] | None = None,
+    post_backward_hook: Callable[[nn.Module, torch.optim.Optimizer, int], None] | None = None,
 ) -> dict[str, Any]:
-    """Deterministic single/multi-step round-trajectory BC training loop with exact resume."""
+    """Deterministic single/multi-step round-trajectory BC training loop with pre-update safety."""
     sampler = LengthBucketBatchSampler(
         [r.round_event_len for r in rounds], batch_size=batch_size, seed=sampler_seed
     )
@@ -1129,7 +1451,11 @@ def train_trajectory_bc_steps(
     assert isinstance(raw, TrajectoryBCModel)
     recipe = raw.recipe(data_sha256=data_sha256, lr=base_lr, weight_decay=base_wd)
 
+    is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
+    scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
+
     start_step = 0
+    stats_restored: dict[str, int] = {}
     if resume_from is not None:
         start_step = load_trajectory_bc_checkpoint(
             resume_from,
@@ -1138,34 +1464,74 @@ def train_trajectory_bc_steps(
             expected_recipe=recipe,
             sampler=sampler,
             scheduler=scheduler,
-            grad_scaler=grad_scaler,
+            grad_scaler=scaler,
             aug_generator=aug_gen,
             map_location=device,
+            stats_out=stats_restored,
         )
 
-    is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
-    scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
-    trainable = [p for p in model.parameters() if p.requires_grad]
+    is_dist = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if is_dist else 1
+    can_gpu_fused_guard = (
+        device.type == "cuda"
+        and bool(optimizer.param_groups)
+        and all(bool(g.get("fused", False)) for g in optimizer.param_groups)
+        and isinstance(optimizer, torch.optim.AdamW)
+        and scheduler is None
+    )
+    one_f32 = torch.ones((), device=device, dtype=torch.float32)
+    zero_f32 = torch.zeros((), device=device, dtype=torch.float32)
+    clip_f32 = torch.full((), float(grad_clip), device=device, dtype=torch.float32)
+
+    optimizer_steps_t = torch.full(
+        (), int(stats_restored.get("optimizer_steps", 0)), device=device, dtype=torch.int64
+    )
+    skipped_steps_t = torch.full(
+        (), int(stats_restored.get("skipped_steps", 0)), device=device, dtype=torch.int64
+    )
+    nonfinite_loss_steps_t = torch.full(
+        (), int(stats_restored.get("nonfinite_loss_steps", 0)), device=device, dtype=torch.int64
+    )
+    nonfinite_grad_steps_t = torch.full(
+        (), int(stats_restored.get("nonfinite_grad_steps", 0)), device=device, dtype=torch.int64
+    )
 
     model.train()
     step = start_step
     last_metrics: dict[str, float] = {}
-    nonfinite_accum = torch.zeros((), device=device, dtype=torch.bool)
+    last_stats: dict[str, int] = {
+        "optimizer_steps": int(stats_restored.get("optimizer_steps", 0)),
+        "skipped_steps": int(stats_restored.get("skipped_steps", 0)),
+        "nonfinite_loss_steps": int(stats_restored.get("nonfinite_loss_steps", 0)),
+        "nonfinite_grad_steps": int(stats_restored.get("nonfinite_grad_steps", 0)),
+    }
     last_out: dict[str, Tensor] | None = None
 
-    def _flush_metrics(out_map: dict[str, Tensor]) -> dict[str, float]:
-        nonlocal nonfinite_accum
+    def _flush_metrics(out_map: dict[str, Tensor]) -> tuple[dict[str, float], dict[str, int]]:
         keys = list(out_map.keys())
         packed = torch.stack(
-            [nonfinite_accum.float()] + [out_map[k].detach().float() for k in keys]
+            [
+                optimizer_steps_t.double(),
+                skipped_steps_t.double(),
+                nonfinite_loss_steps_t.double(),
+                nonfinite_grad_steps_t.double(),
+            ]
+            + [out_map[k].detach().double() for k in keys]
         ).cpu().tolist()
-        nonfinite_accum.zero_()
-        if packed[0] > 0.0:
-            raise RuntimeError("Trajectory BC training loss became non-finite.")
-        metrics_f = {k: float(v) for k, v in zip(keys, packed[1:], strict=True)}
-        if not math.isfinite(metrics_f["loss"]):
-            raise RuntimeError("Trajectory BC training loss became non-finite.")
-        return metrics_f
+        stats = {
+            "optimizer_steps": int(round(packed[0])),
+            "skipped_steps": int(round(packed[1])),
+            "nonfinite_loss_steps": int(round(packed[2])),
+            "nonfinite_grad_steps": int(round(packed[3])),
+        }
+        metrics_f = {k: float(v) for k, v in zip(keys, packed[4:], strict=True)}
+        if max_nonfinite_steps is not None and stats["skipped_steps"] > int(max_nonfinite_steps):
+            raise RuntimeError(
+                f"Exceeded max_nonfinite_steps={max_nonfinite_steps}: skipped={stats['skipped_steps']} "
+                f"(nonfinite_loss={stats['nonfinite_loss_steps']}, "
+                f"nonfinite_grad={stats['nonfinite_grad_steps']})."
+            )
+        return metrics_f, stats
 
     while max_steps is None or step < max_steps:
         for idxs in sampler:
@@ -1180,28 +1546,105 @@ def train_trajectory_bc_steps(
                 device_type=device.type,
                 dtype=amp_dtype or torch.float32,
                 enabled=bool(is_amp),
+                cache_enabled=False,
             ):
                 out = model(batch_dev)
                 loss = out["loss"]
+                if loss_transform is not None:
+                    loss = loss_transform(loss, step)
 
-            nonfinite_accum = nonfinite_accum | (~torch.isfinite(loss.detach()))
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            if trainable:
-                torch.nn.utils.clip_grad_norm_(trainable, grad_clip)
+            loss_bad = (~torch.isfinite(loss.detach())).reshape(())
+            if loss.requires_grad:
+                scaler.scale(loss).backward()
+            if post_backward_hook is not None:
+                post_backward_hook(model, optimizer, step)
             if scaler.is_enabled():
-                old_scale = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                step_skipped = scaler.get_scale() < old_scale
+                scaler.unscale_(optimizer)
+
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            for group in optimizer.param_groups:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        params_with_grad.append(p)
+                        grads.append(p.grad)
+
+            grad_norm, grad_bad = _compute_bc_grad_norm_and_nonfinite(grads, device=device)
+            if scaler.is_enabled():
+                opt_state = scaler._per_optimizer_states[id(optimizer)]
+                found_map = opt_state["found_inf_per_device"]
+                scaler_bad = zero_f32 > 1.0
+                for v in found_map.values():
+                    scaler_bad = scaler_bad | (v.to(device=device, dtype=torch.float32) > 0.0)
+                grad_bad = grad_bad | scaler_bad
+            step_bad = loss_bad | grad_bad
+
+            if is_dist and world_size > 1:
+                sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
+                flags_sync = torch.stack([loss_bad, grad_bad]).to(device=sync_dev, dtype=torch.int32)
+                dist.all_reduce(flags_sync, op=dist.ReduceOp.MAX)
+                flags_dev = (flags_sync > 0).to(device=device)
+                loss_bad = flags_dev[0]
+                grad_bad = flags_dev[1]
+                step_bad = loss_bad | grad_bad
+
+            if params_with_grad and grad_clip > 0.0:
+                safe_norm = torch.where(step_bad, clip_f32, grad_norm)
+                torch.nn.utils.clip_grads_with_norm_(
+                    params_with_grad, float(grad_clip), safe_norm
+                )
+
+            found_inf_f32 = step_bad.to(dtype=torch.float32)
+            if scaler.is_enabled():
+                opt_state = scaler._per_optimizer_states[id(optimizer)]
+                found_map = opt_state["found_inf_per_device"]
+                if found_map:
+                    for d_key in list(found_map.keys()):
+                        cur = found_map[d_key]
+                        found_map[d_key] = torch.maximum(
+                            cur, found_inf_f32.to(device=cur.device, dtype=cur.dtype)
+                        )
+                else:
+                    found_map[device] = found_inf_f32
+
+            if can_gpu_fused_guard:
+                if scaler.is_enabled():
+                    optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
+                    optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
+                    try:
+                        optimizer.step()
+                    finally:
+                        if hasattr(optimizer, "grad_scale"):
+                            del optimizer.grad_scale  # type: ignore[attr-defined]
+                        if hasattr(optimizer, "found_inf"):
+                            del optimizer.found_inf  # type: ignore[attr-defined]
             else:
-                optimizer.step()
-                step_skipped = False
-            if not step_skipped and scheduler is not None:
-                scheduler.step()
+                bad_host = bool(step_bad.item())
+                if not bad_host:
+                    if scaler.is_enabled():
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                elif scaler.is_enabled():
+                    scaler.update()
+
+            optimizer.zero_grad(set_to_none=True)
 
             step += 1
             last_out = out
+            step_bad_i = step_bad.to(dtype=torch.int64)
+            skipped_steps_t.add_(step_bad_i)
+            optimizer_steps_t.add_(1 - step_bad_i)
+            nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
+            nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
+
             at_end = (max_steps is not None and step >= max_steps) or (
                 max_steps is None and sampler.cursor >= len(sampler.batches)
             )
@@ -1214,12 +1657,20 @@ def train_trajectory_bc_steps(
                 or (log_interval > 0 and step % log_interval == 0)
             )
             if need_sync:
-                last_metrics = _flush_metrics(out)
+                last_metrics, last_stats = _flush_metrics(out)
             if need_ckpt:
+                assert ckpt_dir is not None
                 save_trajectory_bc_checkpoint(
-                    ckpt_dir, raw, optimizer, sampler=sampler, step=step,
-                    recipe=recipe, scheduler=scheduler, grad_scaler=scaler,
+                    ckpt_dir,
+                    raw,
+                    optimizer,
+                    sampler=sampler,
+                    step=step,
+                    recipe=recipe,
+                    scheduler=scheduler,
+                    grad_scaler=scaler,
                     aug_generator=aug_gen,
+                    numerical_stats=last_stats,
                 )
         if max_steps is None:
             break
@@ -1227,9 +1678,16 @@ def train_trajectory_bc_steps(
             sampler.reset_epoch(sampler.epoch + 1)
 
     if last_out is not None and not last_metrics:
-        last_metrics = _flush_metrics(last_out)
+        last_metrics, last_stats = _flush_metrics(last_out)
 
-    return {"step": step, "metrics": last_metrics}
+    return {
+        "step": step,
+        "optimizer_steps": last_stats["optimizer_steps"],
+        "skipped_steps": last_stats["skipped_steps"],
+        "nonfinite_loss_steps": last_stats["nonfinite_loss_steps"],
+        "nonfinite_grad_steps": last_stats["nonfinite_grad_steps"],
+        "metrics": last_metrics,
+    }
 
 
 __all__ = [
