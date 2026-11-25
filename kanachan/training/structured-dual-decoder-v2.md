@@ -222,11 +222,11 @@
 | :---: | :--- | :---: | :--- |
 | `0` | `event_type` | `0..10` | `0=PAD`, `1=DORA(局初BOS位写入初始宝牌指示牌)`, `2=TSUMO_SELF(仅Phase 2)`, `3=DAHAI`, `4=REACH_ACCEPTED(仅Phase 2)`, `5=CHI`, `6=PON`, `7=DAIMINKAN`, `8=ANKAN`, `9=KAKAN`, `10=SELF_PASS(仅Phase 2)` |
 | `1` | `actor_rel` | `0..4` | `(event_abs_seat + 4 - observer_seat) % 4 ∈ {0..3}`；索引 `0` 的初始 `DORA` 填 `4 (TABLE)` |
-| `2` | `source_rel` | `0..4` | `CHI` 固定为 `(actor_rel + 3) % 4`；`PON/DAIMINKAN` 为 `(from_abs + 4 - observer_seat) % 4`；其余填 `4 (NONE)` |
-| `3` | `tile37` | `0..37` | `DORA[0]`: `dora_indicator_0`；`DAHAI/DAIMINKAN/KAKAN`: `tile37`；`CHI`: `chi_encode_[code][2]`；`PON`: `peng_encode_[code][2]`；`ANKAN`: `_tile37(base34)`；无牌填 `37` |
+| `2` | `source_rel` | `0..4` | `CHI` 固定为 `(actor_rel + 3) % 4`；`PON/DAIMINKAN` 先由动作方绝对席位还原供牌绝对席位 `from_abs = (event_abs_seat + 1 + rel_from) % 4`，再算 `(from_abs + 4 - observer_seat) % 4`；其余填 `4 (NONE)` |
+| `3` | `tile37` | `0..37` | `DORA[0]`: `dora_indicator_0`；`DAHAI/DAIMINKAN/KAKAN`: `tile37`；`CHI`: `chi_encode_[code][2]`；`PON`: `peng_encode_[code][2]`；`ANKAN`: `_tile37(base34) = (base34 < 27 ? (base34 / 9) * 10 + (base34 % 9) + 1 : base34 + 3)`；无牌填 `37` |
 | `4` | `consumed0_37` | `0..37` | `CHI/PON`: 查表第 0 张消耗牌 `tile37`（含赤 5）；其余填 `37` |
 | `5` | `consumed1_37` | `0..37` | `CHI/PON`: 查表第 1 张消耗牌 `tile37`（含赤 5）；其余填 `37` |
-| `6` | `flags` | bitmask | `b0: moqie (tsumogiri)`, `b1: is_riichi_declare`, `b2: is_double_riichi`, `b3: is_rinshan (紧随本人杠后的切牌)`, `b4: involves_red5` |
+| `6` | `flags` | bitmask | `b0: moqie (tsumogiri)`, `b1: is_riichi_declare`, `b2: is_double_riichi`, `b3: is_rinshan (紧随本人杠后的切牌)`, `b4: involves_red5`（`ev_3/ev_4/ev_5` 含 `{0,10,20}`，**或 `ANKAN/DAIMINKAN` 落在 `base34 ∈ {4,13,22}` 因四枚必含赤 5**） |
 | `7` | `sub_mask` | `uint8` | `DORA`: `dora_idx (0)`；Phase 2 `SELF_PASS`: 放弃位掩码 `(chi|pon|kan|ron)`；其余 `0` |
 | `8` | `turn_idx` | `0..255` | 本局单调递增公开事件步序号 `0..L_ev-1` |
 | `9` | `actor_seq_idx` | `0..255` | `DAHAI`: 该家本局第几张舍牌（`0..23`）；副露/杠: 该家副露槽位（`0..3`）；其余 `0` |
@@ -291,7 +291,7 @@
 - `c0_base34[547]`, `c1_base34[547]`：`CHI (222..311)` 与 `PON (312..431)` 直接按 `kanachan` C++ `chi_encode_` / `peng_encode_` 前两项转为 `base34`；其余动作填 **`34 (NULL_TILE_IDX)`**；
 - `source_rel[547]`：`CHI` 固定填 `3`（上家）；`PON / DAIMINKAN / RON` 填 `rel_from + 1 ∈ {1, 2, 3}`；其余填 **`4 (NULL_SOURCE_IDX)`**；
 - `has_slot_flags[547, 4]`：`[has_target, has_c0, has_c1, has_source] ∈ {0.0, 1.0}^4`；
-- `static_flags[547, 4]`：`[target_is_red5, consumed_has_red5, is_moqie, is_riichi] ∈ {0.0, 1.0}^4`（注意 `PON` 中 `encode % 40 == 5/16/27` 为 `consumed_has_red5=1, target_is_red5=0`；`encode % 40 == 6/17/28` 为 `consumed_has_red5=0, target_is_red5=1`，精确对应 C++ `peng_encode_`！）。
+- `static_flags[547, 4]`：`[target_is_red5, consumed_has_red5, is_moqie, is_riichi] ∈ {0.0, 1.0}^4`（注意精确对应 C++ 物理牌规则：`PON` 中 `encode % 40 == 5/16/27` 为 `consumed_has_red5=1, target_is_red5=0`，`encode % 40 == 6/17/28` 为 `consumed_has_red5=0, target_is_red5=1`；`ANKAN` 落在 `base34 ∈ {4,13,22}` 时四枚必含赤 5 故 `target_is_red5=0, consumed_has_red5=1`；`DAIMINKAN` 鸣普五 `tile37 ∈ {5,15,25}` 时手中三枚必含赤 5 故 `target_is_red5=0, consumed_has_red5=1`，鸣赤五 `tile37 ∈ {0,10,20}` 时 `target_is_red5=1, consumed_has_red5=0`，严格满足 6× 花色置换不变性）。
 
 #### C. 7 模式 `cand_mode: uint8[B, 32]` 与 `cand_dyn: float32[B, 32, 8]` 逐列公式
 常数 $\ln(61) \approx 4.1108738$，$\ln(64001) \approx 11.066654$：
@@ -447,8 +447,8 @@ flowchart TB
 | **`v2_large`** | 512 / 8 | **10** | **6** | 1376 | `True` | `factorized` | 大规模算力解锁档位（约 52.9M 推理参数） |
 | **`OracleCriticV2`** | 192 / 6 | **4** | **3** | 512 | `True` | 无候选 (`h_val`) | Phase 2 / Stage 3 训练期独立全视价值网络（约 3.3M 参数） |
 
-- **混合精度规范**：主权重强制 FP32（拒绝 FP16/FP64 主权重）；CUDA 训练支持 `bfloat16`（首选）或 `float16` autocast；所有头部输出（策略 `log_softmax`、熵、KL、Expectile、TD MSE、CQL `logsumexp`、Noisy-OR `logsigmoid/expm1`）**一律在计算前显式 `.float()` 升至 FP32**，并用 `torch.where(cand_mask, term, 0.0)` 屏蔽非法项，严防 `0 * (-inf) = NaN`。
-- **AdamW 参数分组**：所有 2D+ 线性层矩阵权重进入 `weight_decay` 组（默认 `0.01`，`betas=(0.9, 0.95)`）；所有 `RMSNorm`、`Embedding`（含 `rel_bias`）、一维 `bias`/`biases` 以及 `null_tile_emb / null_source_emb / val_token_emb / no_event_seat_emb / disabled_d1_mem` 进入 `weight_decay = 0.0` 组。
+- **混合精度与头部退出 Autocast 规范**：主权重强制 FP32（拒绝 FP16/FP64 主权重）；CUDA 训练支持 `bfloat16`（首选）或 `float16` autocast；所有读出头（`StructuredActionHead`、`StructuredStateHead`、`DuelingQHead`、`OpponentBeliefHeads`）内部必须像 `GlobalActionHead` 一样显式包裹 `with torch.autocast(device_type=..., enabled=False):` 并直接输出 `float32` 张量（从而在 `autocast` 上下文内亦严格满足 [bc/train.py](bc/train.py#L154) `assert log_probs.dtype == dtype`），所有策略 `log_softmax`、熵、KL、Expectile、TD MSE、CQL `logsumexp` 与 Noisy-OR `logsigmoid/expm1` 一律在 FP32 下用 `torch.where(cand_mask, term, 0.0)` 屏蔽非法项，严防 `0 * (-inf) = NaN`。
+- **AdamW 参数分组防误衰减守卫**：注意现有 [optimizers.py](core/optimizers.py#L13-L28) `adamw_parameter_groups` 默认会将**所有非 `nn.Embedding` 且 `ndim >= 2` 的参数**划入 `weight_decay`！因此实现时必须：① 将单槽可学习向量 `val_token_emb / null_tile_emb / null_source_emb` 存为 **1D `nn.Parameter(torch.empty(d_model))`**（前向时 `view(1, 1, -1)`），将多槽回退表 `no_event_seat_emb / disabled_d1_mem` 定义为 `nn.Embedding(4, d_model)` / `nn.Embedding(5, d_model)`；② 在 `adamw_parameter_groups` 中支持模块级 `_no_weight_decay_param_ids()` 钩子，显式将 `ModeRoutedCandDyn.biases [7, 64]` 与所有 `RMSNorm`、`Embedding`（含 `rel_bias`）及一维 `bias` 放入 `weight_decay = 0.0` 组，仅对 2D+ 线性变换权重矩阵施加 `weight_decay`（默认 `0.01`，`betas=(0.9, 0.95)`）。
 - **决胜同分规则**：合法最优动作选取复用 `legal_argmax`，当多个合法候选得分完全相等时，**固定选择全局动作 ID `cand_ids[b, k]` 最小者**，确保任意候选重排下选出的物理动作 100% 不变。
 
 ---
@@ -594,14 +594,16 @@ flowchart TB
    - 现有 [candidate_features.py](../candidate_features.py) 在导入 `kanachan._candidate_features` 时强制校验 `SCHEMA_ID == "discard_afterstate_v1"` 与 `FEATURE_WIDTH == 46`，且 [hatch_build.py](../../hatch_build.py) 的 `NATIVE_MODULES` 白名单绑定了 `"kanachan/_candidate_features"`；
    - 因此在升级 [tools/features/CMakeLists.txt](../../tools/features/CMakeLists.txt) 时：**必须原封不动保留 `SCHEMA_ID = "discard_afterstate_v1"`、`FEATURE_WIDTH = 46` 与 `discard_features(...)` 函数导出**（确保实验 1 的 `DenseDecisionDecoder + discard_v1` 对照基线继续零改动运行），并在同一扩展中新增独立常量 `STRUCTURED_V2_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与释放 GIL 的批量函数 `encode_structured_v2_batch(...)`（若选择拆分为独立扩展 `kanachan/_structured_v2`，则必须同步加入 `hatch_build.py::NATIVE_MODULES`）；
    - **远程训练源码包防漏检**：[tools/package_training_source.py](../../tools/package_training_source.py) 当前仅硬编码收录了 `"src/features/candidate_features.cpp"` 而未通配 `src/features/*.hpp` / `*.cpp`；新增 `mjsoul_hand_eval.hpp` 与 `structured_v2` 源码文件后，**必须同步将其加入 `package_training_source.py` 的 `REQUIRED` 与 glob 列表**，防止打包上传 RTX 5090 云端构建时缺失头文件。
-3. **`TensorDictSequential` 两段式 `"encode"` 打包接口与现有训练器分支挂载点**：
-   - 现有 [decision_factory.py](../nn/decision_factory.py)、[decision_checkpoint.py](core/decision_checkpoint.py)、[bc/train.py](bc/train.py)、[cql/train.py](cql/train.py) 与 [iql/train.py](iql/train.py) 统一采用 `TensorDictModule(backbone, in_keys=["sparse", "numeric", "progression", "candidates"], out_keys=["encode"])` 接下游 `head_tdm` 的两段式拓扑：
-     - 为零摩擦接入整套现有流水线，`StructuredDualDecoder` 主干统一将 `h_val: [B, D]` 与 `h_cand: [B, 32, D]`（`flat546` 模式下为 `h_val` 扩展）沿第 1 维打包输出为单一 **`encode: [B, 33, D]`**（其中 `encode[:, 0, :] == h_val`，`encode[:, 1:33, :] == h_cand`）；
-     - 状态价值头 `StructuredStateHead`（`in_keys=["encode"]`）直接切片 `encode[:, 0, :]` 输出 `state_value`（及可选 `final_rank_logits`）；候选动作/动作价值头 `StructuredActionHead`（`in_keys=["candidates", "encode"]`）同时读取 `h_val = encode[:, 0, :]` 与 `h_cand = encode[:, 1:33, :]` 输出 `logits` 或 `action_value`；
-   - **必改分支清单（防静默退化到旧慢速分支）**：引入 `config.encoder.architecture = "structured_dual_v2"` 时，必须同步更新所有原先写死 `== "dense_decoder"` 的判断点（严禁漏改导致检查点校验失效或同分决胜退化）：
-     1. [decision_checkpoint.py](core/decision_checkpoint.py#L28) `recipe()`：开启严格配方、数据 SHA256 与 RNG 绑定（使用独立 `ARCHITECTURE_ID = "mahjong_structured_dual_decoder_v2"`，绝不返回 `None`）；
-     2. [cql/train.py](cql/train.py#L1328) 与 [decision_value.py](../nn/decision_value.py)：走快速无冗余 `mc_components` / `td_components`、`q_only` 视图与 `transfer_bc_features`（迁移主干与隐藏层并将末层标量输出置零）；
-     3. [iql/train.py](iql/train.py#L1311)：`TwinQActor(..., tie_break_by_action_id=True)` 强制开启最小 `global_id` 平局决胜。
+3. **`TensorDictSequential` 两段式 `"encode"` 打包接口、零同步 CPU 预取与全仓必改分支清单**：
+   - 现有 [decision_factory.py](../nn/decision_factory.py)、[decision_checkpoint.py](core/decision_checkpoint.py)、[bc/train.py](bc/train.py)、[cql/train.py](cql/train.py)、[iql/train.py](iql/train.py) 与 [awr/train.py](awr/train.py) 统一采用 `TensorDictModule(backbone, ..., out_keys=["encode"])` 接下游 `head_tdm` 的两段式拓扑：
+     - **输出打包契约**：`StructuredDualDecoder` 主干统一将 `h_val: [B, D]` 与 `h_cand: [B, 32, D]`（`flat546` 模式下为 `h_val` 扩展）沿第 1 维打包为单一 **`encode: [B, 33, D]`**（`encode[:, 0, :] == h_val`，`encode[:, 1:33, :] == h_cand`）；`StructuredStateHead` 切片 `encode[:, 0, :]`，`StructuredActionHead` 同时读取两者；
+     - **训练期零 CUDA `.cpu()` 同步停顿 vs 导出期四字段兼容**：严禁在 GPU 训练热路径的 `forward()` 内把 GPU `sparse/numeric/progression/candidates` 拉回 CPU 现算结构化特征！训练期由 DataLoader worker、[bc/prefetch.py](core/bc/prefetch.py) 与 [streaming_mc.py](core/offline_rl/streaming_mc.py)（使用独立版本标识 `"streaming_mc_structured_v2"`）在后台 CPU 进程预计算 `v2_tile_feats / v2_events / v2_global_feats / v2_player_feats / v2_cand_mode / v2_cand_dyn` 并 `pin_memory` 直传 GPU；导出 `snapshots/model.kanachan` 时 `encoder_tdm` 绑定四字段 `in_keys=["sparse", "numeric", "progression", "candidates"]`，当检测到未传入预计算 `v2_*` 键时自动调用 C++ `encode_structured_v2_batch` 原地编码，兼顾训练满吞吐与 C++ `DecisionMaker` 100% 零改动兼容。
+   - **全仓硬编码 `== "dense_decoder"` 必改门控清单（共 5 组，漏改任一处将导致配置报错、回退旧慢速分支或同分决胜退化）**：
+     1. [core/config/device.py](core/config/device.py#L79) 与 [core/config/encoder.py](core/config/encoder.py#L152-L284)：对 `"structured_dual_v2"` 同样强制 FP32 主权重，在 Hydra `ConfigStore` 注册 V2 各预设档位，放行 `rope + silu + dropout=0 + layer_normalization=False` 与 16 对齐 SwiGLU 隐宽；
+     2. [decision_factory.py](../nn/decision_factory.py#L13-L179)：分发 `make_backbone`、`make_candidate_head`、`make_state_head`、`candidate_head_keys` 与 `network_description`；
+     3. [decision_checkpoint.py](core/decision_checkpoint.py#L28) `recipe()`：绑定独立 `ARCHITECTURE_ID = "mahjong_structured_dual_decoder_v2"`、数据 SHA256 与 RNG 状态（绝不返回 `None`）；
+     4. [bc/train.py](bc/train.py#L159-L773) 与 [awr/train.py](awr/train.py#L240-L896)：将损失归约由无掩码全样本均值升级为 `has_choice = (candidates != 546).sum(-1) >= 2` 掩码归约，放行 `CandidateFeaturePrefetch`，并在运行时与 `dump_object` 导出两处同步开启 `DecodeConverter("argmax", tie_break_by_action_id=True)`；
+     5. [cql/train.py](cql/train.py#L790-L1683)、[decision_value.py](../nn/decision_value.py) 与 [iql/train.py](iql/train.py#L643-L1615)：对 `"structured_dual_v2"` 放行 `bc_initial_model`、`streaming_mc`、`reward_plugin` 与 `final_rank_weight`，启用快速 `mc_components / td_components` 与末层置零迁移，并在 CQL `argmax` 与 IQL `TwinQActor` 导出中同步开启 `tie_break_by_action_id=True`。
 4. **双路径推理、`model_loader.py` (`weights_only=True`) 与 `DecisionMaker` 原生对接硬契约**：
    - **便携序列化格式约束（防 `UnpicklingError` 与 GPU 设备脱节）**：[model_loader.py](../model_loader.py) 使用 `torch.load(..., weights_only=True)` 加载带魔数 `"__kanachan__": "11fc2bfe-c4c7-402e-b11e-7cb3ff6f9945"` 的描述字典，且仅当 `"device" in kwargs` 时才将 `map_location` 注入 `kwargs["device"]`（见 [model_loader.py#L71-L72](../model_loader.py#L71-L72)）。因此导出 `snapshots/model.kanachan` 的模块类：
      1. `__init__` 的 `args / kwargs` **仅允许包含 Python 基础标量/列表/字典、`torch.dtype`、`torch.device` 或嵌套 `dump_model/dump_object` 字典，严禁直接塞入自定义 `dataclass` 实例**；
