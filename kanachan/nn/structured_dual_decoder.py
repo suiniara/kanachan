@@ -1436,16 +1436,22 @@ class NextEventHead(nn.Module):
         self.register_buffer("t37_to_b34", t37_to_b34)
 
     def forward(
-        self, h_ev: Tensor, events: Tensor, event_len: Tensor
+        self,
+        h_ev: Tensor,
+        events: Tensor,
+        event_len: Tensor,
+        *,
+        ev_denom: float | Tensor | None = None,
+        td_denom: float | Tensor | None = None,
+        scale: float | Tensor = 1.0,
     ) -> tuple[Tensor, dict[str, Tensor]]:
         bsz, lmax, _ = h_ev.shape
         device = h_ev.device
         with torch.autocast(device_type=device.type, enabled=False):
+            scale_t = torch.as_tensor(scale, device=device, dtype=torch.float32).reshape(())
             if lmax < 2:
                 # Connect zero loss to every head parameter so DDP never sees unused params.
-                zero = (
-                    sum(p.float().sum() * 0.0 for p in self.parameters())
-                )
+                zero = sum(p.float().sum() * 0.0 for p in self.parameters())
                 return zero, {
                     "kind": zero.detach(),
                     "actor": zero.detach(),
@@ -1469,25 +1475,31 @@ class NextEventHead(nn.Module):
             t_logits = _lin(self.tile34_head)
             td_logits = _lin(self.tedashi_head)
 
-            denom = valid.float().sum().clamp_min(1.0)
             valid_f = valid.float()
+            local_ev_cnt = valid_f.sum()
+            if ev_denom is None:
+                denom_ev = local_ev_cnt.clamp_min(1.0)
+                ev_inv = torch.where(local_ev_cnt > 0.0, scale_t / denom_ev, torch.zeros_like(denom_ev))
+            else:
+                denom_ev = torch.as_tensor(ev_denom, device=device, dtype=torch.float32).reshape(())
+                ev_inv = torch.where(denom_ev > 0.0, scale_t / denom_ev.clamp_min(1e-8), torch.zeros_like(denom_ev))
 
             k_loss = (
                 F.cross_entropy(k_logits.reshape(-1, 11), next_ev[..., 0].reshape(-1), reduction="none")
                 .view(bsz, lmax - 1)
                 * valid_f
-            ).sum() / denom
+            ).sum() * ev_inv
             a_loss = (
                 F.cross_entropy(a_logits.reshape(-1, 5), next_ev[..., 1].reshape(-1), reduction="none")
                 .view(bsz, lmax - 1)
                 * valid_f
-            ).sum() / denom
+            ).sum() * ev_inv
             target_b34 = self.t37_to_b34[next_ev[..., 3]]
             t_loss = (
                 F.cross_entropy(t_logits.reshape(-1, 35), target_b34.reshape(-1), reduction="none")
                 .view(bsz, lmax - 1)
                 * valid_f
-            ).sum() / denom
+            ).sum() * ev_inv
 
             is_dahai = valid & (next_ev[..., 0] == 3)
             td_target = (next_ev[..., 6] & 1).clamp(0, 1)
@@ -1495,7 +1507,14 @@ class NextEventHead(nn.Module):
                 td_logits.reshape(-1, 2), td_target.reshape(-1), reduction="none"
             ).view(bsz, lmax - 1)
             td_mask = is_dahai.float()
-            td_loss = (td_raw * td_mask).sum() / td_mask.sum().clamp_min(1.0)
+            local_td_cnt = td_mask.sum()
+            if td_denom is None:
+                denom_td = local_td_cnt.clamp_min(1.0)
+                td_inv = torch.where(local_td_cnt > 0.0, scale_t / denom_td, torch.zeros_like(denom_td))
+            else:
+                denom_td = torch.as_tensor(td_denom, device=device, dtype=torch.float32).reshape(())
+                td_inv = torch.where(denom_td > 0.0, scale_t / denom_td.clamp_min(1e-8), torch.zeros_like(denom_td))
+            td_loss = (td_raw * td_mask).sum() * td_inv
 
             total = 1.0 * k_loss + 0.5 * a_loss + 1.0 * t_loss + 0.5 * td_loss
             return total, {

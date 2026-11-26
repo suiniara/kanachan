@@ -56,24 +56,28 @@ _INT_EXACT_TENSORS: frozenset[str] = frozenset(
     {"v2_events", "v2_event_len", "v2_cand_ids", "v2_cand_mask", "v2_cand_mode"}
 )
 
-REQUIRED_CAND_MODES: tuple[str, ...] = tuple(str(m) for m in range(7))
+REQUIRED_CAND_MODES: tuple[str, ...] = tuple(str(m) for m in range(1, 7))
 
 REQUIRED_RULE_CATEGORIES: tuple[str, ...] = (
     "red5",
     "chi",
     "pon",
-    "dmk",
-    "ankan",
-    "kakan",
+    "daiminkan_event",
+    "daiminkan_cand",
+    "ankan_event",
+    "ankan_cand",
+    "kakan_event",
+    "kakan_cand",
     "dora2p",
     "riichi",
     "ippatsu",
-    "furiten",
+    "permanent_furiten",
+    "temporary_furiten",
+    "riichi_furiten",
     "pending_resp",
     "kyushu",
     "win_tsumo",
     "win_ron",
-    "win",
     "west_or_all_last",
     "left0",
 )
@@ -215,12 +219,18 @@ def _classify_sample_categories(
         cats.append("chi")
     if any(957 <= tok < 1437 for tok in pr_raw) or any(312 <= c < 432 for c in ca_raw):
         cats.append("pon")
-    if any(1437 <= tok < 1881 for tok in pr_raw) or any(432 <= c < 543 for c in ca_raw):
-        cats.append("dmk")
-    if any(1881 <= tok < 2017 for tok in pr_raw) or any(148 <= c < 182 for c in ca_raw):
-        cats.append("ankan")
-    if any(2017 <= tok < 2165 for tok in pr_raw) or any(182 <= c < 219 for c in ca_raw):
-        cats.append("kakan")
+    if any(1437 <= tok < 1881 for tok in pr_raw):
+        cats.append("daiminkan_event")
+    if any(432 <= c < 543 for c in ca_raw):
+        cats.append("daiminkan_cand")
+    if any(1881 <= tok < 2017 for tok in pr_raw):
+        cats.append("ankan_event")
+    if any(148 <= c < 182 for c in ca_raw):
+        cats.append("ankan_cand")
+    if any(2017 <= tok < 2165 for tok in pr_raw):
+        cats.append("kakan_event")
+    if any(182 <= c < 219 for c in ca_raw):
+        cats.append("kakan_cand")
     if n_dora >= 2:
         cats.append("dora2p")
     if any((5 <= tok < 597 and ((tok - 5) % 148) & 1) for tok in pr_raw) or any(
@@ -306,6 +316,25 @@ def load_samples(path: Path, max_samples: int):
     )
 
 
+def _detect_furiten_subtypes(
+    out: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return boolean masks for (permanent_furiten, temporary_furiten, riichi_furiten)."""
+    gf = out["v2_global_feats"]
+    pf = out["v2_player_feats"]
+    tf = out["v2_tile_feats"]
+    own_turn = gf[:, 15] > 0.5
+    self_riichi = pf[:, 0, 14] > 0.5
+    cur_temp_or_riichi = gf[:, 19] > 0.5
+
+    riichi_fur = cur_temp_or_riichi & self_riichi
+    temp_fur = cur_temp_or_riichi & (~self_riichi)
+    perm_own = own_turn & (~self_riichi) & (tf[:, :, 67] > 0.5).any(dim=-1)
+    perm_resp = (~own_turn) & (((tf[:, :, 68] > 0.5) & (tf[:, :, 18] > 0.5)).any(dim=-1))
+    perm_fur = perm_own | perm_resp
+    return perm_fur, temp_fur, riichi_fur
+
+
 def harvest_rare_categories(
     path: Path,
     *,
@@ -313,7 +342,7 @@ def harvest_rare_categories(
     per_cat_target: int = 64,
     required_categories: tuple[str, ...] = REQUIRED_RULE_CATEGORIES,
 ):
-    """Harvest diverse real Mahjong records covering melds, kans, red5s, riichi, ippatsu, wins, kyushu."""
+    """Harvest diverse real Mahjong records covering melds, kans, red5s, riichi, ippatsu, 3 furitens, wins, kyushu."""
     if not path.is_file():
         raise FileNotFoundError(f"Audit data file does not exist: {path}")
     if scan_limit <= 0:
@@ -327,6 +356,7 @@ def harvest_rare_categories(
     category_counts: dict[str, int] = {cat: 0 for cat in required_categories}
     scanned = 0
     furiten_buf: list[tuple[int, str, list[int], list[int], list[int], list[int]]] = []
+    furiten_keys = ("permanent_furiten", "temporary_furiten", "riichi_furiten")
 
     def _flush_furiten_buf() -> None:
         if not furiten_buf:
@@ -336,20 +366,18 @@ def harvest_rare_categories(
         b_pr = torch.tensor([x[4] for x in furiten_buf], dtype=torch.int32)
         b_ca = torch.tensor([x[5] for x in furiten_buf], dtype=torch.int32)
         out = derive_structured_v2_batch(b_sp, b_nu, b_pr, b_ca, include_room_level=False)
-        is_fur = (
-            (out["v2_global_feats"][:, 19] > 0.5)
-            | (out["v2_tile_feats"][:, :, 67].sum(dim=-1) > 0.5)
-        ).tolist()
-        for idx_b, hit in enumerate(is_fur):
-            if not hit:
-                continue
-            category_counts["furiten"] = category_counts.get("furiten", 0) + 1
-            if targets.get("furiten", 0) < per_cat_target:
-                l_idx, u, sp_v, nu_v, pr_v, ca_v = furiten_buf[idx_b]
-                targets["furiten"] = targets.get("furiten", 0) + 1
-                if l_idx not in selected_row_ids:
-                    selected_row_ids.add(l_idx)
-                    rows.append((u, sp_v, nu_v, pr_v, ca_v))
+        perm_f, temp_f, riichi_f = _detect_furiten_subtypes(out)
+        for cat_name, mask_t in zip(furiten_keys, (perm_f, temp_f, riichi_f), strict=True):
+            for idx_b, hit in enumerate(mask_t.tolist()):
+                if not hit:
+                    continue
+                category_counts[cat_name] = category_counts.get(cat_name, 0) + 1
+                if targets.get(cat_name, 0) < per_cat_target:
+                    l_idx, u, sp_v, nu_v, pr_v, ca_v = furiten_buf[idx_b]
+                    targets[cat_name] = targets.get(cat_name, 0) + 1
+                    if l_idx not in selected_row_ids:
+                        selected_row_ids.add(l_idx)
+                        rows.append((u, sp_v, nu_v, pr_v, ca_v))
         furiten_buf.clear()
 
     with _open_tsv(path) as f:
@@ -368,9 +396,9 @@ def harvest_rare_categories(
             if keep:
                 selected_row_ids.add(line_idx)
                 rows.append((uuid, sp, nu, pr, ca))
-            if targets.get("furiten", 0) < per_cat_target and len(pr_raw) >= 5:
+            if any(targets.get(fk, 0) < per_cat_target for fk in furiten_keys) and len(pr_raw) >= 5:
                 furiten_buf.append((line_idx, uuid, sp, nu, pr, ca))
-                if len(furiten_buf) >= 256:
+                if len(furiten_buf) >= 512:
                     _flush_furiten_buf()
 
     _flush_furiten_buf()
@@ -514,12 +542,12 @@ def _accumulate_slot_modes_and_categories(
     mode_counts: dict[str, int],
     cat_counts: dict[str, int],
     enable_early_shape_hint: bool = True,
-) -> None:
-    """Count all 7 candidate modes (0..6) and Mahjong rule categories on reference-checked samples."""
+) -> int:
+    """Count valid candidate modes (1..6 via cand_mask) & categories; return PAD slot count."""
     del uuids
     n = int(sp.shape[0])
     if n == 0:
-        return
+        return 0
     out = derive_structured_v2_batch(
         sp,
         nu,
@@ -529,14 +557,17 @@ def _accumulate_slot_modes_and_categories(
         include_room_level=False,
     )
     cand_mode = out["v2_cand_mode"]
-    for m in range(7):
-        mode_counts[str(m)] = mode_counts.get(str(m), 0) + int((cand_mode == m).sum().item())
+    cand_mask = out["v2_cand_mask"].bool()
+    pad_slots = int((~cand_mask).sum().item())
+    for m in range(1, 7):
+        mode_counts[str(m)] = mode_counts.get(str(m), 0) + int(
+            (cand_mask & (cand_mode == m)).sum().item()
+        )
 
-    fur_hits = (
-        (out["v2_global_feats"][:, 19] > 0.5)
-        | (out["v2_tile_feats"][:, :, 67].sum(dim=-1) > 0.5)
-    )
-    cat_counts["furiten"] = cat_counts.get("furiten", 0) + int(fur_hits.sum().item())
+    perm_f, temp_f, riichi_f = _detect_furiten_subtypes(out)
+    cat_counts["permanent_furiten"] = cat_counts.get("permanent_furiten", 0) + int(perm_f.sum().item())
+    cat_counts["temporary_furiten"] = cat_counts.get("temporary_furiten", 0) + int(temp_f.sum().item())
+    cat_counts["riichi_furiten"] = cat_counts.get("riichi_furiten", 0) + int(riichi_f.sum().item())
 
     sp_rows = sp.tolist()
     pr_rows = pr.tolist()
@@ -546,6 +577,7 @@ def _accumulate_slot_modes_and_categories(
         ca_unpadded = [x for x in ca_r if x < NUM_TYPES_OF_ACTIONS]
         for cat in _classify_sample_categories(sp_r, pr_unpadded, ca_unpadded):
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    return pad_slots
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -581,10 +613,11 @@ def main(argv: list[str] | None = None) -> int:
             f"ref_steps={args.ref_steps}, perm_steps={args.perm_steps}."
         )
 
-    # 1. Single-thread C++ full audit & invariant checks across all 7 candidate modes (0..6)
+    # 1. Single-thread C++ full audit & invariant checks across all valid candidate modes (1..6) and PAD (0)
     invariants_failed = 0
     mismatches: list[str] = []
     cand_mode_counts: dict[str, int] = {m: 0 for m in REQUIRED_CAND_MODES}
+    pad_slot_count = 0
     t0 = time.perf_counter()
     for start in range(0, n, args.batch_size):
         end = min(n, start + args.batch_size)
@@ -617,8 +650,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         if ((cand_mode < 0) | (cand_mode > 6)).any():
             invariants_failed += 1
-        for m in range(7):
-            cand_mode_counts[str(m)] += int((cand_mode == m).sum().item())
+        pad_slot_count += int((~cand_mask).sum().item())
+        for m in range(1, 7):
+            cand_mode_counts[str(m)] += int((cand_mask & (cand_mode == m)).sum().item())
     t1 = time.perf_counter()
     single_thread_sps = n / max(1e-9, t1 - t0)
 
@@ -642,6 +676,7 @@ def main(argv: list[str] | None = None) -> int:
     ref_n = args.ref_steps
     ref_verified_mode_counts: dict[str, int] = {m: 0 for m in REQUIRED_CAND_MODES}
     ref_verified_cat_counts: dict[str, int] = {c: 0 for c in REQUIRED_RULE_CATEGORIES}
+    ref_verified_pad_slot_count = 0
     if ref_n > 0:
         max_diffs, mm_false = _compare_cpp_and_py(
             uuids[:ref_n], sp[:ref_n], nu[:ref_n], pr[:ref_n], ca[:ref_n],
@@ -653,7 +688,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         mismatches.extend(mm_false)
         mismatches.extend(mm_true)
-        _accumulate_slot_modes_and_categories(
+        ref_verified_pad_slot_count += _accumulate_slot_modes_and_categories(
             uuids[:ref_n],
             sp[:ref_n],
             nu[:ref_n],
@@ -726,7 +761,7 @@ def main(argv: list[str] | None = None) -> int:
             harvest_max_diff = max(*hd_f.values(), *hd_t.values())
             mismatches.extend(hmm_f)
             mismatches.extend(hmm_t)
-            _accumulate_slot_modes_and_categories(
+            ref_verified_pad_slot_count += _accumulate_slot_modes_and_categories(
                 h_uuids,
                 h_sp,
                 h_nu,
@@ -761,7 +796,9 @@ def main(argv: list[str] | None = None) -> int:
         "single_thread_us_per_step": round(1e6 / single_thread_sps, 2),
         f"threads_{args.threads}_steps_per_sec": round(mt_sps, 1),
         "cand_mode_counts": cand_mode_counts,
+        "pad_slot_count": pad_slot_count,
         "ref_verified_cand_mode_counts": ref_verified_mode_counts,
+        "ref_verified_pad_slot_count": ref_verified_pad_slot_count,
         "category_counts_in_scan": category_counts_in_scan,
         "ref_verified_category_counts": ref_verified_cat_counts,
         "unverified_modes": unverified_modes,

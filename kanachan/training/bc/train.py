@@ -1,5 +1,6 @@
 import datetime
 from contextlib import ExitStack
+import json
 import logging
 import math
 import os
@@ -58,7 +59,229 @@ from kanachan.training.core.checkpoint import (
     save_training_state,
 )
 from kanachan.training.core.progress import TrainingProgress
-from kanachan.training.core.optimizers import move_optimizer_state, consolidate_optimizer_state
+from kanachan.training.core.optimizers import (
+    adamw_parameter_groups,
+    consolidate_optimizer_state,
+    move_optimizer_state,
+    validate_optimizer_parameter_coverage,
+)
+from kanachan.training.online.state import capture_rng
+
+
+def run_v2_trajectory_bc(
+    config: DictConfig,
+    *,
+    world_size: int,
+    rank: int,
+    local_rank: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    amp_dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Production Trajectory V2 BC training entrypoint using disk-spooled source-v3 rounds."""
+    from kanachan.training.bc.streaming_v2 import SpoolingRoundBCDataSource
+    from kanachan.training.bc.trajectory_v2 import (
+        TrajectoryBCModel,
+        _expected_inactive_bc_param_ids,
+        save_trajectory_bc_checkpoint,
+        train_trajectory_bc_steps,
+    )
+
+    if config.encoder.architecture != "structured_dual_v2":
+        raise ValueError(
+            f"training_mode='v2_trajectory' requires encoder.architecture='structured_dual_v2', "
+            f"got {config.encoder.architecture!r}."
+        )
+    if config.rewrite_rooms is not None or config.rewrite_grades is not None:
+        raise ValueError("v2_trajectory mode does not rewrite source-v3 room/grade sparse tokens.")
+    if config.batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {config.batch_size}.")
+    if config.gradient_accumulation_steps <= 0:
+        raise ValueError("gradient_accumulation_steps must be >= 1.")
+    if config.max_gradient_norm <= 0.0 or not math.isfinite(config.max_gradient_norm):
+        raise ValueError(f"Invalid max_gradient_norm={config.max_gradient_norm}.")
+    if config.snapshot_interval < 0:
+        raise ValueError(f"snapshot_interval must be >= 0, got {config.snapshot_interval}.")
+    if not math.isfinite(config.next_event_weight) or config.next_event_weight < 0.0:
+        raise ValueError(f"Invalid next_event_weight={config.next_event_weight}.")
+    if not math.isfinite(config.final_rank_weight) or config.final_rank_weight < 0.0:
+        raise ValueError(f"Invalid final_rank_weight={config.final_rank_weight}.")
+    if not math.isfinite(config.label_smoothing) or not 0.0 <= config.label_smoothing < 1.0:
+        raise ValueError(f"Invalid label_smoothing={config.label_smoothing}.")
+    _config.optimizer.validate(config.optimizer)
+    if config.optimizer.type != "adamw":
+        raise ValueError(
+            f"v2_trajectory requires optimizer.type='adamw', got {config.optimizer.type!r}."
+        )
+
+    if world_size >= 2 and not torch.distributed.is_initialized():
+        init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+
+    output_prefix = Path(HydraConfig.get().runtime.output_dir)
+    ckpt_dir = output_prefix / "snapshots"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path(config.spool_cache_dir) if config.spool_cache_dir is not None else (
+        output_prefix / "bc_spool_cache"
+    )
+
+    data_source = SpoolingRoundBCDataSource(
+        config.training_data,
+        cache_dir=cache_dir,
+        num_hash_buckets=int(config.spool_num_buckets),
+        max_bucket_bytes=int(config.spool_max_bucket_bytes),
+        max_rounds=config.max_rounds,
+        allow_unlabeled=bool(config.allow_unlabeled),
+        allow_incomplete=bool(config.allow_incomplete),
+        enable_early_shape_hint=bool(getattr(config.encoder, "enable_early_shape_hint", False)),
+    )
+    try:
+        model = TrajectoryBCModel(
+            preset=(getattr(config.encoder, "preset", None) or "custom"),
+            dimension=int(config.encoder.dimension),
+            num_heads=int(config.encoder.num_heads),
+            dim_feedforward=(
+                int(config.encoder.dim_feedforward)
+                if config.encoder.dim_feedforward is not None
+                else None
+            ),
+            n_d1_layers=int(config.encoder.n_d1_layers),
+            n_d2_layers=int(config.encoder.n_d2_layers),
+            use_rel_bias=bool(config.encoder.use_rel_bias),
+            cand_self_attn=bool(config.encoder.cand_self_attn),
+            head_type=str(config.encoder.head_type),
+            enable_early_shape_hint=bool(getattr(config.encoder, "enable_early_shape_hint", False)),
+            rope_base=float(config.encoder.rope_base),
+            use_next_event_head=bool(config.use_next_event_head),
+            next_event_weight=float(config.next_event_weight),
+            use_final_rank_head=bool(config.use_final_rank_head),
+            final_rank_weight=float(config.final_rank_weight),
+            label_smoothing=float(config.label_smoothing),
+            checkpointing=bool(config.checkpointing),
+            device=device,
+            dtype=dtype,
+        )
+        raw_model = model
+        train_model: nn.Module = model
+        if world_size >= 2:
+            if device.type == "cuda":
+                train_model = DistributedDataParallel(
+                    model, device_ids=[local_rank], output_device=local_rank
+                )
+            else:
+                train_model = DistributedDataParallel(model)
+
+        optimizer, scheduler = _config.optimizer.create(device.type, config.optimizer, raw_model)
+        validate_optimizer_parameter_coverage(
+            raw_model,
+            optimizer,
+            inactive_param_ids=_expected_inactive_bc_param_ids(raw_model),
+            context="run_v2_trajectory_bc",
+        )
+        recipe = raw_model.recipe(
+            data_sha256=data_source.data_sha256,
+            lr=float(config.optimizer.learning_rate),
+            weight_decay=float(config.optimizer.weight_decay),
+        )
+        arch_meta = {
+            "training_mode": "v2_trajectory",
+            "architecture": recipe["architecture"],
+            "preset": recipe["backbone"]["preset"],
+            "use_next_event_head": recipe["use_next_event_head"],
+            "use_final_rank_head": recipe["use_final_rank_head"],
+            "data_sha256": recipe["data_sha256"],
+            "world_size": world_size,
+        }
+
+        if rank == 0:
+            logging.info("Model type: behavioral cloning V2 trajectory (v2_trajectory)")
+            logging.info("Architecture: %s (preset=%s)", arch_meta["architecture"], arch_meta["preset"])
+            _config.device.dump(
+                world_size=world_size,
+                rank=rank,
+                local_rank=local_rank,
+                device=device,
+                dtype=dtype,
+                amp_dtype=amp_dtype,
+            )
+            logging.info("Spool cache dir: %s (%d rounds, %d games)", cache_dir, len(data_source), data_source.num_games)
+            _config.encoder.dump(config.encoder)
+            _config.optimizer.dump(config.optimizer)
+
+        tensorboard_path = output_prefix / "tensorboard"
+        if rank == 0:
+            tensorboard_path.mkdir(parents=True, exist_ok=True)
+        with (SummaryWriter(log_dir=tensorboard_path) if rank == 0 else ExitStack()) as summary_writer:
+            if rank == 0:
+                summary_writer.add_text("architecture/summary", json.dumps(arch_meta, sort_keys=True), 0)
+            result = train_trajectory_bc_steps(
+                train_model,  # type: ignore[arg-type]
+                data_source,
+                optimizer,
+                batch_size=int(config.batch_size),
+                max_steps=config.max_steps,
+                device=device,
+                amp_dtype=amp_dtype,
+                suit_augmentation=bool(config.suit_augmentation),
+                aug_seed=int(config.aug_seed),
+                sampler_seed=int(config.sampler_seed),
+                grad_clip=float(config.max_gradient_norm),
+                scheduler=scheduler,
+                ckpt_dir=ckpt_dir,
+                checkpoint_every=int(config.snapshot_interval),
+                resume_from=config.resume_from,
+                data_sha256=data_source.data_sha256,
+                grad_accum_steps=int(config.gradient_accumulation_steps),
+                prefetch_batches=int(config.prefetch_batches),
+                drop_last=bool(config.drop_last),
+            )
+            if rank == 0:
+                for k, v in result.get("metrics", {}).items():
+                    if math.isfinite(float(v)):
+                        summary_writer.add_scalar(f"bc_v2/{k}", float(v), int(result["step"]))
+                summary_writer.flush()
+
+        final_step = int(result["step"])
+        final_ckpt = ckpt_dir / f"traj-bc-{final_step}.pt"
+        need_final = [False]
+        if rank == 0:
+            need_final[0] = not final_ckpt.exists()
+        if world_size >= 2:
+            torch.distributed.broadcast_object_list(need_final, src=0)
+        if need_final[0]:
+            from kanachan.training.bc.trajectory_v2 import LengthBucketBatchSampler
+
+            final_sampler = LengthBucketBatchSampler(
+                list(data_source.round_event_lens),
+                batch_size=int(config.batch_size),
+                seed=int(config.sampler_seed),
+                rank=rank,
+                world_size=world_size,
+                drop_last=bool(config.drop_last),
+            )
+            if "sampler_state" in result:
+                final_sampler.load_state_dict(result["sampler_state"])
+            save_trajectory_bc_checkpoint(
+                ckpt_dir,
+                raw_model,
+                optimizer,
+                sampler=final_sampler,
+                step=final_step,
+                recipe=recipe,
+                scheduler=scheduler,
+                numerical_stats={
+                    "optimizer_steps": int(result["optimizer_steps"]),
+                    "skipped_steps": int(result["skipped_steps"]),
+                    "nonfinite_loss_steps": int(result["nonfinite_loss_steps"]),
+                    "nonfinite_grad_steps": int(result["nonfinite_grad_steps"]),
+                },
+            )
+        if rank == 0:
+            raw_model.dump_actor(ckpt_dir / "model.kanachan")
+        if world_size >= 2:
+            torch.distributed.barrier()
+        return result
+    finally:
+        data_source.close()
 
 
 def _training(
@@ -280,10 +503,16 @@ def _main(config: DictConfig) -> None:
         amp_dtype,
     ) = _config.device.validate(config)
 
+    training_mode = str(getattr(config, "training_mode", "single_step"))
+    if training_mode not in ("single_step", "v2_trajectory"):
+        raise ValueError(
+            f"Unknown BC training_mode={training_mode!r}; expected 'single_step' or 'v2_trajectory'."
+        )
+
     if not config.training_data.exists():
         errmsg = f"{config.training_data}: Does not exist."
         raise RuntimeError(errmsg)
-    if not config.training_data.is_file():
+    if training_mode == "single_step" and not config.training_data.is_file():
         errmsg = f"{config.training_data}: Not a file."
         raise RuntimeError(errmsg)
 
@@ -338,6 +567,18 @@ def _main(config: DictConfig) -> None:
         raise RuntimeError("num_workers must be a non-negative integer.")
 
     _config.encoder.validate(config.encoder)
+
+    if training_mode == "v2_trajectory":
+        run_v2_trajectory_bc(
+            config,
+            world_size=world_size,
+            rank=rank,
+            local_rank=local_rank,
+            device=device,
+            dtype=dtype,
+            amp_dtype=amp_dtype,
+        )
+        return
 
     _config.decoder.validate(config.decoder, config.encoder.dimension)
 
@@ -836,6 +1077,19 @@ def _main(config: DictConfig) -> None:
     tensorboard_path = output_prefix / "tensorboard"
     tensorboard_path.mkdir(parents=True, exist_ok=True)
     with SummaryWriter(log_dir=tensorboard_path) as summary_writer, ExitStack() as loader_resources:
+        if rank == 0:
+            summary_writer.add_text(
+                "architecture/summary",
+                json.dumps(
+                    {
+                        "training_mode": "single_step",
+                        "architecture": str(config.encoder.architecture),
+                        "preset": getattr(config.encoder, "preset", None),
+                    },
+                    sort_keys=True,
+                ),
+                0,
+            )
         data_loader_factory = None
         if config.candidate_feature_workers:
             from kanachan.training.core.bc.prefetch import CandidateFeaturePrefetch

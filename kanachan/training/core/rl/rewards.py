@@ -153,11 +153,23 @@ class RoundAndPlacementReward:
 
 
 def configured_reward(scheme="placement", *, shaping_model=None,
-                      score_unit=10000.0, round_weight=0.2):
+                      score_unit=10000.0, round_weight=0.2,
+                      grp=None):
     if scheme == "placement":
         return PlacementReward(shaping_model)
     if scheme == "round_and_placement":
-        if shaping_model is not None:
-            raise ValueError("Round rewards and EOR potential shaping are separate recipes.")
+        if shaping_model is not None or grp is not None:
+            raise ValueError("Round rewards and potential shaping are separate recipes.")
         return RoundAndPlacementReward(score_unit=score_unit, round_weight=round_weight)
+    if scheme == "grp_pbrs":
+        from kanachan.training.grp import FrozenGRP, FrozenGRPPBRSReward, load_frozen_grp
+
+        grp_obj = grp if grp is not None else shaping_model
+        if isinstance(grp_obj, (str, Path)):
+            grp_obj = load_frozen_grp(Path(grp_obj), require_gate=True)
+        if not isinstance(grp_obj, FrozenGRP):
+            raise ValueError(
+                "scheme='grp_pbrs' requires a verified FrozenGRP or checkpoint path via grp/shaping_model."
+            )
+        return FrozenGRPPBRSReward(grp_obj)
     raise ValueError(f"Unknown reward scheme: {scheme}")

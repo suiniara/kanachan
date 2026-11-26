@@ -30,7 +30,13 @@ from kanachan.structured_v2 import (
     TILE_FEATS_DIM,
     derive_structured_v2_batch,
 )
-from kanachan.training.core.optimizers import move_optimizer_state
+from kanachan.training.core.optimizers import (
+    OptimizerCoverageError,
+    dummy_ddp_zero_loss,
+    move_optimizer_state,
+    sync_ddp_step_status,
+    validate_optimizer_parameter_coverage,
+)
 from kanachan.training.grp import FrozenGRP
 from kanachan.training.online.state import atomic_save, capture_rng, cpu_state, restore_rng
 
@@ -161,6 +167,8 @@ def build_joint_iql_recipe(
         "iql": iql_cfg,
         "grp_sha256": grp.grp_sha256 if grp is not None else None,
         "ruleset_sha256": grp.ruleset_sha256 if grp is not None else None,
+        "grp_rank_payoffs": list(grp.rank_payoffs) if grp is not None else None,
+        "grp_calibration_report": dict(grp.calibration_report) if grp is not None else None,
         "data_sha256": data_sha256,
         "base_lr": float(base_lr),
         "weight_decay": float(weight_decay),
@@ -184,7 +192,14 @@ def build_joint_iql_optimizer(
         weight_decay=weight_decay,
         decoder1_lr_scale=decoder1_lr_scale,
     )
-    return torch.optim.AdamW(groups, fused=use_fused)
+    opt = torch.optim.AdamW(groups, fused=use_fused)
+    validate_optimizer_parameter_coverage(
+        module,
+        opt,
+        inactive_param_ids=module.static_inactive_param_ids(),
+        context="build_joint_iql_optimizer",
+    )
+    return opt
 
 
 def save_joint_iql_checkpoint(
@@ -198,8 +213,9 @@ def save_joint_iql_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
     grad_scaler: GradScaler | None = None,
     numerical_stats: dict[str, int] | None = None,
+    stream_state: Any | None = None,
 ) -> Path:
-    """Rank-0 exclusive checkpoint/actor write with per-rank RNG gather and error broadcast."""
+    """Rank-0 exclusive checkpoint/actor write with per-rank RNG/stream gather and error broadcast."""
     raw = module.module if isinstance(module, DistributedDataParallel) else module
     assert isinstance(raw, JointStructuredIQLModule)
     is_dist = dist.is_available() and dist.is_initialized()
@@ -209,9 +225,12 @@ def save_joint_iql_checkpoint(
     local_rng = capture_rng()
     if is_dist:
         rng_by_rank: list[Any] = [None] * world_size
+        stream_by_rank: list[Any] = [None] * world_size
         dist.all_gather_object(rng_by_rank, local_rng)
+        dist.all_gather_object(stream_by_rank, stream_state)
     else:
         rng_by_rank = [local_rng]
+        stream_by_rank = [stream_state]
 
     ckpt_path = ckpt_dir / f"joint-iql-{step}.pt"
     actor_path = ckpt_dir / f"model.{step}.kanachan"
@@ -235,6 +254,9 @@ def save_joint_iql_checkpoint(
                 else None,
                 "rng": rng_by_rank[0],
                 "rng_by_rank": rng_by_rank,
+                "stream_state_by_rank": stream_by_rank
+                if any(s is not None for s in stream_by_rank)
+                else None,
             }
             atomic_save(ckpt_path, payload)
             raw.dump_actor(actor_path)
@@ -259,8 +281,9 @@ def load_joint_iql_checkpoint(
     grad_scaler: GradScaler | None = None,
     map_location: torch.device | str = "cpu",
     stats_out: dict[str, int] | None = None,
+    stream_state_out: list[Any] | None = None,
 ) -> tuple[int, int]:
-    """Fail-closed restore preserving Target Q Polyak lag, DDP sync, and per-rank RNG."""
+    """Fail-closed restore preserving Target Q Polyak lag, DDP sync, and per-rank RNG/stream."""
     del map_location  # Load on CPU first, then place optimizer state beside module parameters.
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     if payload.get("recipe") != expected_recipe:
@@ -296,6 +319,14 @@ def load_joint_iql_checkpoint(
         if world_size > 1:
             raise ValueError("Multi-rank DDP resume requires per-rank 'rng_by_rank' state.")
         restore_rng(payload["rng"])
+
+    if stream_state_out is not None and payload.get("stream_state_by_rank") is not None:
+        ss_list = payload["stream_state_by_rank"]
+        if len(ss_list) != world_size:
+            raise ValueError(
+                f"Checkpoint world_size={len(ss_list)} does not match current world_size={world_size}."
+            )
+        stream_state_out[:] = [ss_list[rank]]
     return int(payload["step"]), int(payload["cursor"])
 
 
@@ -337,22 +368,7 @@ def _compute_grad_norm_and_nonfinite(
 
 def expected_inactive_iql_param_ids(module: JointStructuredIQLModule) -> set[int]:
     """Return parameter IDs statically bypassed by preset architecture flags."""
-    inactive: set[int] = set()
-    bb = module.backbone
-    if bb.head_type == "flat546":
-        inactive.update(
-            {
-                id(bb.decoder2.null_tile_emb),
-                id(bb.decoder2.null_source_emb),
-                id(bb.decoder2.action_type_emb.weight),
-            }
-        )
-    if bb.n_d1_layers == 0:
-        inactive.add(id(bb.tile_emb.red5_emb.weight))
-        for name, param in bb.decoder1.named_parameters():
-            if not name.startswith("disabled_d1_mem"):
-                inactive.add(id(param))
-    return inactive
+    return module.static_inactive_param_ids()
 
 
 def _validate_grad_scaler_optimizer_state(
@@ -447,22 +463,6 @@ def _grad_scaler_reset_optimizer_state(
         per_states.pop(id(optimizer), None)
 
 
-def _sync_ddp_fatal_code(
-    code: int,
-    *,
-    is_dist: bool,
-    world_size: int,
-    device: torch.device,
-) -> int:
-    """Agree on fatal training errors across all DDP ranks before entering collectives."""
-    if not (is_dist and world_size > 1):
-        return int(code)
-    sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
-    flag = torch.tensor([int(code)], device=sync_dev, dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-    return int(flag.item())
-
-
 def _collect_reachable_autograd_param_ids(loss: Tensor) -> tuple[set[int], bool]:
     """Walk `loss.grad_fn` with zero CUDA sync to find reachable `AccumulateGrad` parameters."""
     root = loss.grad_fn
@@ -512,7 +512,7 @@ def _optimizer_step_with_grad_scaler(
 
 def train_joint_iql_batches(
     module: JointStructuredIQLModule,
-    batches: Sequence[TensorDict],
+    batches: Sequence[TensorDict] | Any,
     optimizer: torch.optim.Optimizer,
     *,
     recipe: dict[str, Any],
@@ -530,18 +530,37 @@ def train_joint_iql_batches(
     max_nonfinite_steps: int | None = None,
     loss_transform: Callable[[Tensor, int], Tensor] | None = None,
     post_backward_hook: Callable[[torch.nn.Module, torch.optim.Optimizer, int], None] | None = None,
+    max_steps: int | None = None,
+    grad_accum_steps: int = 1,
 ) -> dict[str, Any]:
-    """Train JointStructuredIQLModule with strict autograd, DDP, and pre-update safety guards."""
+    """Train JointStructuredIQLModule with strict autograd, DDP, streaming, and pre-update safety guards."""
+    import contextlib
+
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1.")
+
     raw = module.module if isinstance(module, DistributedDataParallel) else module
     assert isinstance(raw, JointStructuredIQLModule)
     raw.sync_targets_ddp()
 
+    stream_grp = getattr(batches, "grp", None)
+    if stream_grp is not None:
+        if (
+            stream_grp.grp_sha256 != recipe.get("grp_sha256")
+            or stream_grp.ruleset_sha256 != recipe.get("ruleset_sha256")
+        ):
+            raise ValueError(
+                "StreamingIQLDataset FrozenGRP identity disagrees with Joint IQL recipe (Fail-Closed)."
+            )
+
     is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
     scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
 
+    is_stream = hasattr(batches, "next_batch")
     start_step = 0
     cursor = 0
     stats_restored: dict[str, int] = {}
+    stream_restored: list[Any] = []
     if resume_from is not None:
         start_step, cursor = load_joint_iql_checkpoint(
             resume_from,
@@ -552,10 +571,31 @@ def train_joint_iql_batches(
             grad_scaler=scaler,
             map_location=device,
             stats_out=stats_restored,
+            stream_state_out=stream_restored,
         )
+        if is_stream and stream_restored:
+            batches.load_state_dict(stream_restored[0])
 
     runner = ddp_wrapped if ddp_wrapped is not None else module
+    ddp_runner = isinstance(runner, DistributedDataParallel)
     runner.train()
+
+    inactive_ids = expected_inactive_iql_param_ids(raw)
+    validate_optimizer_parameter_coverage(
+        raw,
+        optimizer,
+        inactive_param_ids=inactive_ids,
+        context="train_joint_iql_batches",
+    )
+    expected_active_named = tuple(
+        (n, p)
+        for n, p in raw.named_parameters()
+        if p.requires_grad and id(p) not in inactive_ids
+    )
+    if not expected_active_named:
+        raise OptimizerCoverageError(
+            "[train_joint_iql_batches] No trainable parameters remain active in model/optimizer."
+        )
 
     is_dist = dist.is_available() and dist.is_initialized()
     world_size = dist.get_world_size() if is_dist else 1
@@ -569,6 +609,8 @@ def train_joint_iql_batches(
     )
     one_f32 = torch.ones((), device=device, dtype=torch.float32)
     zero_f32 = torch.zeros((), device=device, dtype=torch.float32)
+    zero_b = torch.zeros((), device=device, dtype=torch.bool)
+    one_b = torch.ones((), device=device, dtype=torch.bool)
     clip_f32 = torch.full((), float(max_grad_norm), device=device, dtype=torch.float32)
 
     optimizer_steps_t = torch.full(
@@ -583,6 +625,7 @@ def train_joint_iql_batches(
     nonfinite_grad_steps_t = torch.full(
         (), int(stats_restored.get("nonfinite_grad_steps", 0)), device=device, dtype=torch.int64
     )
+    fatal_steps_t = torch.zeros((), device=device, dtype=torch.int64)
 
     step = start_step
     last_metrics: dict[str, float] = {}
@@ -593,6 +636,7 @@ def train_joint_iql_batches(
         "nonfinite_grad_steps": int(stats_restored.get("nonfinite_grad_steps", 0)),
     }
     last_out: dict[str, Tensor] | None = None
+    last_fatal_msg = ""
 
     def _flush_metrics(out_map: dict[str, Tensor]) -> tuple[dict[str, float], dict[str, int]]:
         keys = list(out_map.keys())
@@ -602,16 +646,22 @@ def train_joint_iql_batches(
                 skipped_steps_t.double(),
                 nonfinite_loss_steps_t.double(),
                 nonfinite_grad_steps_t.double(),
+                fatal_steps_t.double(),
             ]
             + [out_map[k].detach().double() for k in keys]
         ).cpu().tolist()
+        if int(round(packed[4])) > 0:
+            raise RuntimeError(
+                last_fatal_msg
+                or "Fatal autograd/disconnected-graph error synchronized across DDP ranks."
+            )
         stats = {
             "optimizer_steps": int(round(packed[0])),
             "skipped_steps": int(round(packed[1])),
             "nonfinite_loss_steps": int(round(packed[2])),
             "nonfinite_grad_steps": int(round(packed[3])),
         }
-        metrics_f = {k: float(v) for k, v in zip(keys, packed[4:], strict=True)}
+        metrics_f = {k: float(v) for k, v in zip(keys, packed[5:], strict=True)}
         if max_nonfinite_steps is not None and stats["skipped_steps"] > int(max_nonfinite_steps):
             raise RuntimeError(
                 f"Exceeded max_nonfinite_steps={max_nonfinite_steps}: skipped={stats['skipped_steps']} "
@@ -620,203 +670,332 @@ def train_joint_iql_batches(
             )
         return metrics_f, stats
 
-    inactive_ids = expected_inactive_iql_param_ids(raw)
+    seq_len = len(batches) if (not is_stream and isinstance(batches, Sequence)) else None
+    seq_cursor = cursor
 
-    for idx in range(cursor, len(batches)):
-        batch = batches[idx].to(device=device, non_blocking=True)
-        optimizer.zero_grad(set_to_none=True)
-
-        active_trainable_named = [
-            (n, p)
-            for n, p in raw.named_parameters()
-            if p.requires_grad and id(p) not in inactive_ids
-        ]
-        opt_trainable_ids = {
-            id(p)
-            for g in optimizer.param_groups
-            for p in g["params"]
-            if p.requires_grad
-        }
-        pre_code = 0
-        pre_disconnected: list[str] = []
-        if not active_trainable_named or not opt_trainable_ids:
-            pre_code = 1
-            loss = None
-        else:
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_dtype or torch.float32,
-                enabled=bool(is_amp),
-                cache_enabled=False,
-            ):
-                out = runner(batch, amp_dtype=amp_dtype)
-                loss = out["loss"]
-                if loss_transform is not None:
-                    loss = loss_transform(loss, step)
-            if (
-                not isinstance(loss, Tensor)
-                or loss.numel() != 1
-                or not loss.requires_grad
-                or loss.grad_fn is None
-            ):
-                pre_code = 2
-            else:
-                reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
-                if not (reachable_ids & opt_trainable_ids):
-                    pre_code = 3
-                    pre_disconnected = ["<no optimizer parameters connected to loss>"]
-                elif not has_reentrant_ckpt:
-                    pre_disconnected = [
-                        n for n, p in active_trainable_named if id(p) not in reachable_ids
-                    ]
-                    if pre_disconnected:
-                        pre_code = 3
-
-        synced_pre = _sync_ddp_fatal_code(
-            pre_code, is_dist=is_dist, world_size=world_size, device=device
-        )
-        if synced_pre != 0:
-            optimizer.zero_grad(set_to_none=True)
-            _grad_scaler_reset_optimizer_state(scaler, optimizer)
-            suffix = " [propagated across DDP]" if (is_dist and world_size > 1 and pre_code == 0) else ""
-            if synced_pre == 1:
-                raise RuntimeError(
-                    f"No trainable parameters remain active in model/optimizer; aborting step{suffix}."
+    def _pull_microbatch() -> tuple[TensorDict | None, bool, bool]:
+        """Pull next microbatch and signal ``(batch, is_definite_end, any_rank_ghost)``."""
+        nonlocal seq_cursor
+        if is_stream:
+            b = batches.next_batch()
+            if b is None and max_steps is not None:
+                batches.reset_pass()
+                b = batches.next_batch()
+            if is_dist and world_size > 1:
+                sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
+                flags_t = torch.tensor(
+                    [1 if b is not None else 0, 1 if b is None else 0],
+                    device=sync_dev,
+                    dtype=torch.int32,
                 )
-            if synced_pre == 3:
-                raise RuntimeError(
-                    "Disconnected computation graph detected before backward: trainable parameters "
-                    f"not connected to loss ({pre_disconnected[:8]}{'...' if len(pre_disconnected) > 8 else ''}){suffix}."
-                )
-            raise RuntimeError(
-                "Training loss has no autograd graph (requires_grad=False or grad_fn is None); "
-                f"aborting before backward/optimizer update{suffix}."
-            )
+                dist.all_reduce(flags_t, op=dist.ReduceOp.MAX)
+                if int(flags_t[0].item()) == 0:
+                    return None, True, False
+                any_ghost_mb = int(flags_t[1].item()) > 0
+                if b is None:
+                    b = batches.ghost_batch()
+                seq_cursor += 1
+                return b, False, any_ghost_mb
+            if b is None:
+                return None, True, False
+            seq_cursor += 1
+            return b, False, False
 
-        assert isinstance(loss, Tensor)
-        loss_bad = (~torch.isfinite(loss.detach())).reshape(())
-        scaler.scale(loss).backward()
+        assert seq_len is not None
+        if seq_cursor >= seq_len:
+            if max_steps is None:
+                return None, True, False
+            seq_cursor = 0
+            if seq_len == 0:
+                return None, True, False
+        b = batches[seq_cursor]
+        seq_cursor += 1
+        at_seq_end = max_steps is None and seq_cursor >= seq_len
+        return b, at_seq_end, False
 
-        grads_on_opt = [
-            p for _, p in active_trainable_named if p.grad is not None and id(p) in opt_trainable_ids
-        ]
-        disconnected = [n for n, p in active_trainable_named if p.grad is None]
-        post_code = 1 if (not grads_on_opt or disconnected) else 0
-        synced_post = _sync_ddp_fatal_code(
-            post_code, is_dist=is_dist, world_size=world_size, device=device
-        )
-        if synced_post != 0:
-            optimizer.zero_grad(set_to_none=True)
-            _grad_scaler_reset_optimizer_state(scaler, optimizer)
-            suffix = " [propagated across DDP]" if (is_dist and world_size > 1 and post_code == 0) else ""
-            raise RuntimeError(
-                "Disconnected computation graph after backward: trainable parameters received "
-                f"no gradients ({disconnected[:8]}{'...' if len(disconnected) > 8 else ''}){suffix}."
-            )
+    try:
+        while max_steps is None or step < max_steps:
+            micro_group: list[TensorDict] = []
+            reached_end = False
+            any_ghost_group = False
+            for _ in range(int(grad_accum_steps)):
+                b, mb_end, mb_ghost = _pull_microbatch()
+                if b is None:
+                    reached_end = True
+                    break
+                micro_group.append(b)
+                any_ghost_group = any_ghost_group or mb_ghost
+                if mb_end:
+                    reached_end = True
+                    break
+            if not micro_group:
+                break
 
-        if post_backward_hook is not None:
-            post_backward_hook(runner, optimizer, step)
-        if scaler.is_enabled():
-            scaler.unscale_(optimizer)
+            local_w_sum = 0.0
+            any_bw_key = False
+            for bcpu in micro_group:
+                has_bw = "batch_weight" in bcpu.keys()
+                any_bw_key = any_bw_key or has_bw
+                bw = float(bcpu["batch_weight"].mean().item()) if has_bw else 1.0
+                local_w_sum += bw
 
-        params_with_grad: list[Tensor] = []
-        grads: list[Tensor] = []
-        for group in optimizer.param_groups:
-            for p in group["params"]:
-                if p.grad is not None:
-                    params_with_grad.append(p)
-                    grads.append(p.grad)
-
-        grad_norm, grad_bad = _compute_grad_norm_and_nonfinite(grads, device=device)
-        if scaler.is_enabled():
-            scaler_bad = _grad_scaler_detect_nonfinite(
-                scaler, optimizer, device=device, zero_f32=zero_f32
-            )
-            grad_bad = grad_bad | scaler_bad
-        step_bad = loss_bad | grad_bad
-
-        if is_dist and world_size > 1:
-            sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
-            flags_sync = torch.stack([loss_bad, grad_bad]).to(device=sync_dev, dtype=torch.int32)
-            dist.all_reduce(flags_sync, op=dist.ReduceOp.MAX)
-            flags_dev = (flags_sync > 0).to(device=device)
-            loss_bad = flags_dev[0]
-            grad_bad = flags_dev[1]
-            step_bad = loss_bad | grad_bad
-
-        if params_with_grad and max_grad_norm > 0.0:
-            safe_norm = torch.where(step_bad, clip_f32, grad_norm)
-            torch.nn.utils.clip_grads_with_norm_(
-                params_with_grad, float(max_grad_norm), safe_norm
-            )
-
-        if scaler.is_enabled():
-            _grad_scaler_inject_step_bad(scaler, optimizer, step_bad=step_bad, device=device)
-
-        if can_gpu_fused_guard:
-            if scaler.is_enabled():
-                _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
-                scaler.update()
+            if is_dist and world_size > 1 and (
+                int(grad_accum_steps) > 1 or any_ghost_group or ((not is_stream) and any_bw_key)
+            ):
+                sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
+                w_vec = torch.tensor([local_w_sum], device=sync_dev, dtype=torch.float64)
+                dist.all_reduce(w_vec, op=dist.ReduceOp.SUM)
+                global_w_sum = max(1e-8, float(w_vec.item()))
+                loss_scale: float | None = float(world_size) / global_w_sum
+            elif len(micro_group) > 1 or local_w_sum <= 0.0:
+                loss_scale = 1.0 / max(1e-8, local_w_sum) if local_w_sum > 0.0 else 0.0
             else:
-                found_inf_f32 = step_bad.to(dtype=torch.float32)
-                optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
-                optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
-                try:
-                    optimizer.step()
-                finally:
-                    if hasattr(optimizer, "grad_scale"):
-                        del optimizer.grad_scale  # type: ignore[attr-defined]
-                    if hasattr(optimizer, "found_inf"):
-                        del optimizer.found_inf  # type: ignore[attr-defined]
-            raw.update_targets(valid=~step_bad)
-        else:
-            bad_host = bool(step_bad.item())
-            if not bad_host:
+                loss_scale = None
+
+            optimizer.zero_grad(set_to_none=True)
+
+            local_fatal = False
+            skipped_forward = bool(last_fatal_msg)
+            last_forward_armed_reducer = False
+            local_fatal_msg = last_fatal_msg
+            loss_bad = zero_b
+            out: dict[str, Tensor] = last_out if last_out is not None else {}
+
+            if skipped_forward:
+                local_fatal = True
+            else:
+                for m_idx, batch_cpu in enumerate(micro_group):
+                    batch = batch_cpu.to(device=device, non_blocking=True)
+                    is_last_micro = m_idx == len(micro_group) - 1
+                    sync_ctx = (
+                        runner.no_sync()
+                        if (ddp_runner and not is_last_micro)
+                        else contextlib.nullcontext()
+                    )
+                    if not ddp_runner or is_last_micro:
+                        with torch.autocast(
+                            device_type=device.type,
+                            dtype=amp_dtype or torch.float32,
+                            enabled=bool(is_amp),
+                            cache_enabled=False,
+                        ):
+                            out = runner(batch, amp_dtype=amp_dtype, loss_scale=loss_scale)
+                        if ddp_runner:
+                            last_forward_armed_reducer = True
+                    else:
+                        with sync_ctx, torch.autocast(
+                            device_type=device.type,
+                            dtype=amp_dtype or torch.float32,
+                            enabled=bool(is_amp),
+                            cache_enabled=False,
+                        ):
+                            out = runner(batch, amp_dtype=amp_dtype, loss_scale=loss_scale)
+                    loss = out["loss"]
+                    if loss_transform is not None:
+                        loss = loss_transform(loss, step)
+
+                    if (
+                        not isinstance(loss, Tensor)
+                        or loss.numel() != 1
+                        or not loss.requires_grad
+                        or loss.grad_fn is None
+                    ):
+                        local_fatal = True
+                        local_fatal_msg = (
+                            "Training loss has no autograd graph (requires_grad=False or grad_fn is None); "
+                            "aborting before backward/optimizer update."
+                        )
+                        break
+
+                    reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
+                    opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
+                    if not opt_reach:
+                        local_fatal = True
+                        local_fatal_msg = (
+                            "Disconnected computation graph detected before backward: trainable parameters "
+                            "not connected to loss (<no optimizer parameters connected to loss>)."
+                        )
+                        break
+                    if not has_reentrant_ckpt:
+                        pre_disc = [
+                            n for n, p in expected_active_named if id(p) not in reachable_ids
+                        ]
+                        if pre_disc:
+                            local_fatal = True
+                            local_fatal_msg = (
+                                "Disconnected computation graph detected before backward: trainable parameters "
+                                f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                            )
+                            break
+
+                    loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
+                    with sync_ctx:
+                        scaler.scale(loss).backward()
+
+            if local_fatal:
+                last_fatal_msg = local_fatal_msg
+                optimizer.zero_grad(set_to_none=True)
+                if not (is_dist and world_size > 1):
+                    _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                    raise RuntimeError(local_fatal_msg)
+                # Participate in DDP Reducer AllReduce cleanly via zero-grad dummy backward.
+                dummy_ddp_zero_loss(
+                    runner, device, prepare_reducer=(ddp_runner and not last_forward_armed_reducer)
+                ).backward()
+                loss_bad = zero_b
+                grad_bad = zero_b
+                grad_norm = zero_f32
+                params_with_grad: list[Tensor] = []
+            else:
+                post_disc = [n for n, p in expected_active_named if p.grad is None]
+                if post_disc:
+                    local_fatal = True
+                    local_fatal_msg = (
+                        "Disconnected computation graph after backward: trainable parameters received "
+                        f"no gradients ({post_disc[:8]}{'...' if len(post_disc) > 8 else ''})."
+                    )
+                    last_fatal_msg = local_fatal_msg
+                    if not (is_dist and world_size > 1):
+                        optimizer.zero_grad(set_to_none=True)
+                        _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                        raise RuntimeError(local_fatal_msg)
+                    loss_bad = zero_b
+                    grad_bad = zero_b
+                    grad_norm = zero_f32
+                    params_with_grad = []
+                else:
+                    if post_backward_hook is not None:
+                        post_backward_hook(runner, optimizer, step)
+                    if scaler.is_enabled():
+                        scaler.unscale_(optimizer)
+
+                    params_with_grad = []
+                    grads: list[Tensor] = []
+                    for group in optimizer.param_groups:
+                        for p in group["params"]:
+                            if p.grad is not None:
+                                params_with_grad.append(p)
+                                grads.append(p.grad)
+
+                    grad_norm, grad_bad = _compute_grad_norm_and_nonfinite(grads, device=device)
+                    if scaler.is_enabled():
+                        scaler_bad = _grad_scaler_detect_nonfinite(
+                            scaler, optimizer, device=device, zero_f32=zero_f32
+                        )
+                        grad_bad = grad_bad | scaler_bad
+
+            fatal_any, loss_bad, grad_bad = sync_ddp_step_status(
+                one_b if local_fatal else zero_b,
+                loss_bad,
+                grad_bad,
+                is_dist=is_dist,
+                world_size=world_size,
+                device=device,
+            )
+            step_bad = loss_bad | grad_bad | fatal_any
+
+            if not can_gpu_fused_guard:
+                fatal_host, bad_host = torch.stack([fatal_any, step_bad]).cpu().tolist()
+                if fatal_host:
+                    optimizer.zero_grad(set_to_none=True)
+                    _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                    suffix = (
+                        " [propagated across DDP]"
+                        if (is_dist and world_size > 1 and not local_fatal)
+                        else ""
+                    )
+                    raise RuntimeError(
+                        (last_fatal_msg or "Fatal autograd/disconnected-graph error detected") + suffix
+                    )
+                if params_with_grad and max_grad_norm > 0.0:
+                    safe_norm = torch.where(step_bad, clip_f32, grad_norm)
+                    torch.nn.utils.clip_grads_with_norm_(
+                        params_with_grad, float(max_grad_norm), safe_norm
+                    )
                 if scaler.is_enabled():
+                    _grad_scaler_inject_step_bad(scaler, optimizer, step_bad=step_bad, device=device)
+                if not bad_host:
+                    if scaler.is_enabled():
+                        _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    if scheduler is not None:
+                        scheduler.step()
+                    raw.update_targets()
+                elif scaler.is_enabled():
+                    scaler.update()
+                count_bad = step_bad
+            else:
+                fatal_steps_t.add_(fatal_any.to(dtype=torch.int64))
+                sticky_bad = step_bad | (fatal_steps_t > 0)
+                if params_with_grad and max_grad_norm > 0.0:
+                    safe_norm = torch.where(sticky_bad, clip_f32, grad_norm)
+                    torch.nn.utils.clip_grads_with_norm_(
+                        params_with_grad, float(max_grad_norm), safe_norm
+                    )
+                if scaler.is_enabled():
+                    _grad_scaler_inject_step_bad(
+                        scaler, optimizer, step_bad=sticky_bad, device=device
+                    )
                     _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
                     scaler.update()
                 else:
-                    optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
-                raw.update_targets()
-            elif scaler.is_enabled():
-                scaler.update()
+                    found_inf_f32 = sticky_bad.to(dtype=torch.float32)
+                    optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
+                    optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
+                    try:
+                        optimizer.step()
+                    finally:
+                        if hasattr(optimizer, "grad_scale"):
+                            del optimizer.grad_scale  # type: ignore[attr-defined]
+                        if hasattr(optimizer, "found_inf"):
+                            del optimizer.found_inf  # type: ignore[attr-defined]
+                raw.update_targets(valid=~sticky_bad)
+                count_bad = sticky_bad
 
-        optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
 
-        step += 1
-        cursor = idx + 1
-        last_out = out
-        step_bad_i = step_bad.to(dtype=torch.int64)
-        skipped_steps_t.add_(step_bad_i)
-        optimizer_steps_t.add_(1 - step_bad_i)
-        nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
-        nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
+            step += 1
+            cursor = seq_cursor
+            last_out = out
+            step_bad_i = count_bad.to(dtype=torch.int64)
+            skipped_steps_t.add_(step_bad_i)
+            optimizer_steps_t.add_(1 - step_bad_i)
+            nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
+            nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
 
-        need_ckpt = ckpt_dir is not None and checkpoint_every > 0 and step % checkpoint_every == 0
-        need_sync = (
-            device.type == "cpu"
-            or idx == len(batches) - 1
-            or need_ckpt
-            or (check_finite_interval > 0 and step % check_finite_interval == 0)
-            or (log_interval > 0 and step % log_interval == 0)
-        )
-        if need_sync:
-            last_metrics, last_stats = _flush_metrics(out)
-        if need_ckpt:
-            assert ckpt_dir is not None
-            save_joint_iql_checkpoint(
-                ckpt_dir,
-                raw,
-                optimizer,
-                step=step,
-                cursor=cursor,
-                recipe=recipe,
-                scheduler=scheduler,
-                grad_scaler=scaler,
-                numerical_stats=last_stats,
+            at_end = (max_steps is not None and step >= max_steps) or reached_end
+            need_ckpt = ckpt_dir is not None and checkpoint_every > 0 and step % checkpoint_every == 0
+            need_sync = (
+                device.type == "cpu"
+                or at_end
+                or need_ckpt
+                or (check_finite_interval > 0 and step % check_finite_interval == 0)
+                or (log_interval > 0 and step % log_interval == 0)
             )
+            if need_sync:
+                last_metrics, last_stats = _flush_metrics(out)
+            if need_ckpt:
+                assert ckpt_dir is not None
+                cur_stream_state = batches.state_dict() if is_stream else None
+                save_joint_iql_checkpoint(
+                    ckpt_dir,
+                    raw,
+                    optimizer,
+                    step=step,
+                    cursor=cursor,
+                    recipe=recipe,
+                    scheduler=scheduler,
+                    grad_scaler=scaler,
+                    numerical_stats=last_stats,
+                    stream_state=cur_stream_state,
+                )
+            if reached_end and max_steps is None:
+                break
+    finally:
+        if is_stream and hasattr(batches, "_stop_prefetcher"):
+            batches._stop_prefetcher(rollback_queued=True)
 
     if last_out is not None and not last_metrics:
         last_metrics, last_stats = _flush_metrics(last_out)

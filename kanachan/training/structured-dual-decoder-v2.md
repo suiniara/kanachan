@@ -480,8 +480,10 @@ flowchart TB
      - `tile34_loss`（35 类 CE 含 `NONE=34`，权重 `w_tile = 1.0`）；
      - `tedashi_loss`（2 类 CE，**严格仅在 `next_event_type == DAHAI` 的位置计损**，权重 `w_tedashi = 0.5`）；
    - 当批内最大事件长度 `L_ev < 2` 时，返回与输出头乘 `0.0` 相连的零标量张量，确保 DDP `all_reduce` 永不挂起。
-3. **可选辅助头 2：`FinalRankHead`（复用 `kanachan/training/core/final_rank.py`）**：
-   - 仅在整局完整轨迹上启用，按每位观察者半庄总步数线性赋权 $w_t = T_{\text{ref}} / T_{\text{player}}$ 全局归一，保持梯度累积与多卡 DDP 数学等价。
+3. **可选辅助头 2：`FinalRankHead`（复用 `kanachan/training/core/final_rank.py` 终局顺位规则）**：
+   - 仅在完整标注半庄轨迹上启用：对每位观察者在整场半庄中的总决策步数 $T_{\text{player}}$，按每步权重 $w_t = T_{\text{ref}} / T_{\text{player}}$（$T_{\text{ref}} = 10.0$；单小局合成样本无跨局计数时退化为 $T_{\text{player}} = T_{\text{round}}$）以加权和除以有效权重和全局归一化：
+     $$\mathcal{L}_{\text{rank}} = \frac{\sum_{t \in \text{valid}} w_t \cdot \operatorname{CE}(r_{\text{logits}}(h_{\text{val},t}),\, y_{\text{rank},t})}{\max(\epsilon,\, \sum_{t \in \text{valid}} w_t)}$$
+     使得每局每个观察者无论实际出手步数多少，对终局顺位辅助头的总梯度权重恒为 $T_{\text{ref}}$，并通过跨梯度累积微批与多卡 DDP 的全局分母归约保持数学等价。
 4. **9 类动作家族拆分验证指标（防止 85% 弃牌淹没关键决策质量）**：
    - 验证集除汇总 `val_nll` 与 `val_top1_acc`（仅统计 $K \ge 2$）外，强制按 9 个动作家族分别输出样本数、NLL 与 Top-1 准确率：`DISCARD_DAMA`, `DISCARD_RIICHI`, `CHI`, `PON`, `KAN (ANKAN/KAKAN/DAIMINKAN)`, `TSUMO`, `RON`, `SKIP/PASS`, `KYUSHU`。
 5. **预更新数值安全与优化步守卫**：在 `train_trajectory_bc_steps` 与 `train_joint_iql_batches` 中，**所有优化器更新、梯度裁剪、Target Q EMA 与学习率调度之前**必须校验 loss 与梯度（FP32 模长归约 + `GradScaler` `found_inf` 汇总 + DDP `ReduceOp.MAX` 跨卡同步）。在 CUDA Fused AdamW 且无 `scheduler` 时，通过张量化 `grad_scale / found_inf` 注入与 `update_targets(valid=~step_bad)` 实现**零主机同步**原位屏蔽；非 fused / CPU / 启用调度器路径则在步前检查并跳过 `optimizer.step()` / `scheduler.step()` / Target EMA（同时正确触发 `GradScaler.update()` 回退尺度），杜绝 NaN/Inf 污染在线与目标权重，并持久记录 `optimizer_steps / skipped_steps / nonfinite_loss_steps / nonfinite_grad_steps`。 gradient 裁剪前用 `safe_norm` 替换非有限范数防 `0 * Inf` 传播，梯度累积末尾不足 `grad_accum_steps` 的残余微批按 `grad_accum_steps / accum_counter` 精确重缩梯度。

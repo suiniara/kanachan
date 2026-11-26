@@ -29,6 +29,26 @@ class Config:
     snapshot_interval: int = 0
     candidate_feature_workers: int = 0
     candidate_prefetch_batches: int = 8
+    # Structured V2 trajectory training options (used when training_mode="v2_trajectory")
+    training_mode: str = "single_step"
+    use_next_event_head: bool = False
+    next_event_weight: float = 0.20
+    use_final_rank_head: bool = False
+    final_rank_weight: float = 0.0
+    label_smoothing: float = 0.0
+    suit_augmentation: bool = False
+    aug_seed: int = 1337
+    sampler_seed: int = 42
+    spool_cache_dir: Path | None = None
+    spool_num_buckets: int = 64
+    spool_max_bucket_bytes: int = 67108864
+    max_steps: int | None = None
+    max_rounds: int | None = None
+    allow_unlabeled: bool = False
+    allow_incomplete: bool = False
+    prefetch_batches: int = 2
+    drop_last: bool = False
+    resume_from: Path | None = None
     defaults: list[Any] = field(default_factory=lambda: [
         {"device": "cuda"},
         {"encoder": "bert_base"},
@@ -51,3 +71,19 @@ class DecisionConfig(Config):
 
 
 config_store.store(name="decision", node=DecisionConfig)
+
+
+@dataclass
+class TrajectoryV2Config(Config):
+    training_mode: str = "v2_trajectory"
+    batch_size: int = 16
+    defaults: list[Any] = field(default_factory=lambda: [
+        {"device": "cuda"},
+        {"encoder": "v2_base"},
+        {"decoder": "global_actions"},
+        {"optimizer": "adamw"},
+        "_self_",
+    ])
+
+
+config_store.store(name="v2_trajectory", node=TrajectoryV2Config)

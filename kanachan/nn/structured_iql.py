@@ -403,6 +403,7 @@ class JointStructuredIQLModule(nn.Module):
         cand_self_attn: bool = True,
         head_type: str | None = None,
         enable_early_shape_hint: bool = False,
+        rope_base: float = 10000.0,
         checkpointing: bool = False,
         final_rank: bool = False,
         final_rank_weight: float = 0.0,
@@ -435,6 +436,7 @@ class JointStructuredIQLModule(nn.Module):
             cand_self_attn=cand_self_attn,
             head_type=head_type,
             enable_early_shape_hint=enable_early_shape_hint,
+            rope_base=rope_base,
             checkpointing=checkpointing,
             device=device,
             dtype=dtype,
@@ -607,6 +609,29 @@ class JointStructuredIQLModule(nn.Module):
         if self.value_head.final_rank is not None:
             self.value_head.final_rank.requires_grad_(self.final_rank_weight > 0.0)
 
+        for p in self.parameters():
+            if id(p) in self.static_inactive_param_ids():
+                p.requires_grad_(False)
+
+    def static_inactive_param_ids(self) -> set[int]:
+        """Return parameter IDs statically bypassed by preset architecture flags."""
+        inactive: set[int] = set()
+        bb = self.backbone
+        if bb.head_type == "flat546":
+            inactive.update(
+                {
+                    id(bb.decoder2.null_tile_emb),
+                    id(bb.decoder2.null_source_emb),
+                    id(bb.decoder2.action_type_emb.weight),
+                }
+            )
+        if bb.n_d1_layers == 0:
+            inactive.add(id(bb.tile_emb.red5_emb.weight))
+            for name, param in bb.decoder1.named_parameters():
+                if not name.startswith("disabled_d1_mem"):
+                    inactive.add(id(param))
+        return inactive
+
     def parameter_groups(
         self,
         *,
@@ -704,6 +729,7 @@ class JointStructuredIQLModule(nn.Module):
         batch: TensorDict | dict[str, Tensor],
         *,
         amp_dtype: torch.dtype | None = None,
+        loss_scale: float | Tensor | None = None,
     ) -> dict[str, Tensor]:
         device = next(self.parameters()).device
         is_amp = (
@@ -874,6 +900,15 @@ class JointStructuredIQLModule(nn.Module):
                 )
                 loss_total = loss_total + loss_qr
                 qr_metrics["loss_qr_cql"] = loss_qr.detach()
+
+            scale_t = torch.ones((), device=loss_total.device, dtype=torch.float32)
+            if "batch_weight" in batch:
+                scale_t = scale_t * batch["batch_weight"].float().mean().reshape(()).to(device=loss_total.device)
+            if loss_scale is not None:
+                scale_t = scale_t * torch.as_tensor(
+                    loss_scale, device=loss_total.device, dtype=torch.float32
+                ).reshape(())
+            loss_total = loss_total * scale_t
 
             # AWR diagnostics (pure tensorized, zero CUDA sync)
             w_masked = torch.where(has_choice, weights, torch.zeros_like(weights))

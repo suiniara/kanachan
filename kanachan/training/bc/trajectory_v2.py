@@ -55,7 +55,14 @@ from kanachan.structured_v2 import (
     permute_structured_batch,
 )
 from kanachan.training.core.features import validate_sparse_prefix
-from kanachan.training.core.optimizers import adamw_parameter_groups, move_optimizer_state
+from kanachan.training.core.optimizers import (
+    OptimizerCoverageError,
+    adamw_parameter_groups,
+    dummy_ddp_zero_loss,
+    move_optimizer_state,
+    sync_ddp_step_status,
+    validate_optimizer_parameter_coverage,
+)
 from kanachan.training.core.ranking import scores_to_ranks
 from kanachan.training.online.state import atomic_save, capture_rng, cpu_state, restore_rng
 
@@ -86,6 +93,9 @@ def classify_action_id(global_id: int) -> str:
     raise ValueError(f"Unexpected action type {atype} for global action ID {gid}")
 
 
+FINAL_RANK_T_REF: float = 10.0
+
+
 @dataclass
 class RoundTrajectory:
     """One complete observer round grouped from decision steps."""
@@ -103,6 +113,9 @@ class RoundTrajectory:
     candidates: Tensor  # [T, 32] int32
     action_idx: Tensor  # [T] int64
     final_rank: Tensor | None = None  # [T] int64 (-1 if unlabeled)
+    observer_total_steps: int | None = None
+    uuid: str = ""
+    observer_seat: int = 0
 
 
 def _open_tsv(path: Path):
@@ -537,16 +550,16 @@ def _validate_games_completeness(
                     )
 
 
-def parse_bc_rounds(
-    path: Path,
+def _validate_and_stage_bc_lines(
+    line_iter: Iterable[tuple[int, str]],
     *,
-    max_rounds: int | None = None,
-    max_lines: int | None = None,
-    enable_early_shape_hint: bool = False,
     allow_unlabeled: bool = False,
     allow_incomplete: bool = False,
-) -> list[RoundTrajectory]:
-    """Read source-v3 BC TSV/TSV.GZ lines, validate isolation/completeness, and group rounds."""
+    enable_early_shape_hint: bool = False,
+    max_rounds: int | None = None,
+    derive_full_v2: bool = True,
+) -> tuple[list[Any], bool | None, int]:
+    """Parse, isolate by UUID, validate completeness, order steps, and build BC round items."""
     raw_groups: list[
         tuple[
             tuple[Any, ...],
@@ -574,95 +587,92 @@ def parse_bc_rounds(
         ]
     ] = []
 
-    with _open_tsv(path) as fp:
-        for line_no, line in enumerate(fp):
-            if max_lines is not None and line_no >= max_lines:
-                break
-            uuid, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len = _parse_bc_line_full(
-                line, allow_unlabeled=allow_unlabeled, line_no=line_no + 1
+    for line_no, line in line_iter:
+        uuid, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len = _parse_bc_line_full(
+            line, allow_unlabeled=allow_unlabeled, line_no=line_no
+        )
+        seat = sp[SEAT_INDEX] - SEAT_OFFSET
+        chang = sp[7] - 75
+        ju = sp[8] - 78
+        l_ctx = f"line {line_no} (uuid={uuid}, round=({chang}, {ju}, {nu[0]}))"
+
+        is_labeled = final_scores is not None
+        if seen_labeled is None:
+            seen_labeled = is_labeled
+        elif seen_labeled != is_labeled:
+            raise ValueError(
+                f"{l_ctx}: Mixed 6-column unlabeled and 8-column labeled rows."
             )
-            seat = sp[SEAT_INDEX] - SEAT_OFFSET
-            chang = sp[7] - 75
-            ju = sp[8] - 78
-            l_ctx = f"line {line_no + 1} (uuid={uuid}, round=({chang}, {ju}, {nu[0]}))"
 
-            is_labeled = final_scores is not None
-            if seen_labeled is None:
-                seen_labeled = is_labeled
-            elif seen_labeled != is_labeled:
+        if not 0 <= seat < 4 or not 0 <= chang < 3 or not 0 <= ju < 4:
+            raise ValueError(f"{l_ctx}: Invalid observer seat/chang/ju.")
+
+        meta = (sp[0], sp[1])
+        if uuid in game_meta:
+            if game_meta[uuid] != meta:
                 raise ValueError(
-                    f"{l_ctx}: Mixed 6-column unlabeled and 8-column labeled rows."
+                    f"{l_ctx}: Inconsistent room/mode {game_meta[uuid]} vs {meta}."
                 )
+        else:
+            game_meta[uuid] = meta
 
-            if not 0 <= seat < 4 or not 0 <= chang < 3 or not 0 <= ju < 4:
-                raise ValueError(f"{l_ctx}: Invalid observer seat/chang/ju.")
+        if uuid in scores_by_game:
+            if scores_by_game[uuid] != final_scores:
+                raise ValueError(
+                    f"{l_ctx}: Inconsistent final_game_scores for seat {seat}: "
+                    f"{scores_by_game[uuid]} vs {final_scores}."
+                )
+        else:
+            scores_by_game[uuid] = final_scores
 
-            meta = (sp[0], sp[1])
-            if uuid in game_meta:
-                if game_meta[uuid] != meta:
-                    raise ValueError(
-                        f"{l_ctx}: Inconsistent room/mode {game_meta[uuid]} vs {meta}."
-                    )
+        if rs_raw is not None and res_raw is not None:
+            phys_key = (uuid, chang, ju, nu[0])
+            pinfo = phys_rounds.get(phys_key)
+            step_table_ok = (nu[2] + nu[3] + nu[4] + nu[5] + 1000 * nu[1]) == 100000
+            if pinfo is None:
+                pinfo = {
+                    "rs_raw": rs_raw,
+                    "results": res_raw,
+                    "all_prs": [],
+                    "seat_prs": {},
+                    "seat_actions_at_max": {},
+                    "min_left": sp[9] - 82,
+                    "init_nu": tuple(nu) if pr_len == 1 else None,
+                    "table_sum_ok": step_table_ok,
+                }
+                phys_rounds[phys_key] = pinfo
             else:
-                game_meta[uuid] = meta
-
-            if uuid in scores_by_game:
-                if scores_by_game[uuid] != final_scores:
-                    raise ValueError(
-                        f"{l_ctx}: Inconsistent final_game_scores for seat {seat}: "
-                        f"{scores_by_game[uuid]} vs {final_scores}."
-                    )
-            else:
-                scores_by_game[uuid] = final_scores
-
-            if rs_raw is not None and res_raw is not None:
-                phys_key = (uuid, chang, ju, nu[0])
-                pinfo = phys_rounds.get(phys_key)
-                step_table_ok = (nu[2] + nu[3] + nu[4] + nu[5] + 1000 * nu[1]) == 100000
-                if pinfo is None:
-                    pinfo = {
-                        "rs_raw": rs_raw,
-                        "results": res_raw,
-                        "all_prs": [],
-                        "seat_prs": {},
-                        "seat_actions_at_max": {},
-                        "min_left": sp[9] - 82,
-                        "init_nu": tuple(nu) if pr_len == 1 else None,
-                        "table_sum_ok": step_table_ok,
-                    }
-                    phys_rounds[phys_key] = pinfo
-                else:
-                    if not step_table_ok:
-                        pinfo["table_sum_ok"] = False
-                    if pr_len == 1:
-                        if pinfo["init_nu"] is None:
-                            pinfo["init_nu"] = tuple(nu)
-                        elif pinfo["init_nu"] != tuple(nu):
-                            raise ValueError(
-                                f"{l_ctx}: Conflicting initial numeric state at progression=(0,): "
-                                f"{pinfo['init_nu']} vs {tuple(nu)}."
-                            )
-                    if (not allow_incomplete) and (
-                        pinfo["rs_raw"] != rs_raw or pinfo["results"] != res_raw
-                    ):
+                if not step_table_ok:
+                    pinfo["table_sum_ok"] = False
+                if pr_len == 1:
+                    if pinfo["init_nu"] is None:
+                        pinfo["init_nu"] = tuple(nu)
+                    elif pinfo["init_nu"] != tuple(nu):
                         raise ValueError(
-                            f"{l_ctx}: Conflicting round_summary/results within physical round."
+                            f"{l_ctx}: Conflicting initial numeric state at progression=(0,): "
+                            f"{pinfo['init_nu']} vs {tuple(nu)}."
                         )
-                pr_tuple = tuple(pr[:pr_len])
-                pinfo["all_prs"].append(pr_tuple)
-                pinfo["seat_prs"].setdefault(seat, set()).add(pr_tuple)
-                pinfo["min_left"] = min(int(pinfo["min_left"]), int(sp[9] - 82))
+                if (not allow_incomplete) and (
+                    pinfo["rs_raw"] != rs_raw or pinfo["results"] != res_raw
+                ):
+                    raise ValueError(
+                        f"{l_ctx}: Conflicting round_summary/results within physical round."
+                    )
+            pr_tuple = tuple(pr[:pr_len])
+            pinfo["all_prs"].append(pr_tuple)
+            pinfo["seat_prs"].setdefault(seat, set()).add(pr_tuple)
+            pinfo["min_left"] = min(int(pinfo["min_left"]), int(sp[9] - 82))
 
-            key = (uuid, sp[SEAT_INDEX], sp[7], sp[8], nu[0])
-            idx = index_by_key.get(key)
-            if idx is None:
-                idx = len(index_by_key)
-                index_by_key[key] = idx
-                raw_groups.append((key, []))
-            parsed_rows.append((key, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len))
+        key = (uuid, sp[SEAT_INDEX], sp[7], sp[8], nu[0])
+        idx = index_by_key.get(key)
+        if idx is None:
+            idx = len(index_by_key)
+            index_by_key[key] = idx
+            raw_groups.append((key, []))
+        parsed_rows.append((key, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len))
 
     if not parsed_rows:
-        return []
+        return [], seen_labeled, 0
     if not allow_incomplete and seen_labeled is False:
         first_ctx = _format_round_key_ctx(parsed_rows[0][0])
         raise ValueError(
@@ -670,7 +680,6 @@ def parse_bc_rounds(
             "with round_summary and results."
         )
 
-    # Record each seat's chosen action at that physical round's longest progression for trailing win checks
     if phys_rounds:
         max_len_by_phys = {
             pk: max(len(x) for x in pinfo["all_prs"]) for pk, pinfo in phys_rounds.items()
@@ -686,7 +695,6 @@ def parse_bc_rounds(
     if not allow_incomplete:
         _validate_games_completeness(game_meta, phys_rounds)
 
-    # Compute native tie-broken final_rank via scores_to_ranks for all labeled rows
     labeled_idx = [i for i, r in enumerate(parsed_rows) if r[6] is not None]
     computed_ranks: dict[int, int] = {}
     if labeled_idx:
@@ -705,7 +713,8 @@ def parse_bc_rounds(
         final_rank = computed_ranks.get(row_idx, -1)
         raw_groups[g_idx][1].append((sp, nu, pr, ca, act, final_rank, rs_raw or (), pr_len))
 
-    rounds: list[RoundTrajectory] = []
+    staged: list[tuple[Any, ...]] = []
+    obs_step_totals: dict[tuple[str, int], int] = {}
     for key, steps in raw_groups:
         sp_t = torch.tensor([s[0] for s in steps], dtype=torch.int32)
         nu_t = torch.tensor([s[1] for s in steps], dtype=torch.int32)
@@ -713,6 +722,7 @@ def parse_bc_rounds(
         ca_t = torch.tensor([s[3] for s in steps], dtype=torch.int32)
         act_t = torch.tensor([s[4] for s in steps], dtype=torch.long)
         rk_vals = [s[5] for s in steps]
+        pr_lens_raw = [s[7] for s in steps]
 
         feats = derive_structured_v2_batch(
             sp_t, nu_t, pr_t, ca_t,
@@ -724,31 +734,98 @@ def parse_bc_rounds(
         ev_lens = feats["v2_event_len"]
         last_i = order[-1]
         l_r = int(ev_lens[last_i].item())
-        r_events = feats["v2_events"][last_i, :l_r].clone()
         rk_sub = [rk_vals[i] for i in order]
         has_lab = [r >= 0 for r in rk_sub]
         if any(has_lab) and not all(has_lab):
             raise ValueError(f"{_format_round_key_ctx(key)}: Round group mixes labeled and unlabeled steps.")
-        rk_t = torch.tensor(rk_sub, dtype=torch.long) if all(has_lab) else None
-        rounds.append(
-            RoundTrajectory(
-                round_events=r_events,
-                round_event_len=l_r,
-                decision_event_len=ev_lens[sub_idx].to(torch.int32),
-                v2_tile_feats=feats["v2_tile_feats"][sub_idx],
-                v2_global_feats=feats["v2_global_feats"][sub_idx],
-                v2_player_feats=feats["v2_player_feats"][sub_idx],
-                v2_cand_ids=feats["v2_cand_ids"][sub_idx],
-                v2_cand_mask=feats["v2_cand_mask"][sub_idx],
-                v2_cand_mode=feats["v2_cand_mode"][sub_idx],
-                v2_cand_dyn=feats["v2_cand_dyn"][sub_idx],
-                candidates=ca_t[sub_idx],
-                action_idx=act_t[sub_idx],
-                final_rank=rk_t,
+        obs_key = (str(key[0]), int(key[1]))
+        obs_step_totals[obs_key] = obs_step_totals.get(obs_key, 0) + int(sub_idx.numel())
+
+        if derive_full_v2:
+            r_events = feats["v2_events"][last_i, :l_r].clone()
+            rk_t = torch.tensor(rk_sub, dtype=torch.long) if all(has_lab) else None
+            staged.append(
+                (
+                    obs_key,
+                    RoundTrajectory(
+                        round_events=r_events,
+                        round_event_len=l_r,
+                        decision_event_len=feats["v2_event_len"][sub_idx].to(torch.int32),
+                        v2_tile_feats=feats["v2_tile_feats"][sub_idx],
+                        v2_global_feats=feats["v2_global_feats"][sub_idx],
+                        v2_player_feats=feats["v2_player_feats"][sub_idx],
+                        v2_cand_ids=feats["v2_cand_ids"][sub_idx],
+                        v2_cand_mask=feats["v2_cand_mask"][sub_idx],
+                        v2_cand_mode=feats["v2_cand_mode"][sub_idx],
+                        v2_cand_dyn=feats["v2_cand_dyn"][sub_idx],
+                        candidates=ca_t[sub_idx],
+                        action_idx=act_t[sub_idx],
+                        final_rank=rk_t,
+                        observer_total_steps=0,
+                        uuid=obs_key[0],
+                        observer_seat=obs_key[1] - SEAT_OFFSET,
+                    ),
+                )
             )
+        else:
+            staged.append(
+                (
+                    obs_key,
+                    {
+                        "uuid": obs_key[0],
+                        "observer_seat": obs_key[1] - SEAT_OFFSET,
+                        "round_event_len": l_r,
+                        "sp_t": sp_t[sub_idx],
+                        "nu_t": nu_t[sub_idx],
+                        "pr_t": pr_t[sub_idx],
+                        "ca_t": ca_t[sub_idx],
+                        "act_t": act_t[sub_idx],
+                        "pr_lens": [int(pr_lens_raw[i]) for i in order],
+                        "num_steps": int(sub_idx.numel()),
+                        "final_rank": int(rk_sub[0]) if all(has_lab) else None,
+                        "observer_total_steps": 0,
+                    },
+                )
+            )
+
+    out_items: list[Any] = []
+    for obs_key, item in staged:
+        total_obs = obs_step_totals[obs_key]
+        if derive_full_v2:
+            item.observer_total_steps = total_obs
+        else:
+            item["observer_total_steps"] = total_obs
+        out_items.append(item)
+        if max_rounds is not None and len(out_items) >= max_rounds:
+            break
+    return out_items, seen_labeled, len(game_meta)
+
+
+def parse_bc_rounds(
+    path: Path,
+    *,
+    max_rounds: int | None = None,
+    max_lines: int | None = None,
+    enable_early_shape_hint: bool = False,
+    allow_unlabeled: bool = False,
+    allow_incomplete: bool = False,
+) -> list[RoundTrajectory]:
+    """Read source-v3 BC TSV/TSV.GZ lines, validate isolation/completeness, and group rounds."""
+    with _open_tsv(path) as fp:
+        def _iter_lines() -> Iterable[tuple[int, str]]:
+            for line_no, line in enumerate(fp):
+                if max_lines is not None and line_no >= max_lines:
+                    break
+                yield line_no + 1, line
+
+        rounds, _, _ = _validate_and_stage_bc_lines(
+            _iter_lines(),
+            allow_unlabeled=allow_unlabeled,
+            allow_incomplete=allow_incomplete,
+            enable_early_shape_hint=enable_early_shape_hint,
+            max_rounds=max_rounds,
+            derive_full_v2=True,
         )
-    if max_rounds is not None:
-        return rounds[:max_rounds]
     return rounds
 
 
@@ -762,6 +839,7 @@ def build_round_trajectories_from_raw(
     *,
     final_ranks: Tensor | None = None,
     enable_early_shape_hint: bool = False,
+    observer_group_ids: Sequence[Any] | None = None,
 ) -> list[RoundTrajectory]:
     """Group pre-loaded 4-field tensors into validated single-prefix RoundTrajectory objects."""
     feats = derive_structured_v2_batch(
@@ -772,6 +850,15 @@ def build_round_trajectories_from_raw(
     grouped: dict[Any, list[int]] = {}
     for idx, gid in enumerate(round_group_ids):
         grouped.setdefault(gid, []).append(idx)
+
+    obs_totals: dict[Any, int] = {}
+    if observer_group_ids is not None:
+        if len(observer_group_ids) != int(sp.shape[0]):
+            raise ValueError(
+                f"observer_group_ids length {len(observer_group_ids)} != sp.shape[0] {sp.shape[0]}."
+            )
+        for oid in observer_group_ids:
+            obs_totals[oid] = obs_totals.get(oid, 0) + 1
 
     if final_ranks is not None:
         rk_all = final_ranks.long()
@@ -799,6 +886,12 @@ def build_round_trajectories_from_raw(
             rk_vals = final_ranks[order].long()
             if bool((rk_vals >= 0).all().item()):
                 rk_round = rk_vals
+        t_player: int | None = None
+        if observer_group_ids is not None:
+            oids = {observer_group_ids[i] for i in idxs}
+            if len(oids) != 1:
+                raise ValueError(f"Round group {gid!r} spans multiple observer_group_ids: {oids!r}.")
+            t_player = obs_totals[next(iter(oids))]
         rounds.append(
             RoundTrajectory(
                 round_events=feats["v2_events"][last_i, :l_r].clone(),
@@ -814,13 +907,14 @@ def build_round_trajectories_from_raw(
                 candidates=ca[order],
                 action_idx=actions[order].long(),
                 final_rank=rk_round,
+                observer_total_steps=t_player,
             )
         )
     return rounds
 
 
 class LengthBucketBatchSampler:
-    """Bucketed round sampler minimizing round_events padding with exact checkpoint resume."""
+    """Bucketed round sampler minimizing round_events padding with DDP sharding & exact resume."""
 
     def __init__(
         self,
@@ -829,16 +923,25 @@ class LengthBucketBatchSampler:
         batch_size: int,
         seed: int = 0,
         bucket_mult: int = 8,
+        rank: int = 0,
+        world_size: int = 1,
+        drop_last: bool = False,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be positive.")
+        if world_size < 1 or not 0 <= rank < world_size:
+            raise ValueError(f"Invalid distributed sampler coordinates rank={rank}, world_size={world_size}.")
         self.lengths = [int(x) for x in lengths]
         self.batch_size = int(batch_size)
         self.seed = int(seed)
         self.bucket_mult = int(bucket_mult)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.drop_last = bool(drop_last)
         self.epoch = 0
         self.cursor = 0
         self.batches: list[list[int]] = []
+        self.batch_weights: list[float] = []
         self._build_epoch_batches()
 
     def _build_epoch_batches(self) -> None:
@@ -847,6 +950,7 @@ class LengthBucketBatchSampler:
         n = len(self.lengths)
         if n == 0:
             self.batches = []
+            self.batch_weights = []
             self.cursor = 0
             return
         perm = torch.randperm(n, generator=g).tolist()
@@ -857,15 +961,60 @@ class LengthBucketBatchSampler:
             for b in range(0, len(chunk), self.batch_size):
                 all_batches.append(chunk[b : b + self.batch_size])
         batch_perm = torch.randperm(len(all_batches), generator=g).tolist()
-        self.batches = [all_batches[i] for i in batch_perm]
+        ordered_batches = [all_batches[i] for i in batch_perm]
+
+        if self.world_size == 1:
+            self.batches = ordered_batches
+            self.batch_weights = [1.0] * len(ordered_batches)
+        elif self.drop_last:
+            usable = (len(ordered_batches) // self.world_size) * self.world_size
+            self.batches = ordered_batches[self.rank : usable : self.world_size]
+            self.batch_weights = [1.0] * len(self.batches)
+        else:
+            per_rank = math.ceil(len(ordered_batches) / self.world_size)
+            rank_batches: list[list[int]] = []
+            rank_weights: list[float] = []
+            for k in range(per_rank):
+                g_idx = k * self.world_size + self.rank
+                if g_idx < len(ordered_batches):
+                    rank_batches.append(ordered_batches[g_idx])
+                    rank_weights.append(1.0)
+                else:
+                    rank_batches.append(ordered_batches[-1])
+                    rank_weights.append(0.0)
+            self.batches = rank_batches
+            self.batch_weights = rank_weights
         self.cursor = 0
 
     def reset_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
         self._build_epoch_batches()
 
+    def assigned_sample_indices(self) -> list[int]:
+        """Return unique dataset indices owned by this rank (excluding zero-weight ghost batches)."""
+        out: list[int] = []
+        for batch, weight in zip(self.batches, self.batch_weights, strict=True):
+            if weight > 0.0:
+                out.extend(batch)
+        return out
+
+    def pending_indexed_batches(self) -> list[tuple[int, list[int], float]]:
+        """Snapshot remaining (cursor_pos, indices, batch_weight) without mutating cursor."""
+        return [
+            (pos, self.batches[pos], self.batch_weights[pos])
+            for pos in range(self.cursor, len(self.batches))
+        ]
+
     def __len__(self) -> int:
         return len(self.batches)
+
+    def iter_weighted_batches(self) -> Iterator[tuple[list[int], float]]:
+        while self.cursor < len(self.batches):
+            pos = self.cursor
+            batch = self.batches[pos]
+            weight = self.batch_weights[pos]
+            self.cursor += 1
+            yield batch, weight
 
     def __iter__(self) -> Iterator[list[int]]:
         while self.cursor < len(self.batches):
@@ -880,6 +1029,9 @@ class LengthBucketBatchSampler:
             "seed": self.seed,
             "batch_size": self.batch_size,
             "num_items": len(self.lengths),
+            "rank": self.rank,
+            "world_size": self.world_size,
+            "drop_last": self.drop_last,
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -887,6 +1039,9 @@ class LengthBucketBatchSampler:
             state["seed"] != self.seed
             or state["batch_size"] != self.batch_size
             or state["num_items"] != len(self.lengths)
+            or int(state.get("rank", 0)) != self.rank
+            or int(state.get("world_size", 1)) != self.world_size
+            or bool(state.get("drop_last", False)) != self.drop_last
         ):
             raise ValueError("LengthBucketBatchSampler config mismatch on resume.")
         self.epoch = int(state["epoch"])
@@ -911,6 +1066,7 @@ def collate_round_batch(
     rounds: Sequence[RoundTrajectory],
     *,
     suit_perm_generator: torch.Generator | None = None,
+    batch_weight: float = 1.0,
 ) -> dict[str, Tensor]:
     """Pad variable-length rounds to [B_r, L_max, ...] and [B_r, T_max, ...]."""
     bsz_r = len(rounds)
@@ -933,6 +1089,8 @@ def collate_round_batch(
     candidates = torch.full((bsz_r, t_max, 32), PAD_ACTION_ID, dtype=torch.int32)
     action_idx = torch.zeros((bsz_r, t_max), dtype=torch.int64)
     final_rank = torch.full((bsz_r, t_max), -1, dtype=torch.int64)
+    final_rank_weight = torch.zeros((bsz_r, t_max), dtype=torch.float32)
+    bw = float(batch_weight)
 
     for b, r in enumerate(rounds):
         lr = r.round_event_len
@@ -994,6 +1152,12 @@ def collate_round_batch(
         action_idx[b, :t] = act_s
         if r.final_rank is not None:
             final_rank[b, :t] = r.final_rank
+        t_player = float(r.observer_total_steps if r.observer_total_steps is not None else t)
+        if r.observer_total_steps is not None and r.observer_total_steps < t:
+            raise ValueError(
+                f"Invalid observer_total_steps={r.observer_total_steps} < round decision steps {t}."
+            )
+        final_rank_weight[b, :t] = (FINAL_RANK_T_REF / max(1.0, t_player)) * bw
 
     return {
         "round_events": round_events,
@@ -1010,6 +1174,8 @@ def collate_round_batch(
         "candidates": candidates,
         "action": action_idx,
         "final_rank": final_rank,
+        "final_rank_weight": final_rank_weight,
+        "batch_weight": torch.tensor(bw, dtype=torch.float32),
     }
 
 
@@ -1144,6 +1310,7 @@ class TrajectoryBCModel(nn.Module):
         cand_self_attn: bool = True,
         head_type: str | None = None,
         enable_early_shape_hint: bool = False,
+        rope_base: float = 10000.0,
         checkpointing: bool = False,
         use_next_event_head: bool = True,
         next_event_weight: float = 0.20,
@@ -1168,6 +1335,7 @@ class TrajectoryBCModel(nn.Module):
             cand_self_attn=cand_self_attn,
             head_type=head_type,
             enable_early_shape_hint=enable_early_shape_hint,
+            rope_base=rope_base,
             checkpointing=checkpointing,
             device=device,
             dtype=dtype,
@@ -1203,7 +1371,39 @@ class TrajectoryBCModel(nn.Module):
                 self.state_head.norm.requires_grad_(True)
                 self.state_head.layers[0].requires_grad_(True)
 
-    def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        inactive_ids = self.static_inactive_param_ids()
+        for p in self.parameters():
+            if id(p) in inactive_ids:
+                p.requires_grad_(False)
+
+    def static_inactive_param_ids(self) -> set[int]:
+        """Return parameter IDs statically bypassed by BC preset flags."""
+        inactive: set[int] = set()
+        bb = self.backbone
+        if bb.head_type == "flat546":
+            inactive.update(
+                {
+                    id(bb.decoder2.null_tile_emb),
+                    id(bb.decoder2.null_source_emb),
+                    id(bb.decoder2.action_type_emb.weight),
+                }
+            )
+        if bb.n_d1_layers == 0:
+            inactive.add(id(bb.decoder1.no_event_seat_emb.weight))
+            if self.next_event_head is None or self.next_event_weight <= 0.0:
+                inactive.add(id(bb.tile_emb.red5_emb.weight))
+                for name, param in bb.decoder1.named_parameters():
+                    if not name.startswith("disabled_d1_mem"):
+                        inactive.add(id(param))
+        return inactive
+
+    def forward(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        denom_overrides: dict[str, float | Tensor] | None = None,
+        ddp_world_size: int = 1,
+    ) -> dict[str, Tensor]:
         out = self.backbone.forward_round_trajectory(
             batch["round_events"],
             batch["round_event_len"],
@@ -1224,12 +1424,18 @@ class TrajectoryBCModel(nn.Module):
         cands = batch["candidates"].reshape(ntot, MAX_NUM_ACTION_CANDIDATES)
         actions = batch["action"].reshape(ntot).long()
         encode = out["encode"]
+        bw = (
+            batch["batch_weight"].float().reshape(())
+            if "batch_weight" in batch
+            else torch.ones((), device=encode.device, dtype=torch.float32)
+        )
+        world_mul = float(ddp_world_size) if denom_overrides is not None else 1.0
 
         with torch.autocast(device_type=encode.device.type, enabled=False):
             logits = self.policy_head(cands, encode).float()
             cand_mask = cands < NUM_TYPES_OF_ACTIONS
             has_choice = dmask & (cand_mask.sum(dim=-1) >= 2)
-            has_f = has_choice.float()
+            has_f = has_choice.float() * bw
 
             # Padded decision steps may have all-False cand_mask; avoid all-(-inf) log_softmax NaN on masked slots.
             safe_cand_mask = torch.where(
@@ -1248,17 +1454,35 @@ class TrajectoryBCModel(nn.Module):
                 step_policy_loss = (1.0 - eps) * nll_per_step + eps * uniform_nll
             else:
                 step_policy_loss = nll_per_step
-            policy_loss = (step_policy_loss * has_f).sum() / has_f.sum().clamp_min(1.0)
+            policy_num = (step_policy_loss * has_f).sum()
+            local_pol_den = has_f.sum()
+            if denom_overrides is not None:
+                pol_den = torch.as_tensor(
+                    denom_overrides["policy_den"], device=encode.device, dtype=torch.float32
+                ).reshape(())
+                policy_loss = torch.where(
+                    pol_den > 0.0, policy_num * world_mul / pol_den.clamp_min(1e-8), policy_num * 0.0
+                )
+            else:
+                policy_loss = torch.where(
+                    local_pol_den > 0.0, policy_num / local_pol_den.clamp_min(1.0), policy_num * 0.0
+                )
 
             loss_total = policy_loss
             metrics: dict[str, Tensor] = {
                 "loss_policy": policy_loss.detach(),
-                "num_choice_steps": has_f.sum().detach(),
+                "num_choice_steps": local_pol_den.detach(),
+                "policy_den": local_pol_den.detach(),
             }
 
             if self.next_event_head is not None and self.next_event_weight > 0.0:
                 nev_loss, nev_parts = self.next_event_head(
-                    out["h_ev"], batch["round_events"], batch["round_event_len"]
+                    out["h_ev"],
+                    batch["round_events"],
+                    batch["round_event_len"],
+                    ev_denom=(denom_overrides["ev_den"] if denom_overrides is not None else None),
+                    td_denom=(denom_overrides["td_den"] if denom_overrides is not None else None),
+                    scale=bw * world_mul,
                 )
                 loss_total = loss_total + self.next_event_weight * nev_loss
                 metrics["loss_next_event"] = nev_loss.detach()
@@ -1272,15 +1496,31 @@ class TrajectoryBCModel(nn.Module):
                     (~dmask | ((rk_tgt >= 0) & (rk_tgt < 4))).all(),
                     "Invalid final_rank target; expected [0, 3] when final_rank_weight > 0.0.",
                 )
-                lab_f = dmask.float()
+                if "final_rank_weight" in batch:
+                    rk_w = batch["final_rank_weight"].reshape(ntot).float() * dmask.float()
+                else:
+                    rk_w = dmask.float() * bw
                 rk_ce = F.cross_entropy(
                     rank_logits.float(), rk_tgt.clamp(0, 3), reduction="none"
                 )
-                rk_loss = (rk_ce * lab_f).sum() / lab_f.sum().clamp_min(1.0)
+                rk_num = (rk_ce * rk_w).sum()
+                local_fr_den = rk_w.sum()
+                if denom_overrides is not None:
+                    fr_den = torch.as_tensor(
+                        denom_overrides["fr_den"], device=encode.device, dtype=torch.float32
+                    ).reshape(())
+                    rk_loss = torch.where(
+                        fr_den > 0.0, rk_num * world_mul / fr_den.clamp_min(1e-8), rk_num * 0.0
+                    )
+                else:
+                    rk_loss = torch.where(
+                        local_fr_den > 0.0, rk_num / local_fr_den.clamp_min(1e-8), rk_num * 0.0
+                    )
                 if val_out.requires_grad:
                     rk_loss = rk_loss + val_out.float().sum() * 0.0
                 loss_total = loss_total + self.final_rank_weight * rk_loss
                 metrics["loss_final_rank"] = rk_loss.detach()
+                metrics["final_rank_den"] = local_fr_den.detach()
 
         metrics["loss"] = loss_total
         return metrics
@@ -1425,6 +1665,7 @@ def save_trajectory_bc_checkpoint(
     grad_scaler: GradScaler | None = None,
     aug_generator: torch.Generator | None = None,
     numerical_stats: dict[str, int] | None = None,
+    stream_state: Any | None = None,
 ) -> Path:
     raw = model.module if isinstance(model, DistributedDataParallel) else model
     assert isinstance(raw, TrajectoryBCModel)
@@ -1433,11 +1674,22 @@ def save_trajectory_bc_checkpoint(
     world_size = dist.get_world_size() if is_dist else 1
 
     local_rng = capture_rng()
+    local_sampler = sampler.state_dict()
+    local_aug = aug_generator.get_state().cpu().clone() if aug_generator is not None else None
     if is_dist:
         rng_by_rank: list[Any] = [None] * world_size
+        sampler_by_rank: list[Any] = [None] * world_size
+        aug_rng_by_rank: list[Any] = [None] * world_size
+        stream_by_rank: list[Any] = [None] * world_size
         dist.all_gather_object(rng_by_rank, local_rng)
+        dist.all_gather_object(sampler_by_rank, local_sampler)
+        dist.all_gather_object(aug_rng_by_rank, local_aug)
+        dist.all_gather_object(stream_by_rank, stream_state)
     else:
         rng_by_rank = [local_rng]
+        sampler_by_rank = [local_sampler]
+        aug_rng_by_rank = [local_aug]
+        stream_by_rank = [stream_state]
 
     ckpt_path = ckpt_dir / f"traj-bc-{step}.pt"
     actor_path = ckpt_dir / f"model.{step}.kanachan"
@@ -1457,10 +1709,13 @@ def save_trajectory_bc_checkpoint(
                 "grad_scaler": cpu_state(grad_scaler.state_dict())
                 if grad_scaler is not None and grad_scaler.is_enabled()
                 else None,
-                "sampler": sampler.state_dict(),
+                "sampler": sampler_by_rank[0],
+                "sampler_by_rank": sampler_by_rank,
                 "rng": rng_by_rank[0],
                 "rng_by_rank": rng_by_rank,
-                "aug_rng": aug_generator.get_state().cpu().clone() if aug_generator is not None else None,
+                "aug_rng": aug_rng_by_rank[0],
+                "aug_rng_by_rank": aug_rng_by_rank,
+                "stream_state_by_rank": stream_by_rank if any(s is not None for s in stream_by_rank) else None,
             }
             atomic_save(ckpt_path, payload)
             raw.dump_actor(actor_path)
@@ -1486,6 +1741,7 @@ def load_trajectory_bc_checkpoint(
     aug_generator: torch.Generator | None = None,
     map_location: torch.device | str = "cpu",
     stats_out: dict[str, int] | None = None,
+    stream_state_out: list[Any] | None = None,
 ) -> int:
     del map_location  # Load on CPU first to preserve rank/device isolation and avoid VRAM spikes.
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
@@ -1500,17 +1756,29 @@ def load_trajectory_bc_checkpoint(
         scheduler.load_state_dict(payload["scheduler"])
     if grad_scaler is not None and grad_scaler.is_enabled() and payload.get("grad_scaler") is not None:
         grad_scaler.load_state_dict(payload["grad_scaler"])
+
+    is_dist = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_dist else 0
+    world_size = dist.get_world_size() if is_dist else 1
+
     if sampler is not None:
-        sampler.load_state_dict(payload["sampler"])
+        if payload.get("sampler_by_rank") is not None:
+            samp_list = payload["sampler_by_rank"]
+            if len(samp_list) != world_size:
+                raise ValueError(
+                    f"Checkpoint world_size={len(samp_list)} does not match current world_size={world_size}."
+                )
+            sampler.load_state_dict(samp_list[rank])
+        else:
+            if world_size > 1:
+                raise ValueError("Multi-rank DDP resume requires per-rank 'sampler_by_rank' state.")
+            sampler.load_state_dict(payload["sampler"])
 
     if stats_out is not None:
         stats_out.clear()
         for k, v in (payload.get("numerical_stats") or {}).items():
             stats_out[str(k)] = int(v)
 
-    is_dist = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if is_dist else 0
-    world_size = dist.get_world_size() if is_dist else 1
     if payload.get("rng_by_rank") is not None:
         rng_list = payload["rng_by_rank"]
         if len(rng_list) != world_size:
@@ -1523,8 +1791,25 @@ def load_trajectory_bc_checkpoint(
             raise ValueError("Multi-rank DDP resume requires per-rank 'rng_by_rank' state.")
         restore_rng(payload["rng"])
 
-    if aug_generator is not None and payload.get("aug_rng") is not None:
-        aug_generator.set_state(payload["aug_rng"].cpu())
+    if aug_generator is not None:
+        if payload.get("aug_rng_by_rank") is not None:
+            aug_list = payload["aug_rng_by_rank"]
+            if len(aug_list) != world_size:
+                raise ValueError(
+                    f"Checkpoint world_size={len(aug_list)} does not match current world_size={world_size}."
+                )
+            if aug_list[rank] is not None:
+                aug_generator.set_state(aug_list[rank].cpu())
+        elif payload.get("aug_rng") is not None:
+            aug_generator.set_state(payload["aug_rng"].cpu())
+
+    if stream_state_out is not None and payload.get("stream_state_by_rank") is not None:
+        ss_list = payload["stream_state_by_rank"]
+        if len(ss_list) != world_size:
+            raise ValueError(
+                f"Checkpoint world_size={len(ss_list)} does not match current world_size={world_size}."
+            )
+        stream_state_out[:] = [ss_list[rank]]
     return int(payload["step"])
 
 
@@ -1544,29 +1829,56 @@ def _compute_bc_grad_norm_and_nonfinite(
 
 def _expected_inactive_bc_param_ids(model: TrajectoryBCModel) -> set[int]:
     """Return parameter IDs statically bypassed by BC preset flags."""
-    inactive: set[int] = set()
-    bb = model.backbone
-    if bb.head_type == "flat546":
-        inactive.update(
-            {
-                id(bb.decoder2.null_tile_emb),
-                id(bb.decoder2.null_source_emb),
-                id(bb.decoder2.action_type_emb.weight),
-            }
-        )
-    if bb.n_d1_layers == 0:
-        inactive.add(id(bb.decoder1.no_event_seat_emb.weight))
-        if model.next_event_head is None or model.next_event_weight <= 0.0:
-            inactive.add(id(bb.tile_emb.red5_emb.weight))
-            for name, param in bb.decoder1.named_parameters():
-                if not name.startswith("disabled_d1_mem"):
-                    inactive.add(id(param))
-    return inactive
+    return model.static_inactive_param_ids()
+
+
+def _compute_microgroup_denoms(
+    micro_batches: Sequence[dict[str, Tensor]],
+    *,
+    is_dist: bool,
+    world_size: int,
+    device: torch.device,
+) -> dict[str, float] | None:
+    """Compute exact global BC/NextEvent/FinalRank denominators across microbatches & DDP ranks."""
+    if len(micro_batches) <= 1 and not (is_dist and world_size > 1):
+        return None
+    pol_den = 0.0
+    fr_den = 0.0
+    ev_den = 0.0
+    td_den = 0.0
+    for bcpu in micro_batches:
+        bw = float(bcpu["batch_weight"].item()) if "batch_weight" in bcpu else 1.0
+        dmask = bcpu["decision_mask"].bool()
+        cands = bcpu["candidates"]
+        has_choice = dmask & ((cands < NUM_TYPES_OF_ACTIONS).sum(dim=-1) >= 2)
+        pol_den += float(has_choice.sum().item()) * bw
+        if "final_rank_weight" in bcpu:
+            fr_den += float((bcpu["final_rank_weight"] * dmask.float()).sum().item())
+        else:
+            fr_den += float(dmask.sum().item()) * bw
+        events = bcpu["round_events"]
+        lmax = int(events.shape[1])
+        if lmax >= 2:
+            pos_next = torch.arange(1, lmax, dtype=torch.long).unsqueeze(0)
+            valid = pos_next < bcpu["round_event_len"].long().unsqueeze(1)
+            ev_den += float(valid.sum().item()) * bw
+            td_den += float((valid & (events[:, 1:, 0] == 3)).sum().item()) * bw
+    if is_dist and world_size > 1:
+        sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
+        vec = torch.tensor([pol_den, fr_den, ev_den, td_den], device=sync_dev, dtype=torch.float64)
+        dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+        pol_den, fr_den, ev_den, td_den = vec.cpu().tolist()
+    return {
+        "policy_den": pol_den,
+        "fr_den": fr_den,
+        "ev_den": ev_den,
+        "td_den": td_den,
+    }
 
 
 def train_trajectory_bc_steps(
     model: TrajectoryBCModel,
-    rounds: Sequence[RoundTrajectory],
+    rounds: Sequence[RoundTrajectory] | Any,
     optimizer: torch.optim.Optimizer,
     *,
     batch_size: int = 8,
@@ -1588,30 +1900,70 @@ def train_trajectory_bc_steps(
     max_nonfinite_steps: int | None = None,
     loss_transform: Callable[[Tensor, int], Tensor] | None = None,
     post_backward_hook: Callable[[nn.Module, torch.optim.Optimizer, int], None] | None = None,
+    grad_accum_steps: int = 1,
+    prefetch_batches: int = 0,
+    drop_last: bool = False,
 ) -> dict[str, Any]:
-    """Deterministic single/multi-step round-trajectory BC training loop with pre-update safety."""
+    """Deterministic distributed round-trajectory BC training loop with pre-update safety."""
+    import contextlib
+    from kanachan.training.bc.streaming_v2 import BoundedRoundPrefetcher
     from kanachan.training.iql.joint_v2 import (
         _collect_reachable_autograd_param_ids,
         _grad_scaler_detect_nonfinite,
         _grad_scaler_inject_step_bad,
         _grad_scaler_reset_optimizer_state,
         _optimizer_step_with_grad_scaler,
-        _sync_ddp_fatal_code,
     )
 
-    sampler = LengthBucketBatchSampler(
-        [r.round_event_len for r in rounds], batch_size=batch_size, seed=sampler_seed
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1.")
+
+    is_dist = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_dist else 0
+    world_size = dist.get_world_size() if is_dist else 1
+
+    lengths = (
+        list(rounds.round_event_lens)
+        if hasattr(rounds, "round_event_lens")
+        else [r.round_event_len for r in rounds]
     )
+    resolved_data_sha = data_sha256 or str(getattr(rounds, "data_sha256", "") or "")
+    sampler = LengthBucketBatchSampler(
+        lengths,
+        batch_size=batch_size,
+        seed=sampler_seed,
+        rank=rank,
+        world_size=world_size,
+        drop_last=drop_last,
+    )
+    rank_aug_seed = int(aug_seed) + int(rank) * 1_000_003
     aug_gen: torch.Generator | None = None
     if suit_augmentation:
         aug_gen = torch.Generator(device="cpu")
-        aug_gen.manual_seed(aug_seed)
+        aug_gen.manual_seed(rank_aug_seed)
 
     base_lr = float(optimizer.param_groups[0]["lr"])
     base_wd = float(optimizer.param_groups[0].get("weight_decay", 0.0))
     raw = model.module if isinstance(model, DistributedDataParallel) else model
     assert isinstance(raw, TrajectoryBCModel)
-    recipe = raw.recipe(data_sha256=data_sha256, lr=base_lr, weight_decay=base_wd)
+    recipe = raw.recipe(data_sha256=resolved_data_sha, lr=base_lr, weight_decay=base_wd)
+
+    inactive_ids = _expected_inactive_bc_param_ids(raw)
+    validate_optimizer_parameter_coverage(
+        raw,
+        optimizer,
+        inactive_param_ids=inactive_ids,
+        context="train_trajectory_bc_steps",
+    )
+    expected_active_named = tuple(
+        (n, p)
+        for n, p in raw.named_parameters()
+        if p.requires_grad and id(p) not in inactive_ids
+    )
+    if not expected_active_named:
+        raise OptimizerCoverageError(
+            "[train_trajectory_bc_steps] No trainable parameters remain active in BC model/optimizer."
+        )
 
     is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
     scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
@@ -1632,8 +1984,6 @@ def train_trajectory_bc_steps(
             stats_out=stats_restored,
         )
 
-    is_dist = dist.is_available() and dist.is_initialized()
-    world_size = dist.get_world_size() if is_dist else 1
     can_gpu_fused_guard = (
         device.type == "cuda"
         and bool(optimizer.param_groups)
@@ -1644,6 +1994,8 @@ def train_trajectory_bc_steps(
     )
     one_f32 = torch.ones((), device=device, dtype=torch.float32)
     zero_f32 = torch.zeros((), device=device, dtype=torch.float32)
+    zero_b = torch.zeros((), device=device, dtype=torch.bool)
+    one_b = torch.ones((), device=device, dtype=torch.bool)
     clip_f32 = torch.full((), float(grad_clip), device=device, dtype=torch.float32)
 
     optimizer_steps_t = torch.full(
@@ -1658,8 +2010,8 @@ def train_trajectory_bc_steps(
     nonfinite_grad_steps_t = torch.full(
         (), int(stats_restored.get("nonfinite_grad_steps", 0)), device=device, dtype=torch.int64
     )
+    fatal_steps_t = torch.zeros((), device=device, dtype=torch.int64)
 
-    inactive_ids = _expected_inactive_bc_param_ids(raw)
     model.train()
     step = start_step
     last_metrics: dict[str, float] = {}
@@ -1670,6 +2022,7 @@ def train_trajectory_bc_steps(
         "nonfinite_grad_steps": int(stats_restored.get("nonfinite_grad_steps", 0)),
     }
     last_out: dict[str, Tensor] | None = None
+    last_fatal_msg = ""
 
     def _flush_metrics(out_map: dict[str, Tensor]) -> tuple[dict[str, float], dict[str, int]]:
         keys = list(out_map.keys())
@@ -1679,16 +2032,22 @@ def train_trajectory_bc_steps(
                 skipped_steps_t.double(),
                 nonfinite_loss_steps_t.double(),
                 nonfinite_grad_steps_t.double(),
+                fatal_steps_t.double(),
             ]
             + [out_map[k].detach().double() for k in keys]
         ).cpu().tolist()
+        if int(round(packed[4])) > 0:
+            raise RuntimeError(
+                last_fatal_msg
+                or "Fatal BC autograd/disconnected-graph error synchronized across DDP ranks."
+            )
         stats = {
             "optimizer_steps": int(round(packed[0])),
             "skipped_steps": int(round(packed[1])),
             "nonfinite_loss_steps": int(round(packed[2])),
             "nonfinite_grad_steps": int(round(packed[3])),
         }
-        metrics_f = {k: float(v) for k, v in zip(keys, packed[4:], strict=True)}
+        metrics_f = {k: float(v) for k, v in zip(keys, packed[5:], strict=True)}
         if max_nonfinite_steps is not None and stats["skipped_steps"] > int(max_nonfinite_steps):
             raise RuntimeError(
                 f"Exceeded max_nonfinite_steps={max_nonfinite_steps}: skipped={stats['skipped_steps']} "
@@ -1697,207 +2056,312 @@ def train_trajectory_bc_steps(
             )
         return metrics_f, stats
 
+    use_batched_fetch = hasattr(rounds, "get_rounds")
+    ddp_model = isinstance(model, DistributedDataParallel)
+
     while max_steps is None or step < max_steps:
-        for idxs in sampler:
-            if max_steps is not None and step >= max_steps:
+        pending = sampler.pending_indexed_batches()
+        if not pending:
+            if max_steps is None:
                 break
-            batch_rounds = [rounds[i] for i in idxs]
-            batch_cpu = collate_round_batch(batch_rounds, suit_perm_generator=aug_gen)
-            batch_dev = {k: v.to(device=device, non_blocking=True) for k, v in batch_cpu.items()}
+            sampler.reset_epoch(sampler.epoch + 1)
+            continue
 
-            optimizer.zero_grad(set_to_none=True)
-            active_trainable_named = [
-                (n, p)
-                for n, p in raw.named_parameters()
-                if p.requires_grad and id(p) not in inactive_ids
-            ]
-            opt_trainable_ids = {
-                id(p)
-                for g in optimizer.param_groups
-                for p in g["params"]
-                if p.requires_grad
-            }
-            pre_code = 0
-            pre_disconnected: list[str] = []
-            if not active_trainable_named or not opt_trainable_ids:
-                pre_code = 1
-                loss = None
-            else:
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=amp_dtype or torch.float32,
-                    enabled=bool(is_amp),
-                    cache_enabled=False,
-                ):
-                    out = model(batch_dev)
-                    loss = out["loss"]
-                    if loss_transform is not None:
-                        loss = loss_transform(loss, step)
-                if (
-                    not isinstance(loss, Tensor)
-                    or loss.numel() != 1
-                    or not loss.requires_grad
-                    or loss.grad_fn is None
-                ):
-                    pre_code = 2
-                else:
-                    reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
-                    if not (reachable_ids & opt_trainable_ids):
-                        pre_code = 3
-                        pre_disconnected = ["<no optimizer parameters connected to loss>"]
-                    elif not has_reentrant_ckpt:
-                        pre_disconnected = [
-                            n for n, p in active_trainable_named if id(p) not in reachable_ids
-                        ]
-                        if pre_disconnected:
-                            pre_code = 3
-
-            synced_pre = _sync_ddp_fatal_code(
-                pre_code, is_dist=is_dist, world_size=world_size, device=device
+        if prefetch_batches > 0:
+            prefetcher: BoundedRoundPrefetcher | None = BoundedRoundPrefetcher(
+                rounds,
+                pending,
+                max_prefetch=int(prefetch_batches),
+                suit_perm_seed=(rank_aug_seed if suit_augmentation else None),
+                epoch=sampler.epoch,
             )
-            if synced_pre != 0:
-                optimizer.zero_grad(set_to_none=True)
-                _grad_scaler_reset_optimizer_state(scaler, optimizer)
-                suffix = " [propagated across DDP]" if (is_dist and world_size > 1 and pre_code == 0) else ""
-                if synced_pre == 1:
-                    raise RuntimeError(
-                        f"No trainable parameters remain active in BC model/optimizer; aborting step{suffix}."
+            batch_iter: Iterator[tuple[int, dict[str, Tensor]]] = iter(prefetcher)
+        else:
+            prefetcher = None
+
+            def _direct_iter() -> Iterator[tuple[int, dict[str, Tensor]]]:
+                for cursor_pos, idxs, bw in pending:
+                    batch_rounds = (
+                        rounds.get_rounds(idxs) if use_batched_fetch else [rounds[i] for i in idxs]
                     )
-                if synced_pre == 3:
-                    raise RuntimeError(
-                        "Disconnected BC computation graph detected before backward: trainable parameters "
-                        f"not connected to loss ({pre_disconnected[:8]}{'...' if len(pre_disconnected) > 8 else ''}){suffix}."
+                    yield cursor_pos, collate_round_batch(
+                        batch_rounds,
+                        suit_perm_generator=aug_gen,
+                        batch_weight=bw,
                     )
-                raise RuntimeError(
-                    "BC training loss has no autograd graph (requires_grad=False or grad_fn is None); "
-                    f"aborting before backward/optimizer update{suffix}."
-                )
 
-            assert isinstance(loss, Tensor)
-            loss_bad = (~torch.isfinite(loss.detach())).reshape(())
-            scaler.scale(loss).backward()
+            batch_iter = _direct_iter()
 
-            grads_on_opt = [
-                p for _, p in active_trainable_named if p.grad is not None and id(p) in opt_trainable_ids
-            ]
-            disconnected = [n for n, p in active_trainable_named if p.grad is None]
-            post_code = 1 if (not grads_on_opt or disconnected) else 0
-            synced_post = _sync_ddp_fatal_code(
-                post_code, is_dist=is_dist, world_size=world_size, device=device
-            )
-            if synced_post != 0:
+        try:
+            while max_steps is None or step < max_steps:
+                micro_group: list[dict[str, Tensor]] = []
+                for _ in range(int(grad_accum_steps)):
+                    nxt = next(batch_iter, None)
+                    if nxt is None:
+                        break
+                    sampler.cursor = nxt[0] + 1
+                    micro_group.append(nxt[1])
+                if not micro_group:
+                    break
+
                 optimizer.zero_grad(set_to_none=True)
-                _grad_scaler_reset_optimizer_state(scaler, optimizer)
-                suffix = " [propagated across DDP]" if (is_dist and world_size > 1 and post_code == 0) else ""
-                raise RuntimeError(
-                    "Disconnected BC computation graph after backward: trainable parameters received "
-                    f"no gradients ({disconnected[:8]}{'...' if len(disconnected) > 8 else ''}){suffix}."
+                denom_overrides = _compute_microgroup_denoms(
+                    micro_group, is_dist=is_dist, world_size=world_size, device=device
                 )
 
-            if post_backward_hook is not None:
-                post_backward_hook(model, optimizer, step)
-            if scaler.is_enabled():
-                scaler.unscale_(optimizer)
+                local_fatal = False
+                skipped_forward = bool(last_fatal_msg)
+                last_forward_armed_reducer = False
+                local_fatal_msg = last_fatal_msg
+                loss_bad = zero_b
+                out: dict[str, Tensor] = last_out if last_out is not None else {}
 
-            params_with_grad: list[Tensor] = []
-            grads: list[Tensor] = []
-            for group in optimizer.param_groups:
-                for p in group["params"]:
-                    if p.grad is not None:
-                        params_with_grad.append(p)
-                        grads.append(p.grad)
-
-            grad_norm, grad_bad = _compute_bc_grad_norm_and_nonfinite(grads, device=device)
-            if scaler.is_enabled():
-                scaler_bad = _grad_scaler_detect_nonfinite(
-                    scaler, optimizer, device=device, zero_f32=zero_f32
-                )
-                grad_bad = grad_bad | scaler_bad
-            step_bad = loss_bad | grad_bad
-
-            if is_dist and world_size > 1:
-                sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
-                flags_sync = torch.stack([loss_bad, grad_bad]).to(device=sync_dev, dtype=torch.int32)
-                dist.all_reduce(flags_sync, op=dist.ReduceOp.MAX)
-                flags_dev = (flags_sync > 0).to(device=device)
-                loss_bad = flags_dev[0]
-                grad_bad = flags_dev[1]
-                step_bad = loss_bad | grad_bad
-
-            if params_with_grad and grad_clip > 0.0:
-                safe_norm = torch.where(step_bad, clip_f32, grad_norm)
-                torch.nn.utils.clip_grads_with_norm_(
-                    params_with_grad, float(grad_clip), safe_norm
-                )
-
-            if scaler.is_enabled():
-                _grad_scaler_inject_step_bad(scaler, optimizer, step_bad=step_bad, device=device)
-
-            if can_gpu_fused_guard:
-                if scaler.is_enabled():
-                    _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
-                    scaler.update()
+                if skipped_forward:
+                    local_fatal = True
                 else:
-                    found_inf_f32 = step_bad.to(dtype=torch.float32)
-                    optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
-                    optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
-                    try:
-                        optimizer.step()
-                    finally:
-                        if hasattr(optimizer, "grad_scale"):
-                            del optimizer.grad_scale  # type: ignore[attr-defined]
-                        if hasattr(optimizer, "found_inf"):
-                            del optimizer.found_inf  # type: ignore[attr-defined]
-            else:
-                bad_host = bool(step_bad.item())
-                if not bad_host:
+                    for m_idx, batch_cpu in enumerate(micro_group):
+                        batch_dev = {
+                            k: v.to(device=device, non_blocking=True)
+                            for k, v in batch_cpu.items()
+                        }
+                        is_last_micro = m_idx == len(micro_group) - 1
+                        sync_ctx = (
+                            model.no_sync()
+                            if (ddp_model and not is_last_micro)
+                            else contextlib.nullcontext()
+                        )
+                        if not ddp_model or is_last_micro:
+                            with torch.autocast(
+                                device_type=device.type,
+                                dtype=amp_dtype or torch.float32,
+                                enabled=bool(is_amp),
+                                cache_enabled=False,
+                            ):
+                                out = model(
+                                    batch_dev,
+                                    denom_overrides=denom_overrides,
+                                    ddp_world_size=world_size,
+                                )
+                            if ddp_model:
+                                last_forward_armed_reducer = True
+                        else:
+                            with sync_ctx, torch.autocast(
+                                device_type=device.type,
+                                dtype=amp_dtype or torch.float32,
+                                enabled=bool(is_amp),
+                                cache_enabled=False,
+                            ):
+                                out = model(
+                                    batch_dev,
+                                    denom_overrides=denom_overrides,
+                                    ddp_world_size=world_size,
+                                )
+                        loss = out["loss"]
+                        if loss_transform is not None:
+                            loss = loss_transform(loss, step)
+
+                        if (
+                            not isinstance(loss, Tensor)
+                            or loss.numel() != 1
+                            or not loss.requires_grad
+                            or loss.grad_fn is None
+                        ):
+                            local_fatal = True
+                            local_fatal_msg = (
+                                "BC training loss has no autograd graph (requires_grad=False or grad_fn is None); "
+                                "aborting before backward/optimizer update."
+                            )
+                            break
+
+                        reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
+                        opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
+                        if not opt_reach:
+                            local_fatal = True
+                            local_fatal_msg = (
+                                "Disconnected BC computation graph detected before backward: trainable parameters "
+                                "not connected to loss (<no optimizer parameters connected to loss>)."
+                            )
+                            break
+                        if not has_reentrant_ckpt:
+                            pre_disc = [
+                                n for n, p in expected_active_named if id(p) not in reachable_ids
+                            ]
+                            if pre_disc:
+                                local_fatal = True
+                                local_fatal_msg = (
+                                    "Disconnected BC computation graph detected before backward: trainable parameters "
+                                    f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                                )
+                                break
+
+                        loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
+                        with sync_ctx:
+                            scaler.scale(loss).backward()
+
+                if local_fatal:
+                    last_fatal_msg = local_fatal_msg
+                    optimizer.zero_grad(set_to_none=True)
+                    if not (is_dist and world_size > 1):
+                        _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                        raise RuntimeError(local_fatal_msg)
+                    dummy_ddp_zero_loss(
+                        model, device, prepare_reducer=(ddp_model and not last_forward_armed_reducer)
+                    ).backward()
+                    loss_bad = zero_b
+                    grad_bad = zero_b
+                    grad_norm = zero_f32
+                    params_with_grad: list[Tensor] = []
+                else:
+                    post_disc = [n for n, p in expected_active_named if p.grad is None]
+                    if post_disc:
+                        local_fatal = True
+                        local_fatal_msg = (
+                            "Disconnected BC computation graph after backward: trainable parameters received "
+                            f"no gradients ({post_disc[:8]}{'...' if len(post_disc) > 8 else ''})."
+                        )
+                        last_fatal_msg = local_fatal_msg
+                        if not (is_dist and world_size > 1):
+                            optimizer.zero_grad(set_to_none=True)
+                            _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                            raise RuntimeError(local_fatal_msg)
+                        loss_bad = zero_b
+                        grad_bad = zero_b
+                        grad_norm = zero_f32
+                        params_with_grad = []
+                    else:
+                        if post_backward_hook is not None:
+                            post_backward_hook(model, optimizer, step)
+                        if scaler.is_enabled():
+                            scaler.unscale_(optimizer)
+
+                        params_with_grad = []
+                        grads: list[Tensor] = []
+                        for group in optimizer.param_groups:
+                            for p in group["params"]:
+                                if p.grad is not None:
+                                    params_with_grad.append(p)
+                                    grads.append(p.grad)
+
+                        grad_norm, grad_bad = _compute_bc_grad_norm_and_nonfinite(
+                            grads, device=device
+                        )
+                        if scaler.is_enabled():
+                            scaler_bad = _grad_scaler_detect_nonfinite(
+                                scaler, optimizer, device=device, zero_f32=zero_f32
+                            )
+                            grad_bad = grad_bad | scaler_bad
+
+                fatal_any, loss_bad, grad_bad = sync_ddp_step_status(
+                    one_b if local_fatal else zero_b,
+                    loss_bad,
+                    grad_bad,
+                    is_dist=is_dist,
+                    world_size=world_size,
+                    device=device,
+                )
+                step_bad = loss_bad | grad_bad | fatal_any
+
+                if not can_gpu_fused_guard:
+                    fatal_host, bad_host = torch.stack([fatal_any, step_bad]).cpu().tolist()
+                    if fatal_host:
+                        optimizer.zero_grad(set_to_none=True)
+                        _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                        suffix = (
+                            " [propagated across DDP]"
+                            if (is_dist and world_size > 1 and not local_fatal)
+                            else ""
+                        )
+                        raise RuntimeError(
+                            (last_fatal_msg or "Fatal BC autograd/disconnected-graph error") + suffix
+                        )
+                    if params_with_grad and grad_clip > 0.0:
+                        safe_norm = torch.where(step_bad, clip_f32, grad_norm)
+                        torch.nn.utils.clip_grads_with_norm_(
+                            params_with_grad, float(grad_clip), safe_norm
+                        )
                     if scaler.is_enabled():
+                        _grad_scaler_inject_step_bad(scaler, optimizer, step_bad=step_bad, device=device)
+                    if not bad_host:
+                        if scaler.is_enabled():
+                            _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
+                            scaler.update()
+                        else:
+                            optimizer.step()
+                        if scheduler is not None:
+                            scheduler.step()
+                    elif scaler.is_enabled():
+                        scaler.update()
+                    count_bad = step_bad
+                else:
+                    fatal_steps_t.add_(fatal_any.to(dtype=torch.int64))
+                    sticky_bad = step_bad | (fatal_steps_t > 0)
+                    if params_with_grad and grad_clip > 0.0:
+                        safe_norm = torch.where(sticky_bad, clip_f32, grad_norm)
+                        torch.nn.utils.clip_grads_with_norm_(
+                            params_with_grad, float(grad_clip), safe_norm
+                        )
+                    if scaler.is_enabled():
+                        _grad_scaler_inject_step_bad(
+                            scaler, optimizer, step_bad=sticky_bad, device=device
+                        )
                         _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
                         scaler.update()
                     else:
-                        optimizer.step()
-                    if scheduler is not None:
-                        scheduler.step()
-                elif scaler.is_enabled():
-                    scaler.update()
+                        found_inf_f32 = sticky_bad.to(dtype=torch.float32)
+                        optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
+                        optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
+                        try:
+                            optimizer.step()
+                        finally:
+                            if hasattr(optimizer, "grad_scale"):
+                                del optimizer.grad_scale  # type: ignore[attr-defined]
+                            if hasattr(optimizer, "found_inf"):
+                                del optimizer.found_inf  # type: ignore[attr-defined]
+                    count_bad = sticky_bad
 
-            optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=True)
 
-            step += 1
-            last_out = out
-            step_bad_i = step_bad.to(dtype=torch.int64)
-            skipped_steps_t.add_(step_bad_i)
-            optimizer_steps_t.add_(1 - step_bad_i)
-            nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
-            nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
+                step += 1
+                last_out = out
+                step_bad_i = count_bad.to(dtype=torch.int64)
+                skipped_steps_t.add_(step_bad_i)
+                optimizer_steps_t.add_(1 - step_bad_i)
+                nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
+                nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
 
-            at_end = (max_steps is not None and step >= max_steps) or (
-                max_steps is None and sampler.cursor >= len(sampler.batches)
-            )
-            need_ckpt = ckpt_dir is not None and checkpoint_every > 0 and step % checkpoint_every == 0
-            need_sync = (
-                device.type == "cpu"
-                or at_end
-                or need_ckpt
-                or (check_finite_interval > 0 and step % check_finite_interval == 0)
-                or (log_interval > 0 and step % log_interval == 0)
-            )
-            if need_sync:
-                last_metrics, last_stats = _flush_metrics(out)
-            if need_ckpt:
-                assert ckpt_dir is not None
-                save_trajectory_bc_checkpoint(
-                    ckpt_dir,
-                    raw,
-                    optimizer,
-                    sampler=sampler,
-                    step=step,
-                    recipe=recipe,
-                    scheduler=scheduler,
-                    grad_scaler=scaler,
-                    aug_generator=aug_gen,
-                    numerical_stats=last_stats,
+                at_end = (max_steps is not None and step >= max_steps) or (
+                    max_steps is None and sampler.cursor >= len(sampler.batches)
                 )
+                need_ckpt = (
+                    ckpt_dir is not None and checkpoint_every > 0 and step % checkpoint_every == 0
+                )
+                need_sync = (
+                    device.type == "cpu"
+                    or at_end
+                    or need_ckpt
+                    or (check_finite_interval > 0 and step % check_finite_interval == 0)
+                    or (log_interval > 0 and step % log_interval == 0)
+                )
+                if need_sync:
+                    last_metrics, last_stats = _flush_metrics(out)
+                if need_ckpt:
+                    assert ckpt_dir is not None
+                    save_trajectory_bc_checkpoint(
+                        ckpt_dir,
+                        raw,
+                        optimizer,
+                        sampler=sampler,
+                        step=step,
+                        recipe=recipe,
+                        scheduler=scheduler,
+                        grad_scaler=scaler,
+                        aug_generator=aug_gen,
+                        numerical_stats=last_stats,
+                    )
+        finally:
+            if prefetcher is not None:
+                prefetcher.close()
+
         if max_steps is None:
             break
         if step < max_steps:
@@ -1912,6 +2376,7 @@ def train_trajectory_bc_steps(
         "skipped_steps": last_stats["skipped_steps"],
         "nonfinite_loss_steps": last_stats["nonfinite_loss_steps"],
         "nonfinite_grad_steps": last_stats["nonfinite_grad_steps"],
+        "sampler_state": sampler.state_dict(),
         "metrics": last_metrics,
     }
 

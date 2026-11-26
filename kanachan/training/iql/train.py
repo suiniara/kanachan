@@ -2,6 +2,7 @@
 
 import re
 import datetime
+import json
 import math
 from pathlib import Path
 import os
@@ -45,7 +46,338 @@ from kanachan.training.core.checkpoint import (
     save_training_state,
 )
 from kanachan.training.core.progress import TrainingProgress
-from kanachan.training.core.optimizers import move_optimizer_state, consolidate_optimizer_state
+from kanachan.training.core.optimizers import (
+    consolidate_optimizer_state,
+    move_optimizer_state,
+    validate_optimizer_parameter_coverage,
+)
+
+
+def _normalize_rewrite_arg(val: str | int | None, mapping: dict[str, int], *, upper: int, name: str) -> int | None:
+    if isinstance(val, str):
+        val = mapping[val]
+    if val is not None and not 0 <= int(val) <= upper:
+        raise RuntimeError(f"{val}: `{name}` must be an integer within [0, {upper}].")
+    return int(val) if val is not None else None
+
+
+def _build_optional_scheduler(
+    optimizer: Optimizer, optimizer_config: Any
+) -> LRScheduler | None:
+    warmup_steps = int(getattr(optimizer_config, "warmup_steps", 0))
+    annealing_steps = int(getattr(optimizer_config, "annealing_steps", 0))
+    warmup_sched = (
+        torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=float(optimizer_config.warmup_start_lr) / float(optimizer_config.learning_rate),
+            total_iters=warmup_steps,
+        )
+        if warmup_steps > 0
+        else None
+    )
+    anneal_sched = (
+        torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            annealing_steps,
+            int(optimizer_config.annealing_steps_factor),
+        )
+        if annealing_steps > 0
+        else None
+    )
+    if warmup_sched is not None and anneal_sched is not None:
+        return torch.optim.lr_scheduler.SequentialLR(
+            optimizer, [warmup_sched, anneal_sched], [warmup_sched.total_iters]
+        )
+    return warmup_sched or anneal_sched
+
+
+def run_joint_v2_iql(
+    config: DictConfig,
+    *,
+    world_size: int,
+    rank: int,
+    local_rank: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    amp_dtype: torch.dtype,
+) -> dict[str, Any]:
+    """Production Stage-2/3 Joint Structured V2 IQL training entrypoint."""
+    from kanachan.nn.structured_dual_decoder import StructuredActionHead, StructuredDualDecoder
+    from kanachan.nn.structured_iql import JointStructuredIQLModule
+    from kanachan.training.grp import FrozenGRP, load_frozen_grp
+    from kanachan.training.iql.joint_v2 import (
+        build_joint_iql_optimizer,
+        build_joint_iql_recipe,
+        expected_inactive_iql_param_ids,
+        save_joint_iql_checkpoint,
+        train_joint_iql_batches,
+    )
+    from kanachan.training.iql.streaming_v2 import StreamingIQLDataset
+
+    if config.encoder.architecture != "structured_dual_v2":
+        raise ValueError(
+            f"training_mode='v2_joint' requires encoder.architecture='structured_dual_v2', "
+            f"got {config.encoder.architecture!r}."
+        )
+    if not config.double_q_learning:
+        raise ValueError("Joint IQL requires two critics; double_q_learning=false is not supported.")
+    if not math.isfinite(config.discount_factor) or not 0.0 <= config.discount_factor <= 1.0:
+        raise ValueError(f"Invalid discount_factor={config.discount_factor}.")
+    if not math.isfinite(config.expectile) or not 0.0 < config.expectile < 1.0:
+        raise ValueError(f"Invalid expectile={config.expectile}.")
+    if not math.isfinite(config.final_rank_weight) or config.final_rank_weight < 0.0:
+        raise ValueError(f"Invalid final_rank_weight={config.final_rank_weight}.")
+    if not math.isfinite(config.kl_coef) or config.kl_coef < 0.0:
+        raise ValueError(f"Invalid kl_coef={config.kl_coef}.")
+    if not math.isfinite(config.target_update_rate) or not 0.0 < config.target_update_rate <= 1.0:
+        raise ValueError(f"Invalid target_update_rate={config.target_update_rate}.")
+    if config.batch_size <= 0 or config.gradient_accumulation_steps <= 0:
+        raise ValueError("batch_size and gradient_accumulation_steps must be positive.")
+    if not math.isfinite(config.q_max_gradient_norm) or config.q_max_gradient_norm <= 0.0:
+        raise ValueError("q_max_gradient_norm must be positive.")
+    if config.snapshot_interval < 0:
+        raise ValueError("snapshot_interval must be >= 0.")
+    _config.optimizer.validate(config.optimizer)
+    if config.optimizer.type != "adamw":
+        raise ValueError(
+            f"v2_joint requires optimizer.type='adamw', got {config.optimizer.type!r}."
+        )
+    if config.bc_initial_model is not None and not Path(config.bc_initial_model).is_file():
+        raise FileNotFoundError(f"bc_initial_model does not exist: {config.bc_initial_model}")
+
+    if world_size >= 2 and not torch.distributed.is_initialized():
+        init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+
+    frozen_grp: FrozenGRP | None = None
+    custom_reward_fn = None
+    reward_scheme = str(getattr(config, "reward_scheme", "placement"))
+    if reward_scheme == "grp_pbrs":
+        if config.grp_checkpoint is None:
+            raise ValueError("reward_scheme='grp_pbrs' requires grp_checkpoint=<path-to-frozen-grp.pt>.")
+        frozen_grp = load_frozen_grp(Path(config.grp_checkpoint), require_gate=True)
+    elif reward_scheme == "plugin":
+        if config.reward_plugin is None or not Path(config.reward_plugin).is_file():
+            raise ValueError("reward_scheme='plugin' requires a valid reward_plugin file.")
+        ns: dict[str, Any] = {}
+        exec(Path(config.reward_plugin).read_text(encoding="utf-8"), ns)  # noqa: S102
+        if "get_reward" not in ns:
+            raise ValueError(f"Reward plugin {config.reward_plugin} does not define `get_reward`.")
+        custom_reward_fn = ns["get_reward"]
+    elif config.grp_checkpoint is not None:
+        raise ValueError("grp_checkpoint was supplied without reward_scheme='grp_pbrs'.")
+
+    dataset = StreamingIQLDataset(
+        config.training_data,
+        batch_size=int(config.batch_size),
+        reservoir_size=int(config.replay_buffer_size or 4096),
+        warmup_transitions=config.warmup_transitions,
+        reward_scheme=reward_scheme,
+        reward_fn=custom_reward_fn,
+        grp=frozen_grp,
+        score_unit=float(config.score_unit),
+        round_weight=float(config.round_weight),
+        discount_factor=float(config.discount_factor),
+        rewrite_rooms=config.rewrite_rooms,
+        rewrite_grades=config.rewrite_grades,
+        seed=int(config.sampler_seed),
+        rank=rank,
+        world_size=world_size,
+        drop_last=bool(config.drop_last),
+        suit_augmentation=bool(config.suit_augmentation),
+        aug_seed=int(config.aug_seed),
+        enable_early_shape_hint=bool(getattr(config.encoder, "enable_early_shape_hint", False)),
+        max_prefetch=int(config.prefetch_batches),
+        max_games=config.max_games,
+        max_batches=config.max_batches,
+    )
+
+    output_prefix = Path(HydraConfig.get().runtime.output_dir)
+    ckpt_dir = output_prefix / "snapshots"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        module = JointStructuredIQLModule(
+            preset=(getattr(config.encoder, "preset", None) or "custom"),
+            dimension=int(config.encoder.dimension),
+            num_heads=int(config.encoder.num_heads),
+            dim_feedforward=(
+                int(config.encoder.dim_feedforward)
+                if config.encoder.dim_feedforward is not None
+                else None
+            ),
+            n_d1_layers=int(config.encoder.n_d1_layers),
+            n_d2_layers=int(config.encoder.n_d2_layers),
+            use_rel_bias=bool(config.encoder.use_rel_bias),
+            cand_self_attn=bool(config.encoder.cand_self_attn),
+            head_type=str(config.encoder.head_type),
+            enable_early_shape_hint=bool(getattr(config.encoder, "enable_early_shape_hint", False)),
+            rope_base=float(config.encoder.rope_base),
+            expectile=float(config.expectile),
+            discount_factor=float(config.discount_factor),
+            awr_inv_temp_beta=float(config.awr_inv_temp_beta),
+            awr_max_weight=float(config.awr_max_weight),
+            kl_coef=float(config.kl_coef),
+            keep_bc_anchor=bool(config.keep_bc_anchor),
+            target_ema_tau=float(config.target_update_rate),
+            final_rank=(float(config.final_rank_weight) > 0.0),
+            final_rank_weight=float(config.final_rank_weight),
+            freeze_decoder1=bool(config.freeze_decoder1),
+            freeze_shared_tile_emb=config.freeze_shared_tile_emb,
+            use_cql_quantile_head=bool(config.use_cql_quantile_head),
+            num_quantiles=int(config.num_quantiles),
+            qr_double_q=bool(config.qr_double_q),
+            quantile_cql_alpha=float(config.quantile_cql_alpha),
+            cql_temperature=float(config.cql_temperature),
+            checkpointing=bool(config.checkpointing),
+            device=device,
+            dtype=dtype,
+        )
+
+        if config.bc_initial_model is not None:
+            teacher = load_model(Path(config.bc_initial_model), map_location="cpu")
+            bodies = [m for m in teacher.modules() if type(m) is StructuredDualDecoder]
+            heads = [m for m in teacher.modules() if type(m) is StructuredActionHead]
+            if len(bodies) != 1 or len(heads) != 1:
+                raise ValueError(
+                    f"bc_initial_model {config.bc_initial_model} does not contain a unique StructuredDualDecoder + StructuredActionHead."
+                )
+            module.init_from_bc(
+                bodies[0],
+                heads[0],
+                keep_bc_anchor=bool(config.keep_bc_anchor or config.kl_coef > 0.0),
+            )
+            module.configure_freeze(
+                freeze_decoder1=bool(config.freeze_decoder1),
+                freeze_shared_tile_emb=config.freeze_shared_tile_emb,
+                final_rank_weight=float(config.final_rank_weight),
+            )
+
+        if world_size >= 2:
+            module.to(device=device)
+            for p in module.parameters():
+                broadcast(p.data, src=0)
+            for b in module.buffers():
+                broadcast(b.data, src=0)
+            if device.type == "cuda":
+                ddp_wrapped: DistributedDataParallel | None = DistributedDataParallel(
+                    module, device_ids=[local_rank], output_device=local_rank
+                )
+            else:
+                ddp_wrapped = DistributedDataParallel(module)
+        else:
+            ddp_wrapped = None
+
+        optimizer = build_joint_iql_optimizer(
+            module,
+            base_lr=float(config.optimizer.learning_rate),
+            weight_decay=float(config.optimizer.weight_decay),
+            decoder1_lr_scale=float(config.decoder1_lr_scale),
+            device=device,
+        )
+        validate_optimizer_parameter_coverage(
+            module,
+            optimizer,
+            inactive_param_ids=expected_inactive_iql_param_ids(module),
+            context="run_joint_v2_iql",
+        )
+        scheduler = _build_optional_scheduler(optimizer, config.optimizer)
+        recipe = build_joint_iql_recipe(
+            module,
+            base_lr=float(config.optimizer.learning_rate),
+            weight_decay=float(config.optimizer.weight_decay),
+            decoder1_lr_scale=float(config.decoder1_lr_scale),
+            grp=frozen_grp,
+            data_sha256=dataset.data_sha256,
+        )
+
+        arch_meta = {
+            "training_mode": "v2_joint",
+            "architecture": recipe["architecture"],
+            "preset": recipe["backbone"]["preset"],
+            "reward_scheme": reward_scheme,
+            "grp_sha256": recipe["grp_sha256"],
+            "use_cql_quantile_head": recipe["iql"]["use_cql_quantile_head"],
+            "final_rank_weight": recipe["iql"]["final_rank_weight"],
+            "kl_coef": recipe["iql"]["kl_coef"],
+            "data_sha256": recipe["data_sha256"],
+            "world_size": world_size,
+        }
+        if rank == 0:
+            logging.info("Model type: implicit Q-learning V2 joint (v2_joint)")
+            logging.info("Architecture: %s (preset=%s, reward=%s)", arch_meta["architecture"], arch_meta["preset"], reward_scheme)
+            _config.device.dump(
+                world_size=world_size,
+                rank=rank,
+                local_rank=local_rank,
+                device=device,
+                dtype=dtype,
+                amp_dtype=amp_dtype,
+            )
+            _config.encoder.dump(config.encoder)
+            _config.optimizer.dump(config.optimizer)
+            if frozen_grp is not None:
+                logging.info("FrozenGRP checksum: %s (report=%s)", frozen_grp.grp_sha256, frozen_grp.calibration_report)
+
+        from contextlib import ExitStack
+        tensorboard_path = output_prefix / "tensorboard"
+        if rank == 0:
+            tensorboard_path.mkdir(parents=True, exist_ok=True)
+        with (SummaryWriter(log_dir=tensorboard_path) if rank == 0 else ExitStack()) as summary_writer:
+            if rank == 0:
+                summary_writer.add_text("architecture/summary", json.dumps(arch_meta, sort_keys=True), 0)
+            result = train_joint_iql_batches(
+                module,
+                dataset,
+                optimizer,
+                recipe=recipe,
+                device=device,
+                amp_dtype=amp_dtype,
+                max_grad_norm=float(config.q_max_gradient_norm),
+                scheduler=scheduler,
+                ckpt_dir=ckpt_dir,
+                checkpoint_every=int(config.snapshot_interval),
+                resume_from=config.resume_from,
+                ddp_wrapped=ddp_wrapped,
+                max_steps=config.max_steps,
+                grad_accum_steps=int(config.gradient_accumulation_steps),
+            )
+            if rank == 0:
+                for k, v in result.get("metrics", {}).items():
+                    if math.isfinite(float(v)):
+                        summary_writer.add_scalar(f"iql_v2/{k}", float(v), int(result["step"]))
+                summary_writer.flush()
+
+        final_step = int(result["step"])
+        final_ckpt = ckpt_dir / f"joint-iql-{final_step}.pt"
+        need_final = [False]
+        if rank == 0:
+            need_final[0] = not final_ckpt.exists()
+        if world_size >= 2:
+            torch.distributed.broadcast_object_list(need_final, src=0)
+        if need_final[0]:
+            save_joint_iql_checkpoint(
+                ckpt_dir,
+                module,
+                optimizer,
+                step=final_step,
+                cursor=int(result["cursor"]),
+                recipe=recipe,
+                scheduler=scheduler,
+                numerical_stats={
+                    "optimizer_steps": int(result["optimizer_steps"]),
+                    "skipped_steps": int(result["skipped_steps"]),
+                    "nonfinite_loss_steps": int(result["nonfinite_loss_steps"]),
+                    "nonfinite_grad_steps": int(result["nonfinite_grad_steps"]),
+                },
+                stream_state=dataset.state_dict(),
+            )
+        if rank == 0:
+            module.dump_actor(ckpt_dir / "model.kanachan")
+        if world_size >= 2:
+            torch.distributed.barrier()
+        return result
+    finally:
+        dataset.close()
 from kanachan.nn import TwinQActor
 from kanachan.nn.decision_factory import (
     make_backbone, make_candidate_head, make_state_head, candidate_head_keys,
@@ -574,57 +906,33 @@ def _main(config: DictConfig) -> None:
         amp_dtype,
     ) = _config.device.validate(config)
 
+    training_mode = str(getattr(config, "training_mode", "legacy_five_net"))
+    if training_mode not in ("legacy_five_net", "v2_joint"):
+        raise ValueError(
+            f"Unknown IQL training_mode={training_mode!r}; expected 'legacy_five_net' or 'v2_joint'."
+        )
+
     if not config.training_data.exists():
         errmsg = f"{config.training_data}: Does not exist."
         raise RuntimeError(errmsg)
-    if not config.training_data.is_file():
+    if training_mode == "legacy_five_net" and not config.training_data.is_file():
         errmsg = f"{config.training_data}: Not a file."
         raise RuntimeError(errmsg)
 
-    if isinstance(config.rewrite_rooms, str):
-        config.rewrite_rooms = {
-            "bronze": 0,
-            "silver": 1,
-            "gold": 2,
-            "jade": 3,
-            "throne": 4,
-        }[config.rewrite_rooms]
-    if config.rewrite_rooms is not None and (
-        config.rewrite_rooms < 0 or 4 < config.rewrite_rooms
-    ):
-        errmsg = (
-            f"{config.rewrite_rooms}: "
-            "`rewrite_rooms` must be an integer within the range [0, 4]."
-        )
-        raise RuntimeError(errmsg)
-
-    if isinstance(config.rewrite_grades, str):
-        config.rewrite_grades = {
-            "novice1": 0,
-            "novice2": 1,
-            "novice3": 2,
-            "adept1": 3,
-            "adept2": 4,
-            "adept3": 5,
-            "expert1": 6,
-            "expert2": 7,
-            "expert3": 8,
-            "master1": 9,
-            "master2": 10,
-            "master3": 11,
-            "saint1": 12,
-            "saint2": 13,
-            "saint3": 14,
-            "celestial": 15,
-        }[config.rewrite_grades]
-    if config.rewrite_grades is not None and (
-        config.rewrite_grades < 0 or 15 < config.rewrite_grades
-    ):
-        errmsg = (
-            f"{config.rewrite_grades}: "
-            "`rewrite_grades` must be an integer within the range [0, 15]."
-        )
-        raise RuntimeError(errmsg)
+    room_map = {"bronze": 0, "silver": 1, "gold": 2, "jade": 3, "throne": 4}
+    grade_map = {
+        "novice1": 0, "novice2": 1, "novice3": 2,
+        "adept1": 3, "adept2": 4, "adept3": 5,
+        "expert1": 6, "expert2": 7, "expert3": 8,
+        "master1": 9, "master2": 10, "master3": 11,
+        "saint1": 12, "saint2": 13, "saint3": 14, "celestial": 15,
+    }
+    config.rewrite_rooms = _normalize_rewrite_arg(
+        config.rewrite_rooms, room_map, upper=4, name="rewrite_rooms"
+    )
+    config.rewrite_grades = _normalize_rewrite_arg(
+        config.rewrite_grades, grade_map, upper=15, name="rewrite_grades"
+    )
 
     if config.num_workers is None:
         config.num_workers = 0 if device.type == "cpu" else 2
@@ -637,11 +945,30 @@ def _main(config: DictConfig) -> None:
             " a non-negative integer."
         )
         raise RuntimeError(errmsg)
-    if config.contiguous_training_data and config.replay_buffer_size == 0:
+    if training_mode == "legacy_five_net" and config.contiguous_training_data and config.replay_buffer_size == 0:
         errmsg = "Use `replay_buffer_size` for `contiguous_training_data`."
         raise RuntimeError(errmsg)
 
     _config.encoder.validate(config.encoder)
+
+    # Fail-closed guard: never silently route Structured V2 architecture through legacy 5-network IQL.
+    if config.encoder.architecture == "structured_dual_v2" and training_mode != "v2_joint":
+        raise ValueError(
+            "Structured V2 encoder architecture ('structured_dual_v2') cannot run on the legacy "
+            "five-network IQL baseline; use --config-name v2_joint or training_mode=v2_joint."
+        )
+
+    if training_mode == "v2_joint":
+        run_joint_v2_iql(
+            config,
+            world_size=world_size,
+            rank=rank,
+            local_rank=local_rank,
+            device=device,
+            dtype=dtype,
+            amp_dtype=amp_dtype,
+        )
+        return
 
     _config.decoder.validate(config.decoder, config.encoder.dimension)
 
@@ -1671,6 +1998,19 @@ def _main(config: DictConfig) -> None:
     tensorboard_path.mkdir(parents=True, exist_ok=True)
 
     with SummaryWriter(log_dir=tensorboard_path) as summary_writer:
+        if rank == 0:
+            summary_writer.add_text(
+                "architecture/summary",
+                json.dumps(
+                    {
+                        "training_mode": "legacy_five_net",
+                        "architecture": str(config.encoder.architecture),
+                        "preset": getattr(config.encoder, "preset", None),
+                    },
+                    sort_keys=True,
+                ),
+                0,
+            )
         _training(
             training_data=config.training_data,
             contiguous_training_data=config.contiguous_training_data,

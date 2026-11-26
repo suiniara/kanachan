@@ -1,6 +1,9 @@
 import math
+from collections.abc import Iterable
+from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed.optim import ZeroRedundancyOptimizer
 from torch.optim import Adam, AdamW, Optimizer, RAdam
@@ -30,6 +33,148 @@ def adamw_parameter_groups(module, weight_decay):
         {"params": decayed, "weight_decay": weight_decay},
         {"params": unchanged, "weight_decay": 0.0},
     ]
+
+
+class OptimizerCoverageError(RuntimeError):
+    """Raised when optimizer parameters diverge from intended trainable parameters."""
+
+
+def validate_optimizer_parameter_coverage(
+    module: torch.nn.Module,
+    optimizer: Optimizer,
+    *,
+    inactive_param_ids: Iterable[int] | None = None,
+    context: str = "optimizer",
+) -> dict[str, Any]:
+    """Validate once at init that optimizer parameters equal intended trainable parameters."""
+    raw = getattr(module, "module", module)
+    static_inactive = {int(pid) for pid in (inactive_param_ids or ())}
+
+    param_names: dict[int, str] = {}
+    param_objs: dict[int, torch.nn.Parameter] = {}
+    for name, param in raw.named_parameters():
+        param_names[id(param)] = name
+        param_objs[id(param)] = param
+
+    seen_opt_ids: dict[int, int] = {}
+    duplicate_params: list[str] = []
+    foreign_params: list[str] = []
+    frozen_in_optimizer: list[str] = []
+    unintended_trainable: list[str] = []
+
+    for pid in static_inactive:
+        param = param_objs.get(pid)
+        if param is not None and param.requires_grad:
+            unintended_trainable.append(
+                f"{param_names[pid]} (static inactive still requires_grad=True)"
+            )
+
+    for group_idx, group in enumerate(optimizer.param_groups):
+        for param in group.get("params", ()):
+            pid = id(param)
+            if pid in seen_opt_ids:
+                label = param_names.get(pid, f"<foreign id={pid} shape={tuple(param.shape)}>")
+                duplicate_params.append(
+                    f"{label} (groups {seen_opt_ids[pid]} and {group_idx})"
+                )
+            else:
+                seen_opt_ids[pid] = group_idx
+
+            if pid not in param_objs:
+                foreign_params.append(
+                    f"group={group_idx} id={pid} shape={tuple(param.shape)}"
+                )
+            else:
+                if pid in static_inactive and not param.requires_grad:
+                    unintended_trainable.append(
+                        f"{param_names[pid]} (static inactive present in optimizer)"
+                    )
+                if not param.requires_grad:
+                    frozen_in_optimizer.append(param_names[pid])
+
+    missing_trainable = sorted(
+        param_names[pid]
+        for pid, param in param_objs.items()
+        if param.requires_grad and pid not in static_inactive and pid not in seen_opt_ids
+    )
+
+    issues: list[str] = []
+    for label, items in (
+        ("missing_trainable", missing_trainable),
+        ("duplicate_params", sorted(duplicate_params)),
+        ("frozen_in_optimizer", sorted(frozen_in_optimizer)),
+        ("foreign_params", sorted(foreign_params)),
+        ("unintended_trainable", sorted(unintended_trainable)),
+    ):
+        if items:
+            preview = items[:8]
+            more = f" (+{len(items) - 8} more)" if len(items) > 8 else ""
+            issues.append(f"{label}={preview}{more}")
+
+    if issues:
+        raise OptimizerCoverageError(
+            f"[{context}] Optimizer parameter coverage mismatch: " + "; ".join(issues)
+        )
+
+    intended_trainable = sorted(
+        param_names[pid]
+        for pid, param in param_objs.items()
+        if param.requires_grad and pid not in static_inactive
+    )
+    static_inactive_names = sorted(
+        param_names[pid] for pid in static_inactive if pid in param_names
+    )
+    return {
+        "context": str(context),
+        "trainable_count": len(intended_trainable),
+        "optimizer_count": len(seen_opt_ids),
+        "static_inactive_count": len(static_inactive_names),
+        "trainable_param_names": intended_trainable,
+        "static_inactive_param_names": static_inactive_names,
+    }
+
+
+def dummy_ddp_zero_loss(
+    module: torch.nn.Module,
+    device: torch.device,
+    *,
+    prepare_reducer: bool = False,
+) -> Tensor:
+    """Synthesize zero-grad loss touching every requires_grad param so DDP Reducer finishes cleanly."""
+    if prepare_reducer:
+        reducer = getattr(module, "reducer", None)
+        if reducer is not None:
+            rebuild = getattr(reducer, "_rebuild_buckets", None)
+            if callable(rebuild):
+                rebuild()
+            prep = getattr(reducer, "prepare_for_backward", None)
+            if callable(prep):
+                prep([])
+    terms = [p.reshape(-1)[0].float() * 0.0 for p in module.parameters() if p.requires_grad]
+    if not terms:
+        return torch.zeros((), device=device, dtype=torch.float32)
+    return torch.stack(terms).sum()
+
+
+def sync_ddp_step_status(
+    fatal_bad: Tensor,
+    loss_bad: Tensor,
+    grad_bad: Tensor,
+    *,
+    is_dist: bool,
+    world_size: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Synchronize [fatal, nonfinite_loss, nonfinite_grad] in one collective per optimizer step."""
+    if not (is_dist and world_size > 1):
+        return fatal_bad, loss_bad, grad_bad
+    sync_dev = torch.device("cpu") if dist.get_backend() == "gloo" else device
+    status_vec = torch.stack([fatal_bad, loss_bad, grad_bad]).to(
+        device=sync_dev, dtype=torch.int32
+    )
+    dist.all_reduce(status_vec, op=dist.ReduceOp.MAX)
+    flags_dev = (status_vec > 0).to(device=device)
+    return flags_dev[0], flags_dev[1], flags_dev[2]
 
 
 def online_adamw(module, *, lr, weight_decay, device_type, resume_state=None):
