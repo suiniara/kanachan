@@ -130,6 +130,25 @@ def _parse_int_csv(raw: str, field_name: str, ctx: str) -> list[int]:
 _SCORE_BOUND = 10_000_000
 
 
+def _extract_best_effort_round_ctx(raw_line: str, line_no: int | None) -> str:
+    prefix = f"line {line_no}" if line_no is not None else "BC line"
+    parts = raw_line.rstrip("\r\n").split("\t")
+    uuid_s = parts[0].strip() if parts and parts[0].strip() else "<missing>"
+    round_s = "<unknown>"
+    try:
+        if len(parts) >= 3:
+            sp_tokens = parts[1].split(",")
+            nu_tokens = parts[2].split(",")
+            if len(sp_tokens) >= 9 and len(nu_tokens) >= 1:
+                chang = int(sp_tokens[7]) - 75
+                ju = int(sp_tokens[8]) - 78
+                ben = int(nu_tokens[0])
+                round_s = f"({chang}, {ju}, {ben})"
+    except Exception:
+        pass
+    return f"{prefix} (uuid={uuid_s}, round={round_s})"
+
+
 def _parse_bc_line_full(
     line: str,
     *,
@@ -149,7 +168,8 @@ def _parse_bc_line_full(
 ]:
     """Parse one source-v3 BC line (8 cols) or 6-col unlabeled row, returning summary metadata."""
     stripped = line.rstrip("\r\n")
-    ctx = f"line {line_no}" if line_no is not None else "BC line"
+    ctx = _extract_best_effort_round_ctx(line, line_no)
+    line_prefix = f"line {line_no}" if line_no is not None else "BC line"
     if not stripped:
         raise ValueError(f"{ctx}: Blank line in BC source.")
     parts = stripped.split("\t")
@@ -163,7 +183,6 @@ def _parse_bc_line_full(
     uuid = parts[0].strip()
     if not uuid:
         raise ValueError(f"{ctx}: Empty game UUID.")
-    ctx = f"{ctx} ({uuid})"
 
     sp_raw = _parse_int_csv(parts[1], "sparse", ctx)
     if len(sp_raw) > MAX_NUM_ACTIVE_SPARSE_FEATURES:
@@ -181,6 +200,10 @@ def _parse_bc_line_full(
         raise ValueError(f"{ctx}: Expected {NUM_NUMERIC_FEATURES} numeric features, got {len(nu)}.")
     if nu[0] < 0 or nu[1] < 0 or any(abs(x) > _SCORE_BOUND for x in nu):
         raise ValueError(f"{ctx}: Numeric feature out of valid range: {nu}.")
+
+    chang = sp[7] - 75
+    ju = sp[8] - 78
+    ctx = f"{line_prefix} (uuid={uuid}, round=({chang}, {ju}, {nu[0]}))"
 
     pr_raw = _parse_int_csv(parts[3], "progression", ctx)
     if len(pr_raw) > MAX_LENGTH_OF_PROGRESSION_FEATURES:
@@ -219,7 +242,7 @@ def _parse_bc_line_full(
     res_raw = _parse_int_csv(parts[7], "results", ctx)
     if len(res_raw) != NUM_RESULTS:
         raise ValueError(f"{ctx}: Expected {NUM_RESULTS} fields in results, got {len(res_raw)}.")
-    # results layout: [round_delta_scores(4), benchang(1), num_liqibangs(1), post_round_scores(4), final_game_scores(4)]
+    # results layout: [round_delta_scores(4), next_benchang(1), next_num_liqibangs(1), post_round_scores(4), final_game_scores(4)]
     if not 0 <= res_raw[4] < 255 or not 0 <= res_raw[5] < 255:
         raise ValueError(f"{ctx}: Invalid benchang/num_liqibangs in results: {res_raw[4:6]}.")
     if any(abs(s) > _SCORE_BOUND for s in res_raw[0:4] + res_raw[6:14]):
@@ -237,6 +260,13 @@ def parse_bc_line(
 ) -> tuple[str, list[int], list[int], list[int], list[int], int, tuple[int, int, int, int] | None]:
     """Parse one source-v3 BC line (8 cols with 14-int results) or explicit 6-col unlabeled row."""
     return _parse_bc_line_full(line, allow_unlabeled=allow_unlabeled, line_no=line_no)[:7]
+
+
+def _format_round_key_ctx(key: Any) -> str:
+    if isinstance(key, tuple) and len(key) == 5 and isinstance(key[0], str):
+        uuid, sp_seat, sp_chang, sp_ju, ben = key
+        return f"uuid={uuid}, round=({int(sp_chang) - 75}, {int(sp_ju) - 78}, {int(ben)}), seat={int(sp_seat) - SEAT_OFFSET}"
+    return repr(key)
 
 
 def _decode_prog_token(tok: int) -> tuple[str, int, bool]:
@@ -268,6 +298,7 @@ def _order_and_validate_prefix_steps(
     check_v2_events: bool = True,
 ) -> list[int]:
     """Order steps chronologically and reject duplicates or divergent/non-prefix histories."""
+    ctx_str = ctx if isinstance(ctx, str) else _format_round_key_ctx(ctx)
     n_steps = int(sp_t.shape[0])
     pr_lens_arr = (pr_t != NUM_TYPES_OF_PROGRESSION_FEATURES).sum(dim=-1).tolist()
     left_arr = (sp_t[:, 9] - 82).tolist()
@@ -295,11 +326,13 @@ def _order_and_validate_prefix_steps(
             and int(is_own_arr[prev_u]) == int(is_own_arr[u])
             and torch.equal(prev_pr, pr_t[u, :u_plen])
         ):
-            raise ValueError(f"Duplicate decision step in round {ctx} at progression length {u_plen}.")
+            raise ValueError(
+                f"Duplicate decision step in {ctx_str} at progression length {u_plen}."
+            )
 
         if u_plen < prev_plen or not torch.equal(prev_pr, u_pr_prefix):
             raise ValueError(
-                f"Divergent or non-prefix progression history in round {ctx} "
+                f"Divergent or non-prefix progression history in {ctx_str} "
                 f"(lengths {prev_plen} -> {u_plen})."
             )
 
@@ -309,7 +342,7 @@ def _order_and_validate_prefix_steps(
             if u_ev_len < prev_ev_len or not torch.equal(
                 v2_events[prev_u, :prev_ev_len], v2_events[u, :prev_ev_len]
             ):
-                raise ValueError(f"Divergent v2_events stream in round {ctx}.")
+                raise ValueError(f"Divergent v2_events stream in {ctx_str}.")
 
     return order
 
@@ -318,108 +351,190 @@ def _validate_games_completeness(
     game_meta: dict[str, tuple[int, int]],
     phys_rounds: dict[tuple[str, int, int, int], dict[str, Any]],
 ) -> None:
-    """Enforce complete-game & complete-round structural integrity across source-v3 games."""
+    """Enforce complete-game & complete-round Majsoul rules across source-v3 games."""
     rounds_by_uuid: dict[str, list[tuple[int, int, int, dict[str, Any]]]] = {}
     for (uuid, chang, ju, ben), info in phys_rounds.items():
+        r_ctx = f"uuid={uuid}, round=({chang}, {ju}, {ben})"
+        game_mode = game_meta[uuid][1]
+        if game_mode not in (5, 6):
+            raise ValueError(f"{r_ctx}: Expected 4-player Tonpuusen (5) or Hanchan (6) mode, got {game_mode}.")
+        max_chang = 1 if game_mode == 5 else 2
+        if chang > max_chang:
+            raise ValueError(
+                f"{r_ctx}: Invalid chang={chang} for game_mode={game_mode} (max={max_chang})."
+            )
+
+        if not info.get("table_sum_ok", True):
+            raise ValueError(
+                f"{r_ctx}: Table point sum conservation failed (expected 100000 including riichi sticks)."
+            )
+
         # Verify cross-seat consistency within physical round (same max_pr prefix & round outcome)
         max_pr: tuple[int, ...] = max(info["all_prs"], key=len)
         if not max_pr or max_pr[0] != 0:
-            raise ValueError(f"Physical round ({uuid}, {chang}, {ju}, {ben}) has invalid progression start.")
+            raise ValueError(f"{r_ctx}: Invalid progression start {max_pr[:1]}.")
         for pr_seq in info["all_prs"]:
             if pr_seq != max_pr[: len(pr_seq)]:
-                raise ValueError(
-                    f"Observer seats disagree on progression inside round ({uuid}, {chang}, {ju}, {ben})."
-                )
+                raise ValueError(f"{r_ctx}: Observer seats disagree on progression inside round.")
 
         # Dealer must open the round at progression == (0,)
         seat_prs: dict[int, set[tuple[int, ...]]] = info["seat_prs"]
         if ju not in seat_prs or (0,) not in seat_prs[ju]:
-            raise ValueError(
-                f"Truncated round start in ({uuid}, {chang}, {ju}, {ben}): missing dealer {ju} opening step."
-            )
+            raise ValueError(f"{r_ctx}: Truncated round start (missing dealer {ju} opening step).")
+        if info.get("init_nu") is None:
+            raise ValueError(f"{r_ctx}: Missing initial round state at dealer opening progression=(0,).")
 
         # Every non-riichi action (or non-dahai action even during riichi) must have a recorded step
         riichi_active = [False, False, False, False]
         for i in range(1, len(max_pr)):
-            kind, actor, is_riichi = _decode_prog_token(max_pr[i])
+            try:
+                kind, actor, is_riichi = _decode_prog_token(max_pr[i])
+            except ValueError as exc:
+                raise ValueError(f"{r_ctx}: {exc}") from exc
             if (not riichi_active[actor]) or (kind != "dahai"):
                 prefix_i = max_pr[:i]
                 if prefix_i not in seat_prs.get(actor, ()):
                     raise ValueError(
-                        f"Incomplete round ({uuid}, {chang}, {ju}, {ben}): missing seat {actor} "
-                        f"decision at progression length {i} for {kind}."
+                        f"{r_ctx}: Incomplete round (missing seat {actor} decision at progression length {i} for {kind})."
                     )
             if is_riichi:
                 riichi_active[actor] = True
 
-        # Validate trailing decision steps against round_summary
+        # Validate trailing decision steps & structural encoding against round_summary
         rs_raw: tuple[int, ...] = info["rs_raw"]
         seat_actions_at_max: dict[int, set[int]] = info["seat_actions_at_max"]
+        if not rs_raw:
+            raise ValueError(f"{r_ctx}: Empty round_summary.")
         if rs_raw[0] <= 15:
-            # Every winner encoded in round_summary must have declared Tsumo (219) or Ron (543..545) at max_pr
+            if len(rs_raw) > 3:
+                raise ValueError(f"{r_ctx}: Win round_summary has too many codes: {rs_raw}.")
             for code in rs_raw:
                 if code <= 3:
+                    if len(rs_raw) != 1:
+                        raise ValueError(f"{r_ctx}: Tsumo round_summary cannot combine multiple wins: {rs_raw}.")
                     winner = code
                     expected_acts = {219}
                 elif code <= 15:
                     winner = (code - 4) // 3
                     expected_acts = {543, 544, 545}
                 else:
-                    continue
+                    raise ValueError(f"{r_ctx}: Mixed win and non-win round_summary codes: {rs_raw}.")
                 if not (seat_actions_at_max.get(winner, set()) & expected_acts):
                     raise ValueError(
-                        f"Incomplete win round ({uuid}, {chang}, {ju}, {ben}): missing winning decision "
-                        f"for seat {winner} (round_summary={rs_raw})."
+                        f"{r_ctx}: Incomplete win round (missing winning decision for seat {winner}, round_summary={rs_raw})."
                     )
         elif 16 <= rs_raw[0] <= 27:
-            # Exhaustive wall draw must reach late wall (accounting for auto-tsumogiri / 4-kan remainder <= 4)
+            if not (4 <= len(rs_raw) <= 7) or any(not (16 <= c <= 27) for c in rs_raw):
+                raise ValueError(f"{r_ctx}: Invalid exhaustive-draw round_summary={rs_raw}.")
             if info["min_left"] > 4:
                 raise ValueError(
-                    f"Truncated exhaustive-draw round ({uuid}, {chang}, {ju}, {ben}): "
-                    f"min left_tiles={info['min_left']} > 4."
+                    f"{r_ctx}: Truncated exhaustive-draw round (min left_tiles={info['min_left']} > 4)."
                 )
+        elif rs_raw[0] == 28:
+            if rs_raw != (28,):
+                raise ValueError(f"{r_ctx}: Invalid abortive-draw round_summary={rs_raw}.")
+        else:
+            raise ValueError(f"{r_ctx}: Unknown round_summary code {rs_raw[0]} in {rs_raw}.")
 
         rounds_by_uuid.setdefault(uuid, []).append((chang, ju, ben, info))
 
     for uuid, rlist in rounds_by_uuid.items():
         rlist.sort(key=lambda item: (item[0], item[1], item[2]))
-        if (rlist[0][0], rlist[0][1], rlist[0][2]) != (0, 0, 0):
+        oc, oj, ob, open_info = rlist[0]
+        if (oc, oj, ob) != (0, 0, 0):
             raise ValueError(
-                f"Truncated game {uuid}: first observed round is {(rlist[0][0], rlist[0][1], rlist[0][2])}, expected (0, 0, 0)."
+                f"uuid={uuid}, round=({oc}, {oj}, {ob}): Truncated game; first observed round is not (0, 0, 0)."
             )
-        for pos in range(1, len(rlist)):
-            pc, pj, pb, _ = rlist[pos - 1]
-            cc, cj, cb, _ = rlist[pos]
-            p_idx = pc * 4 + pj
-            c_idx = cc * 4 + cj
-            same_dealer_cont = (c_idx == p_idx) and (cb == pb + 1)
-            next_dealer_step = (c_idx == p_idx + 1) and (cb in (0, pb + 1))
-            if not (same_dealer_cont or next_dealer_step):
+        if open_info["init_nu"] != (0, 0, 25000, 25000, 25000, 25000):
+            raise ValueError(
+                f"uuid={uuid}, round=({oc}, {oj}, {ob}): Expected opening numeric (0, 0, 25000, 25000, 25000, 25000), "
+                f"got {open_info['init_nu']}."
+            )
+
+        for pos in range(len(rlist)):
+            pc, pj, pb, prev_info = rlist[pos]
+            p_ctx = f"uuid={uuid}, round=({pc}, {pj}, {pb})"
+            prev_rs: tuple[int, ...] = prev_info["rs_raw"]
+            prev_res: tuple[int, ...] = prev_info["results"]
+            is_last = pos == len(rlist) - 1
+
+            if is_last:
+                if prev_rs[0] == 28:
+                    raise ValueError(
+                        f"{p_ctx}: Game cannot terminate on abortive draw (RecordLiuJu) without subsequent round."
+                    )
+                post_scores = tuple(int(x) for x in prev_res[6:10])
+                final_scores = tuple(int(x) for x in prev_res[10:14])
+                if prev_res[4] != 0 or prev_res[5] != 0:
+                    if not (prev_res[4] == 0 and prev_rs[0] >= 16 and prev_res[5] > 0 and post_scores != final_scores):
+                        raise ValueError(
+                            f"{p_ctx}: Final round next_benchang/next_num_liqibangs unexpectedly non-zero: {prev_res[4:6]}."
+                        )
+
+                game_mode = game_meta[uuid][1]
+                min_end_idx = 3 if game_mode == 5 else 7  # Tonpuusen East-4 (3) vs Hanchan South-4 (7)
+                hard_cap_idx = 7 if game_mode == 5 else 11  # Tonpuusen South-4 (7) vs Hanchan West-4 (11)
+                if not any(s < 0 for s in post_scores):
+                    if (pc * 4 + pj) < min_end_idx:
+                        raise ValueError(
+                            f"{p_ctx}: Game ended prematurely without tobi; post_scores={post_scores}."
+                        )
+                    if (pc * 4 + pj) < hard_cap_idx and max(post_scores) < 30000:
+                        raise ValueError(
+                            f"{p_ctx}: Game ended before hard cap without reaching 30000 threshold; post_scores={post_scores}."
+                        )
+
+                if post_scores != final_scores:
+                    kyot = int(prev_res[5])
+                    top_seat = int(scores_to_ranks(torch.tensor([post_scores], dtype=torch.int64))[0].argmin().item())
+                    expected_fin = tuple(
+                        post_scores[i] + (1000 * kyot if i == top_seat else 0) for i in range(4)
+                    )
+                    if not ((prev_rs[0] >= 16 or any(s < 0 for s in post_scores)) and kyot > 0 and final_scores == expected_fin):
+                        raise ValueError(
+                            f"{p_ctx}: Final round post_scores={post_scores} do not match final_game_scores={final_scores} "
+                            f"(kyot={kyot}, top_seat={top_seat})."
+                        )
+                continue
+
+            cc, cj, cb, curr_info = rlist[pos + 1]
+            c_init = curr_info["init_nu"]
+            if c_init[0] != cb or c_init[1] != prev_res[5] or c_init[2:6] != prev_res[6:10]:
                 raise ValueError(
-                    f"Truncated or non-contiguous game {uuid}: round {(pc, pj, pb)} -> {(cc, cj, cb)}."
+                    f"{p_ctx}: Score/riichi carryover mismatch into round=({cc}, {cj}, {cb}); "
+                    f"prev results={prev_res[4:10]} vs next init={c_init}."
                 )
 
-        lc, lj, _lb, last_info = rlist[-1]
-        game_mode = game_meta[uuid][1]
-        min_end_idx = 3 if game_mode == 5 else 7  # Tonpuusen East-4 (3) vs Hanchan South-4 (7)
-        post_scores = tuple(int(x) for x in last_info["results"][6:10])
-        final_scores = tuple(int(x) for x in last_info["results"][10:14])
-        if not any(s < 0 for s in post_scores) and (lc * 4 + lj) < min_end_idx:
-            raise ValueError(
-                f"Truncated game {uuid}: ended early at (chang={lc}, ju={lj}) with post_scores={post_scores}."
-            )
-        if post_scores != final_scores:
-            kyot = int(last_info["results"][5])
-            draw_kyotaku_match = (
-                last_info["rs_raw"][0] >= 16
-                and kyot > 0
-                and sorted(final_scores[i] - post_scores[i] for i in range(4)) == [0, 0, 0, 1000 * kyot]
-            )
-            if not draw_kyotaku_match:
-                raise ValueError(
-                    f"Truncated game {uuid}: final round post_scores={post_scores} "
-                    f"do not match final_game_scores={final_scores}."
+            p_idx = pc * 4 + pj
+            c_idx = cc * 4 + cj
+            if prev_rs[0] <= 15:
+                dealer_won = any(
+                    code == pj or (4 <= code <= 15 and (code - 4) // 3 == pj)
+                    for code in prev_rs
                 )
+                if dealer_won:
+                    if not (c_idx == p_idx and cb == pb + 1 and prev_res[4] == pb + 1 and prev_res[5] == 0):
+                        raise ValueError(
+                            f"{p_ctx}: Dealer win transition to round=({cc}, {cj}, {cb}) violates renchan/honba/riichi rules "
+                            f"(rs={prev_rs}, res={prev_res[4:6]})."
+                        )
+                elif not (c_idx == p_idx + 1 and cb == 0 and prev_res[4] == 0 and prev_res[5] == 0):
+                    raise ValueError(
+                        f"{p_ctx}: Non-dealer win transition to round=({cc}, {cj}, {cb}) violates lunzhuang/honba/riichi rules "
+                        f"(rs={prev_rs}, res={prev_res[4:6]})."
+                    )
+            elif 16 <= prev_rs[0] <= 27:
+                if not (cb == pb + 1 and prev_res[4] == pb + 1 and c_idx in (p_idx, p_idx + 1)):
+                    raise ValueError(
+                        f"{p_ctx}: Exhaustive draw transition to round=({cc}, {cj}, {cb}) violates renchan/lunzhuang/honba rules "
+                        f"(rs={prev_rs}, res={prev_res[4:6]})."
+                    )
+            else:  # prev_rs[0] == 28 (RecordLiuJu)
+                if not (c_idx == p_idx and cb == pb + 1 and prev_res[4] == pb + 1):
+                    raise ValueError(
+                        f"{p_ctx}: Abortive draw transition to round=({cc}, {cj}, {cb}) violates renchan/honba rules "
+                        f"(rs={prev_rs}, res={prev_res[4:6]})."
+                    )
 
 
 def parse_bc_rounds(
@@ -466,25 +581,27 @@ def parse_bc_rounds(
             uuid, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len = _parse_bc_line_full(
                 line, allow_unlabeled=allow_unlabeled, line_no=line_no + 1
             )
+            seat = sp[SEAT_INDEX] - SEAT_OFFSET
+            chang = sp[7] - 75
+            ju = sp[8] - 78
+            l_ctx = f"line {line_no + 1} (uuid={uuid}, round=({chang}, {ju}, {nu[0]}))"
+
             is_labeled = final_scores is not None
             if seen_labeled is None:
                 seen_labeled = is_labeled
             elif seen_labeled != is_labeled:
                 raise ValueError(
-                    f"line {line_no + 1} ({uuid}): Mixed 6-column unlabeled and 8-column labeled rows."
+                    f"{l_ctx}: Mixed 6-column unlabeled and 8-column labeled rows."
                 )
 
-            seat = sp[SEAT_INDEX] - SEAT_OFFSET
-            chang = sp[7] - 75
-            ju = sp[8] - 78
             if not 0 <= seat < 4 or not 0 <= chang < 3 or not 0 <= ju < 4:
-                raise ValueError(f"line {line_no + 1} ({uuid}): Invalid observer seat/chang/ju.")
+                raise ValueError(f"{l_ctx}: Invalid observer seat/chang/ju.")
 
             meta = (sp[0], sp[1])
             if uuid in game_meta:
                 if game_meta[uuid] != meta:
                     raise ValueError(
-                        f"line {line_no + 1} ({uuid}): Inconsistent room/mode {game_meta[uuid]} vs {meta}."
+                        f"{l_ctx}: Inconsistent room/mode {game_meta[uuid]} vs {meta}."
                     )
             else:
                 game_meta[uuid] = meta
@@ -492,8 +609,8 @@ def parse_bc_rounds(
             if uuid in scores_by_game:
                 if scores_by_game[uuid] != final_scores:
                     raise ValueError(
-                        f"line {line_no + 1} ({uuid}): Inconsistent final_game_scores for game {uuid} "
-                        f"(seat {seat}): {scores_by_game[uuid]} vs {final_scores}."
+                        f"{l_ctx}: Inconsistent final_game_scores for seat {seat}: "
+                        f"{scores_by_game[uuid]} vs {final_scores}."
                     )
             else:
                 scores_by_game[uuid] = final_scores
@@ -501,6 +618,7 @@ def parse_bc_rounds(
             if rs_raw is not None and res_raw is not None:
                 phys_key = (uuid, chang, ju, nu[0])
                 pinfo = phys_rounds.get(phys_key)
+                step_table_ok = (nu[2] + nu[3] + nu[4] + nu[5] + 1000 * nu[1]) == 100000
                 if pinfo is None:
                     pinfo = {
                         "rs_raw": rs_raw,
@@ -509,15 +627,26 @@ def parse_bc_rounds(
                         "seat_prs": {},
                         "seat_actions_at_max": {},
                         "min_left": sp[9] - 82,
+                        "init_nu": tuple(nu) if pr_len == 1 else None,
+                        "table_sum_ok": step_table_ok,
                     }
                     phys_rounds[phys_key] = pinfo
                 else:
+                    if not step_table_ok:
+                        pinfo["table_sum_ok"] = False
+                    if pr_len == 1:
+                        if pinfo["init_nu"] is None:
+                            pinfo["init_nu"] = tuple(nu)
+                        elif pinfo["init_nu"] != tuple(nu):
+                            raise ValueError(
+                                f"{l_ctx}: Conflicting initial numeric state at progression=(0,): "
+                                f"{pinfo['init_nu']} vs {tuple(nu)}."
+                            )
                     if (not allow_incomplete) and (
                         pinfo["rs_raw"] != rs_raw or pinfo["results"] != res_raw
                     ):
                         raise ValueError(
-                            f"line {line_no + 1} ({uuid}): Conflicting round_summary/results within "
-                            f"physical round {(chang, ju, nu[0])}."
+                            f"{l_ctx}: Conflicting round_summary/results within physical round."
                         )
                 pr_tuple = tuple(pr[:pr_len])
                 pinfo["all_prs"].append(pr_tuple)
@@ -535,8 +664,10 @@ def parse_bc_rounds(
     if not parsed_rows:
         return []
     if not allow_incomplete and seen_labeled is False:
+        first_ctx = _format_round_key_ctx(parsed_rows[0][0])
         raise ValueError(
-            "Complete game/round reconstruction requires 8-column source-v3 rows with round_summary and results."
+            f"{first_ctx}: Complete game/round reconstruction requires 8-column source-v3 rows "
+            "with round_summary and results."
         )
 
     # Record each seat's chosen action at that physical round's longest progression for trailing win checks
@@ -597,7 +728,7 @@ def parse_bc_rounds(
         rk_sub = [rk_vals[i] for i in order]
         has_lab = [r >= 0 for r in rk_sub]
         if any(has_lab) and not all(has_lab):
-            raise ValueError(f"Round group {key} mixes labeled and unlabeled steps.")
+            raise ValueError(f"{_format_round_key_ctx(key)}: Round group mixes labeled and unlabeled steps.")
         rk_t = torch.tensor(rk_sub, dtype=torch.long) if all(has_lab) else None
         rounds.append(
             RoundTrajectory(
@@ -1411,6 +1542,28 @@ def _compute_bc_grad_norm_and_nonfinite(
     return total_norm, ~torch.isfinite(total_norm)
 
 
+def _expected_inactive_bc_param_ids(model: TrajectoryBCModel) -> set[int]:
+    """Return parameter IDs statically bypassed by BC preset flags."""
+    inactive: set[int] = set()
+    bb = model.backbone
+    if bb.head_type == "flat546":
+        inactive.update(
+            {
+                id(bb.decoder2.null_tile_emb),
+                id(bb.decoder2.null_source_emb),
+                id(bb.decoder2.action_type_emb.weight),
+            }
+        )
+    if bb.n_d1_layers == 0:
+        inactive.add(id(bb.decoder1.no_event_seat_emb.weight))
+        if model.next_event_head is None or model.next_event_weight <= 0.0:
+            inactive.add(id(bb.tile_emb.red5_emb.weight))
+            for name, param in bb.decoder1.named_parameters():
+                if not name.startswith("disabled_d1_mem"):
+                    inactive.add(id(param))
+    return inactive
+
+
 def train_trajectory_bc_steps(
     model: TrajectoryBCModel,
     rounds: Sequence[RoundTrajectory],
@@ -1437,6 +1590,15 @@ def train_trajectory_bc_steps(
     post_backward_hook: Callable[[nn.Module, torch.optim.Optimizer, int], None] | None = None,
 ) -> dict[str, Any]:
     """Deterministic single/multi-step round-trajectory BC training loop with pre-update safety."""
+    from kanachan.training.iql.joint_v2 import (
+        _collect_reachable_autograd_param_ids,
+        _grad_scaler_detect_nonfinite,
+        _grad_scaler_inject_step_bad,
+        _grad_scaler_reset_optimizer_state,
+        _optimizer_step_with_grad_scaler,
+        _sync_ddp_fatal_code,
+    )
+
     sampler = LengthBucketBatchSampler(
         [r.round_event_len for r in rounds], batch_size=batch_size, seed=sampler_seed
     )
@@ -1476,6 +1638,7 @@ def train_trajectory_bc_steps(
         device.type == "cuda"
         and bool(optimizer.param_groups)
         and all(bool(g.get("fused", False)) for g in optimizer.param_groups)
+        and bool(getattr(optimizer, "_step_supports_amp_scaling", False))
         and isinstance(optimizer, torch.optim.AdamW)
         and scheduler is None
     )
@@ -1496,6 +1659,7 @@ def train_trajectory_bc_steps(
         (), int(stats_restored.get("nonfinite_grad_steps", 0)), device=device, dtype=torch.int64
     )
 
+    inactive_ids = _expected_inactive_bc_param_ids(raw)
     model.train()
     step = start_step
     last_metrics: dict[str, float] = {}
@@ -1542,20 +1706,94 @@ def train_trajectory_bc_steps(
             batch_dev = {k: v.to(device=device, non_blocking=True) for k, v in batch_cpu.items()}
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_dtype or torch.float32,
-                enabled=bool(is_amp),
-                cache_enabled=False,
-            ):
-                out = model(batch_dev)
-                loss = out["loss"]
-                if loss_transform is not None:
-                    loss = loss_transform(loss, step)
+            active_trainable_named = [
+                (n, p)
+                for n, p in raw.named_parameters()
+                if p.requires_grad and id(p) not in inactive_ids
+            ]
+            opt_trainable_ids = {
+                id(p)
+                for g in optimizer.param_groups
+                for p in g["params"]
+                if p.requires_grad
+            }
+            pre_code = 0
+            pre_disconnected: list[str] = []
+            if not active_trainable_named or not opt_trainable_ids:
+                pre_code = 1
+                loss = None
+            else:
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=amp_dtype or torch.float32,
+                    enabled=bool(is_amp),
+                    cache_enabled=False,
+                ):
+                    out = model(batch_dev)
+                    loss = out["loss"]
+                    if loss_transform is not None:
+                        loss = loss_transform(loss, step)
+                if (
+                    not isinstance(loss, Tensor)
+                    or loss.numel() != 1
+                    or not loss.requires_grad
+                    or loss.grad_fn is None
+                ):
+                    pre_code = 2
+                else:
+                    reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
+                    if not (reachable_ids & opt_trainable_ids):
+                        pre_code = 3
+                        pre_disconnected = ["<no optimizer parameters connected to loss>"]
+                    elif not has_reentrant_ckpt:
+                        pre_disconnected = [
+                            n for n, p in active_trainable_named if id(p) not in reachable_ids
+                        ]
+                        if pre_disconnected:
+                            pre_code = 3
 
+            synced_pre = _sync_ddp_fatal_code(
+                pre_code, is_dist=is_dist, world_size=world_size, device=device
+            )
+            if synced_pre != 0:
+                optimizer.zero_grad(set_to_none=True)
+                _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                suffix = " [propagated across DDP]" if (is_dist and world_size > 1 and pre_code == 0) else ""
+                if synced_pre == 1:
+                    raise RuntimeError(
+                        f"No trainable parameters remain active in BC model/optimizer; aborting step{suffix}."
+                    )
+                if synced_pre == 3:
+                    raise RuntimeError(
+                        "Disconnected BC computation graph detected before backward: trainable parameters "
+                        f"not connected to loss ({pre_disconnected[:8]}{'...' if len(pre_disconnected) > 8 else ''}){suffix}."
+                    )
+                raise RuntimeError(
+                    "BC training loss has no autograd graph (requires_grad=False or grad_fn is None); "
+                    f"aborting before backward/optimizer update{suffix}."
+                )
+
+            assert isinstance(loss, Tensor)
             loss_bad = (~torch.isfinite(loss.detach())).reshape(())
-            if loss.requires_grad:
-                scaler.scale(loss).backward()
+            scaler.scale(loss).backward()
+
+            grads_on_opt = [
+                p for _, p in active_trainable_named if p.grad is not None and id(p) in opt_trainable_ids
+            ]
+            disconnected = [n for n, p in active_trainable_named if p.grad is None]
+            post_code = 1 if (not grads_on_opt or disconnected) else 0
+            synced_post = _sync_ddp_fatal_code(
+                post_code, is_dist=is_dist, world_size=world_size, device=device
+            )
+            if synced_post != 0:
+                optimizer.zero_grad(set_to_none=True)
+                _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                suffix = " [propagated across DDP]" if (is_dist and world_size > 1 and post_code == 0) else ""
+                raise RuntimeError(
+                    "Disconnected BC computation graph after backward: trainable parameters received "
+                    f"no gradients ({disconnected[:8]}{'...' if len(disconnected) > 8 else ''}){suffix}."
+                )
+
             if post_backward_hook is not None:
                 post_backward_hook(model, optimizer, step)
             if scaler.is_enabled():
@@ -1571,11 +1809,9 @@ def train_trajectory_bc_steps(
 
             grad_norm, grad_bad = _compute_bc_grad_norm_and_nonfinite(grads, device=device)
             if scaler.is_enabled():
-                opt_state = scaler._per_optimizer_states[id(optimizer)]
-                found_map = opt_state["found_inf_per_device"]
-                scaler_bad = zero_f32 > 1.0
-                for v in found_map.values():
-                    scaler_bad = scaler_bad | (v.to(device=device, dtype=torch.float32) > 0.0)
+                scaler_bad = _grad_scaler_detect_nonfinite(
+                    scaler, optimizer, device=device, zero_f32=zero_f32
+                )
                 grad_bad = grad_bad | scaler_bad
             step_bad = loss_bad | grad_bad
 
@@ -1594,25 +1830,15 @@ def train_trajectory_bc_steps(
                     params_with_grad, float(grad_clip), safe_norm
                 )
 
-            found_inf_f32 = step_bad.to(dtype=torch.float32)
             if scaler.is_enabled():
-                opt_state = scaler._per_optimizer_states[id(optimizer)]
-                found_map = opt_state["found_inf_per_device"]
-                if found_map:
-                    for d_key in list(found_map.keys()):
-                        cur = found_map[d_key]
-                        found_map[d_key] = torch.maximum(
-                            cur, found_inf_f32.to(device=cur.device, dtype=cur.dtype)
-                        )
-                else:
-                    found_map[device] = found_inf_f32
+                _grad_scaler_inject_step_bad(scaler, optimizer, step_bad=step_bad, device=device)
 
             if can_gpu_fused_guard:
                 if scaler.is_enabled():
-                    optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
-                    scaler.step(optimizer)
+                    _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
                     scaler.update()
                 else:
+                    found_inf_f32 = step_bad.to(dtype=torch.float32)
                     optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
                     optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
                     try:
@@ -1626,7 +1852,7 @@ def train_trajectory_bc_steps(
                 bad_host = bool(step_bad.item())
                 if not bad_host:
                     if scaler.is_enabled():
-                        scaler.step(optimizer)
+                        _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
                         scaler.update()
                     else:
                         optimizer.step()
