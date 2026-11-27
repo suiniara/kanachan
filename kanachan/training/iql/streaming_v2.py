@@ -471,6 +471,7 @@ class StreamingIQLDataset:
         self._prefetch_queue: queue.Queue[Any] | None = None
         self._stop_event: threading.Event | None = None
         self._worker: threading.Thread | None = None
+        self._worker_error: BaseException | None = None
         self._last_batch: TensorDict | None = None
         self._cached_zero_ghost: TensorDict | None = None
 
@@ -643,40 +644,44 @@ class StreamingIQLDataset:
             "undos": [],
         }
 
-        needed_pass_transitions = (self.pass_batches_emitted + 1) * self.batch_size
-        while not self._eof and (
-            self._reservoir.length < self.warmup_transitions
-            or self.pass_transitions_seen < needed_pass_transitions
-        ):
-            game = self._read_next_owned_game()
-            if game is None:
-                break
-            n_rows = int(game["act"].shape[0])
-            snap["undos"].append(self._reservoir.ingest_game(game, self._ingest_rng))
-            self.pass_transitions_seen += n_rows
+        try:
+            needed_pass_transitions = (self.pass_batches_emitted + 1) * self.batch_size
+            while not self._eof and (
+                self._reservoir.length < self.warmup_transitions
+                or self.pass_transitions_seen < needed_pass_transitions
+            ):
+                game = self._read_next_owned_game()
+                if game is None:
+                    break
+                n_rows = int(game["act"].shape[0])
+                snap["undos"].append(self._reservoir.ingest_game(game, self._ingest_rng))
+                self.pass_transitions_seen += n_rows
 
-        if self._eof and self.pass_target_batches is None:
-            if self.pass_transitions_seen == 0:
-                self.pass_target_batches = 0
-            elif self.drop_last:
-                self.pass_target_batches = self.pass_transitions_seen // self.batch_size
-            else:
-                self.pass_target_batches = math.ceil(self.pass_transitions_seen / self.batch_size)
+            if self._eof and self.pass_target_batches is None:
+                if self.pass_transitions_seen == 0:
+                    self.pass_target_batches = 0
+                elif self.drop_last:
+                    self.pass_target_batches = self.pass_transitions_seen // self.batch_size
+                else:
+                    self.pass_target_batches = math.ceil(self.pass_transitions_seen / self.batch_size)
 
-        if self._eof and self.pass_target_batches is not None:
-            if self.pass_batches_emitted >= self.pass_target_batches or self._reservoir.length == 0:
-                return None, snap
+            if self._eof and self.pass_target_batches is not None:
+                if self.pass_batches_emitted >= self.pass_target_batches or self._reservoir.length == 0:
+                    return None, snap
 
-        raw = self._reservoir.sample_batch(self.batch_size, self._sample_rng)
-        perm_idx = (
-            int(torch.randint(0, 6, (1,), generator=self._aug_rng).item())
-            if self.suit_augmentation
-            else 0
-        )
-        raw["perm_idx"] = torch.tensor(perm_idx, dtype=torch.int64)
-        self.pass_batches_emitted += 1
-        self.total_batches_emitted += 1
-        return raw, snap
+            raw = self._reservoir.sample_batch(self.batch_size, self._sample_rng)
+            perm_idx = (
+                int(torch.randint(0, 6, (1,), generator=self._aug_rng).item())
+                if self.suit_augmentation
+                else 0
+            )
+            raw["perm_idx"] = torch.tensor(perm_idx, dtype=torch.int64)
+            self.pass_batches_emitted += 1
+            self.total_batches_emitted += 1
+            return raw, snap
+        except BaseException:
+            self._rollback_snapshot(snap)
+            raise
 
     def _build_tensordict_batch(self, raw: dict[str, Tensor], *, batch_weight: float = 1.0) -> TensorDict:
         bsz = int(raw["act"].shape[0])
@@ -730,8 +735,18 @@ class StreamingIQLDataset:
         self._sample_rng.set_state(snap["sample_rng"])
         self._aug_rng.set_state(snap["aug_rng"])
 
-    def _stop_prefetcher(self, rollback_queued: bool = False) -> None:
+    def _stop_prefetcher(
+        self,
+        rollback_queued: bool = False,
+        *,
+        raise_worker_error: bool = True,
+    ) -> None:
         if self._worker is None:
+            if raise_worker_error:
+                with self._lock:
+                    err = self._worker_error
+                if err is not None:
+                    raise err
             return
         assert self._stop_event is not None and self._prefetch_queue is not None
         self._stop_event.set()
@@ -741,17 +756,25 @@ class StreamingIQLDataset:
                 item = self._prefetch_queue.get_nowait()
             except queue.Empty:
                 if not self._worker.is_alive():
-                    break
-                self._worker.join(timeout=0.05)
+                    try:
+                        item = self._prefetch_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                else:
+                    self._worker.join(timeout=0.02)
+                    continue
+            if item is _SENTINEL:
                 continue
-            if item is _SENTINEL or (isinstance(item, tuple) and item[0] == "err"):
+            if isinstance(item, tuple) and item[0] == "err":
+                with self._lock:
+                    if self._worker_error is None:
+                        self._worker_error = item[1]
                 continue
             if isinstance(item, tuple) and item[0] == "ok":
                 drained.append(item[2])
             elif isinstance(item, tuple) and item[0] == "eof":
                 drained.append(item[1])
-        if self._worker.is_alive():
-            self._worker.join(timeout=2.0)
+        self._worker.join()
         if rollback_queued and drained:
             # Undo unconsumed queued batches AND pre-fetched EOF transitions in reverse order.
             with self._lock:
@@ -761,6 +784,11 @@ class StreamingIQLDataset:
         self._worker = None
         self._prefetch_queue = None
         self._stop_event = None
+        if raise_worker_error:
+            with self._lock:
+                err = self._worker_error
+            if err is not None:
+                raise err
 
     def _ensure_prefetcher_started(self) -> None:
         if self.max_prefetch <= 0 or self._worker is not None:
@@ -780,25 +808,35 @@ class StreamingIQLDataset:
             return False
 
         def _worker_fn() -> None:
+            cur_snap: dict[str, Any] | None = None
             try:
                 while not stop.is_set():
                     with self._lock:
                         if stop.is_set():
                             break
-                        raw, snap = self._produce_next_raw_with_rollback()
+                        raw, cur_snap = self._produce_next_raw_with_rollback()
                     if raw is None:
-                        if not _put(("eof", snap)):
+                        if not _put(("eof", cur_snap)):
                             with self._lock:
-                                if snap is not None:
-                                    self._rollback_snapshot(snap)
+                                if cur_snap is not None:
+                                    self._rollback_snapshot(cur_snap)
+                        cur_snap = None
                         return
                     td = self._build_tensordict_batch(raw, batch_weight=1.0)
-                    if not _put(("ok", td, snap)):
+                    if not _put(("ok", td, cur_snap)):
                         with self._lock:
-                            if snap is not None:
-                                self._rollback_snapshot(snap)
+                            if cur_snap is not None:
+                                self._rollback_snapshot(cur_snap)
+                        cur_snap = None
                         return
+                    cur_snap = None
             except BaseException as exc:  # noqa: BLE001
+                with self._lock:
+                    if cur_snap is not None:
+                        self._rollback_snapshot(cur_snap)
+                        cur_snap = None
+                    if self._worker_error is None:
+                        self._worker_error = exc
                 _put(("err", exc))
 
         t = threading.Thread(target=_worker_fn, name="iql-v2-prefetch", daemon=True)
@@ -807,15 +845,22 @@ class StreamingIQLDataset:
 
     def next_batch(self) -> TensorDict | None:
         if self.max_prefetch > 0:
+            with self._lock:
+                err = self._worker_error
+            if err is not None:
+                raise err
             self._ensure_prefetcher_started()
             assert self._prefetch_queue is not None
             while True:
                 item = self._prefetch_queue.get()
                 if item is _SENTINEL or (isinstance(item, tuple) and item[0] == "eof"):
-                    self._stop_prefetcher(rollback_queued=False)
+                    self._stop_prefetcher(rollback_queued=False, raise_worker_error=True)
                     return None
                 if item[0] == "err":
-                    self._stop_prefetcher(rollback_queued=False)
+                    with self._lock:
+                        if self._worker_error is None:
+                            self._worker_error = item[1]
+                    self._stop_prefetcher(rollback_queued=False, raise_worker_error=True)
                     raise item[1]
                 td = item[1]
                 self._last_batch = td
@@ -888,7 +933,7 @@ class StreamingIQLDataset:
 
     def state_dict(self) -> dict[str, Any]:
         """Pause background prefetch, roll back unconsumed items cleanly, and return exact stream state."""
-        self._stop_prefetcher(rollback_queued=True)
+        self._stop_prefetcher(rollback_queued=True, raise_worker_error=True)
         with self._lock:
             return {
                 "format": "kanachan_iql_stream_v2",
@@ -915,8 +960,9 @@ class StreamingIQLDataset:
             }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        self._stop_prefetcher(rollback_queued=False)
+        self._stop_prefetcher(rollback_queued=False, raise_worker_error=False)
         with self._lock:
+            self._worker_error = None
             if state.get("format") != "kanachan_iql_stream_v2":
                 raise ValueError("Invalid StreamingIQLDataset checkpoint state format (expected v2).")
             if state.get("source_data_sha256") != self.source_data_sha256:
@@ -950,8 +996,9 @@ class StreamingIQLDataset:
 
     def reset_pass(self) -> None:
         """Reset current-pass cursor/counters for another epoch while keeping cumulative reservoir & RNGs."""
-        self._stop_prefetcher(rollback_queued=False)
+        self._stop_prefetcher(rollback_queued=False, raise_worker_error=False)
         with self._lock:
+            self._worker_error = None
             self._close_fp()
             self._file_idx = 0
             self._line_in_file = 0
@@ -963,7 +1010,7 @@ class StreamingIQLDataset:
             self.pass_batches_emitted = 0
 
     def close(self) -> None:
-        self._stop_prefetcher(rollback_queued=False)
+        self._stop_prefetcher(rollback_queued=False, raise_worker_error=False)
         with self._lock:
             self._close_fp()
         if hasattr(self._parser_helper, "_DataIterator__fp"):

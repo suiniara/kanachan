@@ -18,13 +18,24 @@ SOURCE_V3_BC_FORMAT_VERSION = "source_v3_bc_v1"
 SOURCE_V3_RL_FORMAT_VERSION = "source_v3_rl_v1"
 
 
-def sha256_file_bytes(path: Path) -> tuple[int, str]:
+def sha256_file_bytes(path: Path, *, chunk_size: int = 1024 * 1024) -> tuple[int, str]:
     """Stream-hash exact on-disk bytes (compressed bytes for .gz) without full file load."""
+    c_size = int(chunk_size)
+    if c_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}.")
     p = Path(path)
-    sz = int(p.stat().st_size)
+    hasher = hashlib.sha256()
+    buf = bytearray(c_size)
+    mv = memoryview(buf)
+    total_bytes = 0
     with p.open("rb") as fp:
-        digest = hashlib.file_digest(fp, "sha256").hexdigest()
-    return sz, digest
+        while True:
+            n = fp.readinto(mv)
+            if not n:
+                break
+            hasher.update(mv[:n])
+            total_bytes += n
+    return total_bytes, hasher.hexdigest()
 
 
 def compute_reward_plugin_sha256(

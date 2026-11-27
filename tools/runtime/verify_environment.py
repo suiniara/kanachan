@@ -23,8 +23,16 @@ os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
 
 def digest(path):
+    h = hashlib.sha256()
+    buf = bytearray(1024 * 1024)
+    mv = memoryview(buf)
     with Path(path).open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+        while True:
+            n = stream.readinto(mv)
+            if not n:
+                break
+            h.update(mv[:n])
+    return h.hexdigest()
 
 
 def compare(left, right):

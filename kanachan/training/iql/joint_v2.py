@@ -32,6 +32,7 @@ from kanachan.structured_v2 import (
 )
 from kanachan.training.core.optimizers import (
     OptimizerCoverageError,
+    consolidate_optimizer_state,
     dummy_ddp_zero_loss,
     move_optimizer_state,
     sync_ddp_step_status,
@@ -229,6 +230,9 @@ def save_joint_iql_checkpoint(
     is_dist = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_dist else 0
     world_size = dist.get_world_size() if is_dist else 1
+
+    if is_dist and world_size > 1:
+        consolidate_optimizer_state(optimizer)
 
     local_rng = capture_rng()
     if is_dist:
@@ -806,7 +810,7 @@ def train_joint_iql_batches(
                         if (ddp_runner and not is_last_micro)
                         else contextlib.nullcontext()
                     )
-                    if not ddp_runner or is_last_micro:
+                    with sync_ctx:
                         with torch.autocast(
                             device_type=device.type,
                             dtype=amp_dtype or torch.float32,
@@ -814,56 +818,47 @@ def train_joint_iql_batches(
                             cache_enabled=False,
                         ):
                             out = runner(batch, amp_dtype=amp_dtype, loss_scale=loss_scale)
-                        if ddp_runner:
+                        if ddp_runner and is_last_micro:
                             last_forward_armed_reducer = True
-                    else:
-                        with sync_ctx, torch.autocast(
-                            device_type=device.type,
-                            dtype=amp_dtype or torch.float32,
-                            enabled=bool(is_amp),
-                            cache_enabled=False,
+                        loss = out["loss"]
+                        if loss_transform is not None:
+                            loss = loss_transform(loss, step)
+
+                        if (
+                            not isinstance(loss, Tensor)
+                            or loss.numel() != 1
+                            or not loss.requires_grad
+                            or loss.grad_fn is None
                         ):
-                            out = runner(batch, amp_dtype=amp_dtype, loss_scale=loss_scale)
-                    loss = out["loss"]
-                    if loss_transform is not None:
-                        loss = loss_transform(loss, step)
-
-                    if (
-                        not isinstance(loss, Tensor)
-                        or loss.numel() != 1
-                        or not loss.requires_grad
-                        or loss.grad_fn is None
-                    ):
-                        local_fatal = True
-                        local_fatal_msg = (
-                            "Training loss has no autograd graph (requires_grad=False or grad_fn is None); "
-                            "aborting before backward/optimizer update."
-                        )
-                        break
-
-                    reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
-                    opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
-                    if not opt_reach:
-                        local_fatal = True
-                        local_fatal_msg = (
-                            "Disconnected computation graph detected before backward: trainable parameters "
-                            "not connected to loss (<no optimizer parameters connected to loss>)."
-                        )
-                        break
-                    if not has_reentrant_ckpt:
-                        pre_disc = [
-                            n for n, p in expected_active_named if id(p) not in reachable_ids
-                        ]
-                        if pre_disc:
                             local_fatal = True
                             local_fatal_msg = (
-                                "Disconnected computation graph detected before backward: trainable parameters "
-                                f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                                "Training loss has no autograd graph (requires_grad=False or grad_fn is None); "
+                                "aborting before backward/optimizer update."
                             )
                             break
 
-                    loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
-                    with sync_ctx:
+                        reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
+                        opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
+                        if not opt_reach:
+                            local_fatal = True
+                            local_fatal_msg = (
+                                "Disconnected computation graph detected before backward: trainable parameters "
+                                "not connected to loss (<no optimizer parameters connected to loss>)."
+                            )
+                            break
+                        if not has_reentrant_ckpt:
+                            pre_disc = [
+                                n for n, p in expected_active_named if id(p) not in reachable_ids
+                            ]
+                            if pre_disc:
+                                local_fatal = True
+                                local_fatal_msg = (
+                                    "Disconnected computation graph detected before backward: trainable parameters "
+                                    f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                                )
+                                break
+
+                        loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
                         scaler.scale(loss).backward()
 
             if local_fatal:

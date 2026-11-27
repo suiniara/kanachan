@@ -1,14 +1,16 @@
-"""Bounded-memory external hash-bucket disk spooling, O(1)-RAM sampler & prefetch for Structured V2 BC (§2)."""
+"""Bounded-memory external hash-bucket disk spooling, radix/fixed-fan-in sampler & prefetch (§2)."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+import contextlib
 import gzip
 import hashlib
 import heapq
 import json
 import math
+import operator
 import queue
 import shutil
 import struct
@@ -60,6 +62,15 @@ assert _INDEX_DTYPE.itemsize == _INDEX_STRUCT.size
 _REC_HDR_STRUCT = struct.Struct("<HHHHbB")  # 10 bytes header per round in rounds.bin
 assert _REC_HDR_STRUCT.size == 10
 
+_UNSORTED_INDEX_DTYPE = np.dtype(
+    [
+        ("first_line", "<u8"),
+        ("idx_bytes", "V32"),
+        ("rec_sha256", "V32"),
+    ]
+)
+assert _UNSORTED_INDEX_DTYPE.itemsize == 72
+
 _PART_REC_DTYPE = np.dtype(
     [
         ("key", "<u8"),
@@ -82,6 +93,8 @@ assert _UNSORTED_BATCH_DTYPE.itemsize == 24
 
 _SCHED_STRUCT = struct.Struct("<QI")  # 12 bytes/batch: (id_offset, count)
 assert _SCHED_STRUCT.size == 12
+_SCHED_DTYPE = np.dtype([("id_offset", "<u8"), ("count", "<u4")])
+assert _SCHED_DTYPE.itemsize == _SCHED_STRUCT.size
 _ID_SIZE = 4  # <u4 round index in ids.bin
 _SENTINEL = object()
 
@@ -374,34 +387,155 @@ def _unpack_round_record(
     }
 
 
-def _iter_unsorted_batch_run(run_path: Path, *, chunk_records: int = 1024) -> Iterator[tuple[int, int, int]]:
-    chunk_bytes = chunk_records * _UNSORTED_BATCH_DTYPE.itemsize
-    with run_path.open("rb") as fp:
+def _iter_run_records(
+    fp: Any,
+    dtype: np.dtype[Any],
+    sort_fields: tuple[str, ...],
+    chunk_records: int,
+) -> Iterator[tuple[Any, bytes]]:
+    rec_size = dtype.itemsize
+    chunk_bytes = max(1, int(chunk_records)) * rec_size
+    if len(sort_fields) == 1:
+        f0 = sort_fields[0]
         while True:
             raw = fp.read(chunk_bytes)
             if not raw:
                 break
-            arr = np.frombuffer(raw, dtype=_UNSORTED_BATCH_DTYPE)
-            bkeys = arr["bkey"].tolist()
-            offs = arr["id_offset"].tolist()
-            cnts = arr["count"].tolist()
-            yield from zip(bkeys, offs, cnts, strict=True)
+            arr = np.frombuffer(raw, dtype=dtype)
+            keys = arr[f0].tolist()
+            mv = memoryview(raw)
+            for idx, k0 in enumerate(keys):
+                yield k0, bytes(mv[idx * rec_size : (idx + 1) * rec_size])
+    elif len(sort_fields) == 2:
+        f0, f1 = sort_fields
+        while True:
+            raw = fp.read(chunk_bytes)
+            if not raw:
+                break
+            arr = np.frombuffer(raw, dtype=dtype)
+            k0s = arr[f0].tolist()
+            k1s = arr[f1].tolist()
+            mv = memoryview(raw)
+            for idx, (k0, k1) in enumerate(zip(k0s, k1s, strict=True)):
+                yield (k0, k1), bytes(mv[idx * rec_size : (idx + 1) * rec_size])
+    else:
+        raise ValueError(f"Unsupported sort_fields arity {len(sort_fields)}: {sort_fields}.")
+
+
+def _external_merge_sorted_runs(
+    unsorted_path: Path,
+    work_dir: Path,
+    *,
+    dtype: np.dtype[Any],
+    sort_fields: tuple[str, ...],
+    run_records: int,
+    max_fan_in: int = 16,
+    run_prefix: str = "run",
+    emit_fn: Callable[[Iterator[bytes]], None],
+) -> None:
+    """External fixed-fan-in multi-pass merge sort keeping open FDs <= max_fan_in + 1."""
+    if max_fan_in < 2:
+        raise ValueError(f"max_fan_in must be >= 2, got {max_fan_in}.")
+    rec_size = dtype.itemsize
+    run_chunk_bytes = max(1, int(run_records)) * rec_size
+    runs: list[Path] = []
+    work_dir.mkdir(parents=True, exist_ok=True)
+    key_get = operator.itemgetter(0)
+    try:
+        with unsorted_path.open("rb") as ufp:
+            run_idx = 0
+            while True:
+                raw = ufp.read(run_chunk_bytes)
+                if not raw:
+                    break
+                rarr = np.frombuffer(raw, dtype=dtype).copy()
+                rarr.sort(order=list(sort_fields))
+                if run_idx == 0 and (len(raw) < run_chunk_bytes or ufp.peek(1) == b""):
+                    emit_fn(iter((rarr.tobytes(),)))
+                    return
+                rpath = work_dir / f"{run_prefix}_p0_{run_idx:06d}.bin"
+                rarr.tofile(rpath)
+                del rarr, raw
+                runs.append(rpath)
+                run_idx += 1
+        unsorted_path.unlink(missing_ok=True)
+        if not runs:
+            emit_fn(iter(()))
+            return
+
+        read_recs = max(16, min(512, (256 * 1024) // max(1, max_fan_in * rec_size)))
+        flush_bytes = 64 * 1024
+        pass_idx = 1
+        while len(runs) > max_fan_in:
+            next_runs: list[Path] = []
+            for g_idx in range(0, len(runs), max_fan_in):
+                group = runs[g_idx : g_idx + max_fan_in]
+                if len(group) == 1:
+                    next_runs.append(group[0])
+                    continue
+                out_path = work_dir / f"{run_prefix}_p{pass_idx}_{len(next_runs):06d}.bin"
+                with contextlib.ExitStack() as stack:
+                    fps = [stack.enter_context(rp.open("rb")) for rp in group]
+                    out_fp = stack.enter_context(out_path.open("wb"))
+                    iters = [_iter_run_records(fp, dtype, sort_fields, read_recs) for fp in fps]
+                    out_buf: list[bytes] = []
+                    out_bytes = 0
+                    for _k, rec_bytes in heapq.merge(*iters, key=key_get):
+                        out_buf.append(rec_bytes)
+                        out_bytes += rec_size
+                        if out_bytes >= flush_bytes:
+                            out_fp.writelines(out_buf)
+                            out_buf.clear()
+                            out_bytes = 0
+                    if out_buf:
+                        out_fp.writelines(out_buf)
+                for rp in group:
+                    rp.unlink(missing_ok=True)
+                next_runs.append(out_path)
+            runs = next_runs
+            pass_idx += 1
+
+        with contextlib.ExitStack() as stack:
+            fps = [stack.enter_context(rp.open("rb")) for rp in runs]
+            iters = [_iter_run_records(fp, dtype, sort_fields, read_recs) for fp in fps]
+
+            def _chunked_merged() -> Iterator[bytes]:
+                buf: list[bytes] = []
+                buf_bytes = 0
+                for _k, rec_bytes in heapq.merge(*iters, key=key_get):
+                    buf.append(rec_bytes)
+                    buf_bytes += rec_size
+                    if buf_bytes >= flush_bytes:
+                        yield b"".join(buf)
+                        buf.clear()
+                        buf_bytes = 0
+                if buf:
+                    yield b"".join(buf)
+
+            emit_fn(_chunked_merged())
+    finally:
+        unsorted_path.unlink(missing_ok=True)
+        for rp in runs:
+            rp.unlink(missing_ok=True)
 
 
 class DiskLengthBucketBatchSampler:
-    """O(1)-RAM external-memory disk-backed length-bucketed batch sampler for BC trajectories (§2).
+    """Bounded-memory, bounded-FD external disk length-bucketed batch sampler (§2).
 
-    At initialization and across epochs, `DiskLengthBucketBatchSampler` never holds full-dataset
-    index or batch lists in RAM:
-    1. Streams `index.bin` in bounded 4,096-record chunks (~128 KB) into order-preserving
-       SplitMix64 key partitions on disk (buffered with bounded open handles & RAM).
-    2. Reads one bounded partition (`<= window_items`) at a time, carries the sub-pool tail across
-       partition boundaries (so at most one partial batch exists globally when `drop_last=False`),
-       length-buckets each `batch_size * bucket_mult` pool, and writes batch round IDs into
-       `epoch_<e>_ids.bin` + unsorted batch descriptors to disk.
-    3. External-merge-sorts batch descriptors into fixed-width 12-byte `epoch_<e>_schedule.bin`.
-    4. Iteration and distributed rank seeking stream batches lazily in O(1) RAM via thread-local
-       read handles with zero shared file cursor contention.
+    Both epoch schedule construction and steady-state rank iteration keep memory
+    and file descriptors strictly independent of total dataset size ``N``:
+    1. Streams ``index.bin`` in 4,096-record (~128 KB) chunks through recursive
+       MSB SplitMix64 radix partitioning (at most ``radix <= max_merge_fan_in <= 16``
+       concurrent open files, bounded partition size ``<= window_items``).
+    2. Sorts one leaf partition at a time by random key, carries partial-pool tails across
+       partitions (at most one partial batch globally when ``drop_last=False``),
+       length-buckets each ``batch_size * bucket_mult`` pool, and streams batch round IDs
+       to ``epoch_<e>_ids.bin`` + batch descriptors to disk.
+    3. External multi-pass fixed fan-in merge sort (at most ``max_merge_fan_in + 1``
+       concurrent open FDs and ``<= 320 KB`` merge buffers, ``O(log_{fan_in}(N))`` passes)
+       writes fixed-width 12-byte ``epoch_<e>_schedule.bin``.
+    4. Iteration and distributed rank seeking stream batches lazily via thread-local
+       read handles (2 FDs per active reader thread) without full index arrays in RAM.
     """
 
     def __init__(
@@ -417,7 +551,10 @@ class DiskLengthBucketBatchSampler:
         drop_last: bool = False,
         schedule_dir: Path | None = None,
         index_sha256: str = "",
+        ordered_sample_sha256: str = "",
         window_items: int = 16384,
+        max_merge_fan_in: int = 16,
+        merge_run_batches: int | None = None,
         shared_schedule_across_ranks: bool | None = None,
     ) -> None:
         if batch_size < 1:
@@ -426,6 +563,10 @@ class DiskLengthBucketBatchSampler:
             raise ValueError("bucket_mult must be >= 1.")
         if window_items < 1:
             raise ValueError("window_items must be >= 1.")
+        if max_merge_fan_in < 2:
+            raise ValueError(f"max_merge_fan_in must be >= 2, got {max_merge_fan_in}.")
+        if merge_run_batches is not None and merge_run_batches < 1:
+            raise ValueError(f"merge_run_batches must be >= 1, got {merge_run_batches}.")
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(f"Invalid distributed sampler coordinates rank={rank}, world_size={world_size}.")
 
@@ -438,7 +579,22 @@ class DiskLengthBucketBatchSampler:
         self.world_size = int(world_size)
         self.drop_last = bool(drop_last)
         self.window_items = int(window_items)
+        self.max_merge_fan_in = int(max_merge_fan_in)
+        self.merge_run_batches = int(merge_run_batches) if merge_run_batches is not None else None
         self.index_sha256 = index_sha256 or sha256_file_bytes(self.index_path)[1]
+        if ordered_sample_sha256:
+            self.ordered_sample_sha256 = str(ordered_sample_sha256)
+        else:
+            meta_sib = self.index_path.parent / "meta.json"
+            resolved_ord = ""
+            if meta_sib.is_file():
+                try:
+                    m_obj = json.loads(meta_sib.read_text(encoding="utf-8"))
+                    if m_obj.get("index_sha256") == self.index_sha256 and m_obj.get("ordered_sample_sha256"):
+                        resolved_ord = str(m_obj["ordered_sample_sha256"])
+                except Exception:
+                    pass
+            self.ordered_sample_sha256 = resolved_ord
 
         self._temp_dir: tempfile.TemporaryDirectory[str] | None = None
         if schedule_dir is None:
@@ -516,8 +672,9 @@ class DiskLengthBucketBatchSampler:
 
     def _expected_schedule_meta(self, epoch: int) -> dict[str, Any]:
         return {
-            "format": "kanachan_bc_disk_schedule_v1",
+            "format": "kanachan_bc_disk_schedule_v2",
             "index_sha256": self.index_sha256,
+            "ordered_sample_sha256": self.ordered_sample_sha256,
             "num_items": self.num_items,
             "batch_size": self.batch_size,
             "bucket_mult": self.bucket_mult,
@@ -593,90 +750,153 @@ class DiskLengthBucketBatchSampler:
 
             pool_sz = max(self.batch_size, self.batch_size * self.bucket_mult)
             part_target = max(self.window_items, 1)
-            num_parts = max(1, math.ceil(self.num_items / part_target))
             seed_mix = _splitmix64_scalar(self.seed + int(epoch) * 1009)
+            radix_shift = max(1, min(4, self.max_merge_fan_in.bit_length() - 1))
+            radix_fanout = 1 << radix_shift
+            max_radix_depth = 64 // radix_shift
+            node_counter = 0
 
-            # 1. Stream index.bin sequentially and scatter items into order-preserving key partitions.
-            part_paths = [work_dir / f"part_{p:06d}.bin" for p in range(num_parts)]
-            part_bufs: list[list[bytes]] = [[] for _ in range(num_parts)]
-            part_bytes = [0] * num_parts
-            pending_bytes = 0
-            max_pending_bytes = min(4 * 1024 * 1024, max(65536, part_target * 16))
-            open_append_fps: OrderedDict[int, Any] = OrderedDict()
+            def _scatter_index_depth0() -> list[tuple[Path, int]]:
+                read_chunk = 4096 * _INDEX_DTYPE.itemsize
+                part_paths = [work_dir / f"radix_d0_b{b:02d}.bin" for b in range(radix_fanout)]
+                part_bufs: list[list[bytes]] = [[] for _ in range(radix_fanout)]
+                part_bytes = [0] * radix_fanout
+                part_counts = [0] * radix_fanout
+                pending_bytes = 0
+                max_pending = 256 * 1024
+                r_cursor = 0
+                with contextlib.ExitStack() as stack:
+                    open_fps: dict[int, Any] = {}
 
-            def _flush_part(pid: int) -> None:
-                nonlocal pending_bytes
-                chunks = part_bufs[pid]
-                if not chunks:
-                    return
-                fp = open_append_fps.get(pid)
-                if fp is None:
-                    if len(open_append_fps) >= 32:
-                        _, old_fp = open_append_fps.popitem(last=False)
-                        old_fp.close()
-                    fp = part_paths[pid].open("ab")
-                    open_append_fps[pid] = fp
-                else:
-                    open_append_fps.move_to_end(pid)
-                fp.writelines(chunks)
-                chunks.clear()
-                pending_bytes -= part_bytes[pid]
-                part_bytes[pid] = 0
+                    def _flush_b(bid: int) -> None:
+                        nonlocal pending_bytes
+                        chunks = part_bufs[bid]
+                        if not chunks:
+                            return
+                        fp = open_fps.get(bid)
+                        if fp is None:
+                            fp = stack.enter_context(part_paths[bid].open("wb"))
+                            open_fps[bid] = fp
+                        fp.writelines(chunks)
+                        chunks.clear()
+                        pending_bytes -= part_bytes[bid]
+                        part_bytes[bid] = 0
 
-            read_chunk = 4096 * _INDEX_DTYPE.itemsize
-            r_cursor = 0
-            try:
-                with self.index_path.open("rb") as idx_fp:
-                    while True:
-                        raw = idx_fp.read(read_chunk)
-                        if not raw:
-                            break
-                        arr = np.frombuffer(raw, dtype=_INDEX_DTYPE)
-                        cnt = int(arr.shape[0])
-                        rids = np.arange(r_cursor, r_cursor + cnt, dtype=np.uint64)
-                        r_cursor += cnt
-                        keys = _splitmix64_u64_vec(np.uint64(seed_mix) ^ rids)
-                        ev_lens = np.minimum(arr["ev_len"], np.uint32(65535)).astype(np.uint16, copy=False)
-
-                        rec_arr = np.empty((cnt,), dtype=_PART_REC_DTYPE)
-                        rec_arr["key"] = keys
-                        rec_arr["round_id"] = rids.astype(np.uint32, copy=False)
-                        rec_arr["ev_len"] = ev_lens
-                        rec_arr["pad"] = np.uint16(0)
-
-                        # Order-preserving MSB partition: largest top-32 keys land in highest part_id.
-                        pids = ((keys >> np.uint64(32)) * np.uint64(num_parts)) >> np.uint64(32)
-                        order = np.argsort(pids, kind="mergesort")
-                        pids_s = pids[order]
-                        rec_s = rec_arr[order]
-                        uniq_pids, starts, counts = np.unique(
-                            pids_s, return_index=True, return_counts=True
-                        )
-                        for p_val, st, ln in zip(
-                            uniq_pids.tolist(), starts.tolist(), counts.tolist(), strict=True
-                        ):
-                            blob = rec_s[st : st + ln].tobytes()
-                            part_bufs[p_val].append(blob)
-                            part_bytes[p_val] += len(blob)
-                            pending_bytes += len(blob)
-                        while pending_bytes > max_pending_bytes:
-                            heaviest = max(range(num_parts), key=lambda k: part_bytes[k])
-                            if part_bytes[heaviest] == 0:
+                    with self.index_path.open("rb") as idx_fp:
+                        while True:
+                            raw = idx_fp.read(read_chunk)
+                            if not raw:
                                 break
-                            _flush_part(heaviest)
-                for pid in range(num_parts):
-                    _flush_part(pid)
-            finally:
-                for fp in open_append_fps.values():
-                    fp.close()
-                open_append_fps.clear()
+                            arr = np.frombuffer(raw, dtype=_INDEX_DTYPE)
+                            cnt = int(arr.shape[0])
+                            rids = np.arange(r_cursor, r_cursor + cnt, dtype=np.uint64)
+                            r_cursor += cnt
+                            keys = _splitmix64_u64_vec(np.uint64(seed_mix) ^ rids)
+                            ev_lens = np.minimum(arr["ev_len"], np.uint32(65535)).astype(
+                                np.uint16, copy=False
+                            )
+                            rec_arr = np.empty((cnt,), dtype=_PART_REC_DTYPE)
+                            rec_arr["key"] = keys
+                            rec_arr["round_id"] = rids.astype(np.uint32, copy=False)
+                            rec_arr["ev_len"] = ev_lens
+                            rec_arr["pad"] = np.uint16(0)
 
-            if r_cursor != self.num_items:
-                raise RuntimeError(
-                    f"Index item count mismatch during schedule build: {r_cursor} != {self.num_items}."
-                )
+                            pids = (keys >> np.uint64(64 - radix_shift)) & np.uint64(radix_fanout - 1)
+                            order = np.argsort(pids, kind="mergesort")
+                            pids_s = pids[order]
+                            rec_s = rec_arr[order]
+                            uniq_pids, starts, counts = np.unique(
+                                pids_s, return_index=True, return_counts=True
+                            )
+                            for p_val, st, ln in zip(
+                                uniq_pids.tolist(), starts.tolist(), counts.tolist(), strict=True
+                            ):
+                                blob = rec_s[st : st + ln].tobytes()
+                                part_bufs[p_val].append(blob)
+                                part_bytes[p_val] += len(blob)
+                                part_counts[p_val] += int(ln)
+                                pending_bytes += len(blob)
+                            if pending_bytes >= max_pending:
+                                for bid in range(radix_fanout):
+                                    _flush_b(bid)
+                    for bid in range(radix_fanout):
+                        _flush_b(bid)
 
-            # 2. Sort each bounded partition by random key, length-bucket in pool_sz windows,
+                if r_cursor != self.num_items:
+                    raise RuntimeError(
+                        f"Index item count mismatch during schedule build: {r_cursor} != {self.num_items}."
+                    )
+                return [(part_paths[b], part_counts[b]) for b in range(radix_fanout) if part_counts[b] > 0]
+
+            def _iter_sorted_partitions_dfs(bpath: Path, cnt: int, depth: int) -> Iterator[Path]:
+                nonlocal node_counter
+                if cnt <= part_target or depth >= max_radix_depth:
+                    yield bpath
+                    return
+                nid = node_counter
+                node_counter += 1
+                sub_paths = [work_dir / f"radix_d{depth}_{nid}_b{b:02d}.bin" for b in range(radix_fanout)]
+                sub_bufs: list[list[bytes]] = [[] for _ in range(radix_fanout)]
+                sub_bytes = [0] * radix_fanout
+                sub_counts = [0] * radix_fanout
+                pending_bytes = 0
+                max_pending = 256 * 1024
+                shift_amt = np.uint64(64 - (depth + 1) * radix_shift)
+                mask_u64 = np.uint64(radix_fanout - 1)
+                read_chunk = 4096 * _PART_REC_DTYPE.itemsize
+                with contextlib.ExitStack() as stack:
+                    open_fps: dict[int, Any] = {}
+
+                    def _flush_sub(bid: int) -> None:
+                        nonlocal pending_bytes
+                        chunks = sub_bufs[bid]
+                        if not chunks:
+                            return
+                        fp = open_fps.get(bid)
+                        if fp is None:
+                            fp = stack.enter_context(sub_paths[bid].open("wb"))
+                            open_fps[bid] = fp
+                        fp.writelines(chunks)
+                        chunks.clear()
+                        pending_bytes -= sub_bytes[bid]
+                        sub_bytes[bid] = 0
+
+                    with bpath.open("rb") as bfp:
+                        while True:
+                            raw = bfp.read(read_chunk)
+                            if not raw:
+                                break
+                            rarr = np.frombuffer(raw, dtype=_PART_REC_DTYPE)
+                            pids = (rarr["key"] >> shift_amt) & mask_u64
+                            order = np.argsort(pids, kind="mergesort")
+                            pids_s = pids[order]
+                            rec_s = rarr[order]
+                            uniq_pids, starts, counts = np.unique(
+                                pids_s, return_index=True, return_counts=True
+                            )
+                            for p_val, st, ln in zip(
+                                uniq_pids.tolist(), starts.tolist(), counts.tolist(), strict=True
+                            ):
+                                blob = rec_s[st : st + ln].tobytes()
+                                sub_bufs[p_val].append(blob)
+                                sub_bytes[p_val] += len(blob)
+                                sub_counts[p_val] += int(ln)
+                                pending_bytes += len(blob)
+                            if pending_bytes >= max_pending:
+                                for bid in range(radix_fanout):
+                                    _flush_sub(bid)
+                    for bid in range(radix_fanout):
+                        _flush_sub(bid)
+                bpath.unlink(missing_ok=True)
+                for bid in range(radix_fanout):
+                    if sub_counts[bid] > 0:
+                        yield from _iter_sorted_partitions_dfs(sub_paths[bid], sub_counts[bid], depth + 1)
+
+            def _iter_leaf_partitions() -> Iterator[Path]:
+                for top_path, top_cnt in _scatter_index_depth0():
+                    yield from _iter_sorted_partitions_dfs(top_path, top_cnt, 1)
+
+            # 2. Sort each bounded leaf partition by random key, length-bucket in pool_sz windows,
             #    and emit batch ID slices + unsorted batch descriptors on disk.
             unsorted_batches_p = work_dir / "unsorted_batches.bin"
             batch_seed = _splitmix64_scalar(seed_mix ^ 0xA5A5_5A5A_F0F0_0F0F)
@@ -699,14 +919,14 @@ class DiskLengthBucketBatchSampler:
                     ids_buf_bytes = 0
                 bkey = _splitmix64_scalar(batch_seed ^ total_batches)
                 ub_buf.append(struct.pack("<QQII", bkey, id_offset, cnt_b, 0))
-                if len(ub_buf) >= 8192:
+                if len(ub_buf) >= 4096:
                     ub_fp.writelines(ub_buf)
                     ub_buf.clear()
                 id_offset += cnt_b
                 total_batches += 1
 
             with tmp_ids.open("wb") as ids_fp, unsorted_batches_p.open("wb") as ub_fp:
-                for ppath in part_paths:
+                for ppath in _iter_leaf_partitions():
                     if not ppath.is_file() or ppath.stat().st_size == 0:
                         ppath.unlink(missing_ok=True)
                         continue
@@ -741,53 +961,33 @@ class DiskLengthBucketBatchSampler:
                     ub_fp.writelines(ub_buf)
                     ub_buf.clear()
 
-            # 3. External merge-sort batch descriptors into fixed-record schedule.bin.
-            run_batches = max(256, part_target // 2)
-            run_chunk_bytes = run_batches * _UNSORTED_BATCH_DTYPE.itemsize
-            run_paths: list[Path] = []
-            with unsorted_batches_p.open("rb") as ub_in:
-                run_idx = 0
-                while True:
-                    raw = ub_in.read(run_chunk_bytes)
-                    if not raw:
-                        break
-                    rarr = np.frombuffer(raw, dtype=_UNSORTED_BATCH_DTYPE).copy()
-                    rarr.sort(order=["bkey", "id_offset"])
-                    if run_idx == 0 and ub_in.peek(1) == b"":
-                        # Fast path: fits inside a single bounded run -> write directly to tmp_sched!
-                        with tmp_sched.open("wb") as sfp:
-                            out_buf: list[bytes] = []
-                            for _bk, off_v, cnt_v in zip(
-                                rarr["bkey"].tolist(),
-                                rarr["id_offset"].tolist(),
-                                rarr["count"].tolist(),
-                                strict=True,
-                            ):
-                                out_buf.append(_SCHED_STRUCT.pack(off_v, cnt_v))
-                            sfp.writelines(out_buf)
-                        run_paths = []
-                        break
-                    rpath = work_dir / f"run_{run_idx:05d}.bin"
-                    rarr.tofile(rpath)
-                    run_paths.append(rpath)
-                    run_idx += 1
-
-            unsorted_batches_p.unlink(missing_ok=True)
+            # 3. External multi-pass fixed-fan-in merge sort into fixed-record schedule.bin.
+            run_batches = self.merge_run_batches or max(256, part_target // 2)
             if total_batches == 0:
+                unsorted_batches_p.unlink(missing_ok=True)
                 tmp_sched.write_bytes(b"")
-            elif run_paths:
-                iters = [_iter_unsorted_batch_run(rp) for rp in run_paths]
-                with tmp_sched.open("wb") as sfp:
-                    out_buf = []
-                    for _bkey, off_v, cnt_v in heapq.merge(*iters):
-                        out_buf.append(_SCHED_STRUCT.pack(off_v, cnt_v))
-                        if len(out_buf) >= 8192:
-                            sfp.writelines(out_buf)
-                            out_buf.clear()
-                    if out_buf:
-                        sfp.writelines(out_buf)
-                for rp in run_paths:
-                    rp.unlink(missing_ok=True)
+            else:
+                def _write_sched_chunks(chunks: Iterator[bytes]) -> None:
+                    with tmp_sched.open("wb") as sfp:
+                        for chunk in chunks:
+                            if not chunk:
+                                continue
+                            arr = np.frombuffer(chunk, dtype=_UNSORTED_BATCH_DTYPE)
+                            out_arr = np.empty((int(arr.shape[0]),), dtype=_SCHED_DTYPE)
+                            out_arr["id_offset"] = arr["id_offset"]
+                            out_arr["count"] = arr["count"]
+                            sfp.write(out_arr.tobytes())
+
+                _external_merge_sorted_runs(
+                    unsorted_batches_p,
+                    work_dir,
+                    dtype=_UNSORTED_BATCH_DTYPE,
+                    sort_fields=("bkey", "id_offset"),
+                    run_records=run_batches,
+                    max_fan_in=self.max_merge_fan_in,
+                    run_prefix="batch_run",
+                    emit_fn=_write_sched_chunks,
+                )
 
             meta_obj = {
                 **self._expected_schedule_meta(epoch),
@@ -808,21 +1008,37 @@ class DiskLengthBucketBatchSampler:
     def _ensure_epoch_schedule(self, epoch: int) -> None:
         self.epoch = int(epoch)
         self.cursor = 0
-        if self._try_load_epoch_meta(self.epoch):
-            return
-        if self._shared_ddp and dist.is_available() and dist.is_initialized():
+        if (
+            self._shared_ddp
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        ):
             rank = dist.get_rank()
-            err_holder: list[str | None] = [None]
+            sync_box: list[Any] = [None]
             if rank == 0:
                 try:
-                    self._build_epoch_schedule_disk(self.epoch)
+                    if not self._try_load_epoch_meta(self.epoch):
+                        self._build_epoch_schedule_disk(self.epoch)
+                    sync_box[0] = {"ok": True, "total_batches": self.total_batches}
                 except BaseException as exc:  # noqa: BLE001
-                    err_holder[0] = f"{type(exc).__name__}: {exc}"
-            dist.broadcast_object_list(err_holder, src=0)
-            if err_holder[0] is not None:
-                raise RuntimeError(f"Rank-0 DiskLengthBucketBatchSampler build failed: {err_holder[0]}")
-            if rank != 0 and not self._try_load_epoch_meta(self.epoch):
-                raise RuntimeError(f"Shared disk batch schedule unavailable on rank {rank}: {self.schedule_dir}")
+                    sync_box[0] = {"ok": False, "err": f"{type(exc).__name__}: {exc}"}
+            dist.broadcast_object_list(sync_box, src=0)
+            msg = sync_box[0]
+            if not isinstance(msg, dict) or not msg.get("ok"):
+                err_txt = msg.get("err") if isinstance(msg, dict) else "unknown error"
+                raise RuntimeError(f"Rank-0 DiskLengthBucketBatchSampler build failed: {err_txt}")
+            if rank != 0:
+                if not self._try_load_epoch_meta(self.epoch):
+                    raise RuntimeError(
+                        f"Shared disk batch schedule unavailable on rank {rank}: {self.schedule_dir}"
+                    )
+                if self.total_batches != int(msg["total_batches"]):
+                    raise RuntimeError(
+                        f"Shared disk batch schedule on rank {rank} disagrees with rank 0 batch count."
+                    )
+            return
+        if self._try_load_epoch_meta(self.epoch):
             return
         self._build_epoch_schedule_disk(self.epoch)
 
@@ -891,8 +1107,9 @@ class DiskLengthBucketBatchSampler:
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "format": "kanachan_disk_sampler_v1",
+            "format": "kanachan_disk_sampler_v2",
             "index_sha256": self.index_sha256,
+            "ordered_sample_sha256": self.ordered_sample_sha256,
             "epoch": self.epoch,
             "cursor": self.cursor,
             "seed": self.seed,
@@ -905,9 +1122,18 @@ class DiskLengthBucketBatchSampler:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        saved_sha = state.get("index_sha256")
-        if saved_sha is not None and saved_sha != self.index_sha256:
-            raise ValueError("DiskLengthBucketBatchSampler index_sha256 mismatch on resume.")
+        if state.get("format") != "kanachan_disk_sampler_v2":
+            raise ValueError(
+                f"Incompatible DiskLengthBucketBatchSampler state format: {state.get('format')!r}."
+            )
+        saved_ord = state.get("ordered_sample_sha256") or ""
+        if self.ordered_sample_sha256 or saved_ord:
+            if not self.ordered_sample_sha256 or saved_ord != self.ordered_sample_sha256:
+                raise ValueError("DiskLengthBucketBatchSampler ordered_sample_sha256 mismatch on resume.")
+        else:
+            saved_sha = state.get("index_sha256")
+            if saved_sha is not None and saved_sha != self.index_sha256:
+                raise ValueError("DiskLengthBucketBatchSampler index_sha256 mismatch on resume.")
         if (
             int(state["seed"]) != self.seed
             or int(state["batch_size"]) != self.batch_size
@@ -925,7 +1151,7 @@ class DiskLengthBucketBatchSampler:
 
 
 class SpoolingRoundBCDataSource:
-    """Out-of-core hash-bucketed & disk-indexed round BC source with O(1) RAM retention."""
+    """Out-of-core canonical-order hash-bucketed & disk-indexed round BC source (§2)."""
 
     def __init__(
         self,
@@ -1010,6 +1236,7 @@ class SpoolingRoundBCDataSource:
         self.num_rounds: int = 0
         self.index_sha256: str = ""
         self.rounds_sha256: str = ""
+        self.ordered_sample_sha256: str = ""
         self.index_bytes: int = 0
         self.rounds_bytes: int = 0
 
@@ -1018,21 +1245,43 @@ class SpoolingRoundBCDataSource:
         self._all_handles: list[tuple[Any, Any]] = []
         self._finalizer = weakref.finalize(self, self._cleanup_resources, self._all_handles, self._temp_dir)
 
-        if reuse_cache and self._try_load_cached_meta():
-            pass
-        elif is_ddp:
+        if is_ddp and dist.get_world_size() > 1:
             rank = dist.get_rank()
-            err_holder: list[str | None] = [None]
+            sync_box: list[Any] = [None]
             if rank == 0:
                 try:
-                    self._build_disk_cache()
+                    if not (reuse_cache and self._try_load_cached_meta()):
+                        self._build_disk_cache()
+                    sync_box[0] = {
+                        "ok": True,
+                        "num_rounds": self.num_rounds,
+                        "index_sha256": self.index_sha256,
+                        "rounds_sha256": self.rounds_sha256,
+                        "ordered_sample_sha256": self.ordered_sample_sha256,
+                    }
                 except BaseException as exc:  # noqa: BLE001
-                    err_holder[0] = f"{type(exc).__name__}: {exc}"
-            dist.broadcast_object_list(err_holder, src=0)
-            if err_holder[0] is not None:
-                raise RuntimeError(f"Rank-0 BC disk spool build failed: {err_holder[0]}")
-            if rank != 0 and not self._try_load_cached_meta():
-                raise RuntimeError(f"Shared BC spool cache unavailable on rank {rank}: {self.cache_dir}")
+                    sync_box[0] = {"ok": False, "err": f"{type(exc).__name__}: {exc}"}
+            dist.broadcast_object_list(sync_box, src=0)
+            msg = sync_box[0]
+            if not isinstance(msg, dict) or not msg.get("ok"):
+                err_txt = msg.get("err") if isinstance(msg, dict) else "unknown error"
+                raise RuntimeError(f"Rank-0 BC disk spool build failed: {err_txt}")
+            if rank != 0:
+                if not self._try_load_cached_meta():
+                    raise RuntimeError(
+                        f"Shared BC spool cache unavailable on rank {rank}: {self.cache_dir}"
+                    )
+                if (
+                    self.num_rounds != int(msg["num_rounds"])
+                    or self.index_sha256 != msg["index_sha256"]
+                    or self.rounds_sha256 != msg["rounds_sha256"]
+                    or self.ordered_sample_sha256 != msg["ordered_sample_sha256"]
+                ):
+                    raise RuntimeError(
+                        f"Shared BC spool cache on rank {rank} disagrees with rank 0 metadata: {self.cache_dir}"
+                    )
+        elif reuse_cache and self._try_load_cached_meta():
+            pass
         else:
             self._build_disk_cache()
 
@@ -1088,7 +1337,9 @@ class SpoolingRoundBCDataSource:
             meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
         except Exception:
             return False
-        if meta.get("format") != "kanachan_bc_round_spool_v2":
+        if meta.get("format") != "kanachan_bc_round_spool_v3":
+            return False
+        if not meta.get("ordered_sample_sha256"):
             return False
         if meta.get("source_data_sha256") != self.source_data_sha256:
             return False
@@ -1124,6 +1375,7 @@ class SpoolingRoundBCDataSource:
         self.num_rounds = n_rounds
         self.index_sha256 = idx_sha
         self.rounds_sha256 = rds_sha
+        self.ordered_sample_sha256 = str(meta["ordered_sample_sha256"])
         self.index_bytes = idx_sz
         self.rounds_bytes = rds_sz
         return True
@@ -1139,7 +1391,8 @@ class SpoolingRoundBCDataSource:
         tmp_rounds = self.cache_dir / "rounds.bin.tmp"
         tmp_index = self.cache_dir / "index.bin.tmp"
         tmp_meta = self.cache_dir / "meta.json.tmp"
-        for p in (tmp_rounds, tmp_index, tmp_meta):
+        tmp_unsorted_idx = self.cache_dir / "index.unsorted.tmp"
+        for p in (tmp_rounds, tmp_index, tmp_meta, tmp_unsorted_idx):
             p.unlink(missing_ok=True)
 
         def _raw_source_iter() -> Iterable[tuple[int, str]]:
@@ -1152,6 +1405,7 @@ class SpoolingRoundBCDataSource:
 
         rds_hasher = hashlib.sha256()
         idx_hasher = hashlib.sha256()
+        ord_hasher = hashlib.sha256()
         num_rounds_total = 0
         num_games_total = 0
         seen_labeled_global: bool | None = None
@@ -1166,7 +1420,9 @@ class SpoolingRoundBCDataSource:
                 depth=0,
             )
 
-            with tmp_rounds.open("wb") as r_fp, tmp_index.open("wb") as idx_fp:
+            unsorted_buf: list[bytes] = []
+            unsorted_bytes = 0
+            with tmp_rounds.open("wb") as r_fp, tmp_unsorted_idx.open("wb") as uidx_fp:
                 for leaf_path in _iter_leaf_buckets(
                     top_buckets,
                     bucket_dir,
@@ -1196,12 +1452,11 @@ class SpoolingRoundBCDataSource:
                     num_games_total += int(bucket_games)
 
                     for rec in records:
-                        if self.max_rounds is not None and num_rounds_total >= int(self.max_rounds):
-                            break
                         raw_rec = _pack_round_record(rec)
                         rec_len = len(raw_rec)
                         r_fp.write(raw_rec)
                         rds_hasher.update(raw_rec)
+                        rec_sha = hashlib.sha256(raw_rec).digest()
                         idx_entry = _INDEX_STRUCT.pack(
                             offset,
                             rec_len,
@@ -1211,13 +1466,51 @@ class SpoolingRoundBCDataSource:
                             int(rec["final_rank"]) if rec["final_rank"] is not None else -1,
                             int(rec["observer_seat"]),
                         )
-                        idx_fp.write(idx_entry)
-                        idx_hasher.update(idx_entry)
-                        num_rounds_total += 1
+                        row_bytes = struct.pack("<Q", int(rec["first_line_no"])) + idx_entry + rec_sha
+                        unsorted_buf.append(row_bytes)
+                        unsorted_bytes += len(row_bytes)
+                        if unsorted_bytes >= 128 * 1024:
+                            uidx_fp.writelines(unsorted_buf)
+                            unsorted_buf.clear()
+                            unsorted_bytes = 0
                         offset += rec_len
 
-                    if self.max_rounds is not None and num_rounds_total >= int(self.max_rounds):
-                        break
+                if unsorted_buf:
+                    uidx_fp.writelines(unsorted_buf)
+                    unsorted_buf.clear()
+
+            # Canonicalize global sample order by source-file appearance (`first_line`) regardless of hash buckets.
+            def _write_canonical_index(chunks: Iterator[bytes]) -> None:
+                nonlocal num_rounds_total
+                limit = int(self.max_rounds) if self.max_rounds is not None else None
+                with tmp_index.open("wb") as idx_fp:
+                    for chunk in chunks:
+                        if not chunk:
+                            continue
+                        if limit is not None and num_rounds_total >= limit:
+                            break
+                        arr = np.frombuffer(chunk, dtype=_UNSORTED_INDEX_DTYPE)
+                        for rec in arr:
+                            if limit is not None and num_rounds_total >= limit:
+                                break
+                            idx_b = rec["idx_bytes"].tobytes()
+                            rec_sha_b = rec["rec_sha256"].tobytes()
+                            idx_fp.write(idx_b)
+                            idx_hasher.update(idx_b)
+                            ord_hasher.update(struct.pack("<Q", num_rounds_total))
+                            ord_hasher.update(rec_sha_b)
+                            num_rounds_total += 1
+
+            _external_merge_sorted_runs(
+                tmp_unsorted_idx,
+                bucket_dir,
+                dtype=_UNSORTED_INDEX_DTYPE,
+                sort_fields=("first_line",),
+                run_records=8192,
+                max_fan_in=16,
+                run_prefix="canon_idx",
+                emit_fn=_write_canonical_index,
+            )
 
             self.num_games = num_games_total
             self.num_rounds = num_rounds_total
@@ -1225,11 +1518,12 @@ class SpoolingRoundBCDataSource:
             self.index_bytes = num_rounds_total * _INDEX_STRUCT.size
             self.rounds_sha256 = rds_hasher.hexdigest()
             self.index_sha256 = idx_hasher.hexdigest()
+            self.ordered_sample_sha256 = ord_hasher.hexdigest()
 
             tmp_rounds.replace(self.rounds_path)
             tmp_index.replace(self.index_path)
             meta_obj = {
-                "format": "kanachan_bc_round_spool_v2",
+                "format": "kanachan_bc_round_spool_v3",
                 "source_files": self.source_file_fingerprints,
                 "source_data_sha256": self.source_data_sha256,
                 "spool_recipe_sha256": self.spool_recipe_sha256,
@@ -1238,12 +1532,15 @@ class SpoolingRoundBCDataSource:
                 "allow_incomplete": self.allow_incomplete,
                 "enable_early_shape_hint": self.enable_early_shape_hint,
                 "max_rounds": self.max_rounds,
+                "num_hash_buckets": self.num_hash_buckets,
+                "max_bucket_bytes": self.max_bucket_bytes,
                 "num_games": self.num_games,
                 "num_rounds": self.num_rounds,
                 "index_bytes": self.index_bytes,
                 "rounds_bytes": self.rounds_bytes,
                 "index_sha256": self.index_sha256,
                 "rounds_sha256": self.rounds_sha256,
+                "ordered_sample_sha256": self.ordered_sample_sha256,
                 "data_sha256": self.data_sha256,
             }
             tmp_meta.write_text(json.dumps(meta_obj, indent=2, sort_keys=True), encoding="utf-8")
@@ -1251,7 +1548,7 @@ class SpoolingRoundBCDataSource:
         finally:
             if bucket_dir.exists():
                 shutil.rmtree(bucket_dir, ignore_errors=True)
-            for p in (tmp_rounds, tmp_index, tmp_meta):
+            for p in (tmp_rounds, tmp_index, tmp_meta, tmp_unsorted_idx):
                 p.unlink(missing_ok=True)
 
     def create_sampler(
@@ -1264,9 +1561,11 @@ class SpoolingRoundBCDataSource:
         world_size: int = 1,
         drop_last: bool = False,
         window_items: int = 16384,
+        max_merge_fan_in: int = 16,
+        merge_run_batches: int | None = None,
         schedule_dir: Path | None = None,
     ) -> DiskLengthBucketBatchSampler:
-        """Create an O(1)-RAM external disk-backed batch sampler over `index.bin`."""
+        """Create a bounded-memory external disk-backed batch sampler over ``index.bin``."""
         sdir = Path(schedule_dir) if schedule_dir is not None else (self.cache_dir / "schedules")
         return DiskLengthBucketBatchSampler(
             self.index_path,
@@ -1279,7 +1578,10 @@ class SpoolingRoundBCDataSource:
             drop_last=drop_last,
             schedule_dir=sdir,
             index_sha256=self.index_sha256,
+            ordered_sample_sha256=self.ordered_sample_sha256,
             window_items=window_items,
+            max_merge_fan_in=max_merge_fan_in,
+            merge_run_batches=merge_run_batches,
             shared_schedule_across_ranks=bool(
                 self._persistent_cache and world_size > 1 and dist.is_available() and dist.is_initialized()
             ),

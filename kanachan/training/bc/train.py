@@ -230,6 +230,7 @@ def run_v2_trajectory_bc(
             "amp_dtype": str(amp_dtype),
             "world_size": int(world_size),
             "optimizer_type": str(config.optimizer.type),
+            "use_zero": bool(config.optimizer.use_zero),
             "warmup_steps": int(getattr(config.optimizer, "warmup_steps", 0)),
             "annealing_steps": int(getattr(config.optimizer, "annealing_steps", 0)),
             "annealing_steps_factor": int(getattr(config.optimizer, "annealing_steps_factor", 1)),
@@ -239,6 +240,7 @@ def run_v2_trajectory_bc(
             data_sha256=data_source.data_sha256,
             source_data_sha256=data_source.source_data_sha256,
             preprocess_recipe_sha256=data_source.preprocess_recipe_sha256,
+            ordered_sample_sha256=data_source.ordered_sample_sha256,
             lr=float(config.optimizer.learning_rate),
             weight_decay=float(config.optimizer.weight_decay),
             training_config=training_cfg,
@@ -252,6 +254,7 @@ def run_v2_trajectory_bc(
             "data_sha256": recipe["data_sha256"],
             "source_data_sha256": data_source.source_data_sha256,
             "preprocess_recipe_sha256": data_source.preprocess_recipe_sha256,
+            "ordered_sample_sha256": data_source.ordered_sample_sha256,
             "training_config": training_cfg,
             "world_size": world_size,
         }

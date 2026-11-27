@@ -9,9 +9,41 @@ on:
       - docs/structured-dual-decoder-v2
 
 jobs:
+  python310-compat:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: "."
+      TORCHDYNAMO_DISABLE: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python 3.10 runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0
+          TORCH_VER=$(python -c "import torch; print(torch.__version__)")
+          echo "torch==${TORCH_VER}" > "$RUNNER_TEMP/constraints310.txt"
+          pip install -c "$RUNNER_TEMP/constraints310.txt" --extra-index-url https://download.pytorch.org/whl/cpu \
+            "hydra-core==1.3.2" jsonschema "mahjong==1.1.11" numpy pyyaml pyzmq tensorboard \
+            "tensordict>=0.7.0,<0.11" "torchrl>=0.7.0,<0.11" tqdm types-tqdm
+          python -m pip check
+
+      - name: Run Python 3.10 fingerprint compatibility check
+        run: |
+          python -m unittest -v \
+            test.training.test_structured_v2_final_fixes.TestStructuredV2FinalFixes.test_07_python310_compatible_chunked_sha256_file_bytes
+
   cpp-and-python-ci:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       KANACHAN_SKIP_CUDA: "1"
       KANACHAN_TEST_DISTRIBUTED: "1"
@@ -28,25 +60,84 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install build & test dependencies
+      - name: Install build & declared Python dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build build-essential libboost-dev
+          sudo apt-get install -y --no-install-recommends cmake ninja-build build-essential curl bzip2 ca-certificates
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0
-          pip install numpy tensordict omegaconf hydra-core tensorboard pybind11
+          TORCH_VER=$(python -c "import torch; print(torch.__version__)")
+          echo "torch==${TORCH_VER}" > "$RUNNER_TEMP/constraints.txt"
+          pip install -c "$RUNNER_TEMP/constraints.txt" --extra-index-url https://download.pytorch.org/whl/cpu \
+            "hydra-core==1.3.2" jsonschema "mahjong==1.1.11" numpy pyyaml pyzmq tensorboard \
+            "tensordict>=0.7.0,<0.11" "torchrl>=0.7.0,<0.11" tqdm types-tqdm
+          python -m pip check
 
-      - name: Clone external native deps (nyanten & boost) and build C++20 _candidate_features
+      - name: Cache pinned external native deps (nyanten & boost)
+        id: cache-native-deps
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kanachan-native-deps
+          key: kanachan-native-nyanten-581aa72-boost-1.85.0-v1
+
+      - name: Fetch pinned Nyanten and Boost 1.85.0
         run: |
-          python -c "import pybind11, pathlib; print(pybind11.get_cmake_dir())"
-          cmake -S tools/features -B build-features -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPython3_EXECUTABLE="$(which python)" \
-            -Dpybind11_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')" \
-            -DKANACHAN_FETCH_DEPS=ON || true
-          if [ ! -f build-features/build.ninja ]; then
-            echo "Building standalone header-check & compiler flags test"
+          DEPS_DIR="$HOME/.cache/kanachan-native-deps"
+          mkdir -p "$DEPS_DIR"
+          if [ ! -d "$DEPS_DIR/nyanten/.git" ]; then
+            rm -rf "$DEPS_DIR/nyanten"
+            git clone https://github.com/Cryolite/nyanten.git "$DEPS_DIR/nyanten"
           fi
+          git -C "$DEPS_DIR/nyanten" fetch --all --tags
+          git -C "$DEPS_DIR/nyanten" checkout 581aa72ce53e0ffeb0ef8d1ed14df2521ca5fb9b
+          test "$(git -C "$DEPS_DIR/nyanten" rev-parse HEAD)" = "581aa72ce53e0ffeb0ef8d1ed14df2521ca5fb9b"
+
+          if [ ! -d "$DEPS_DIR/boost_1_85_0/boost" ]; then
+            curl --fail --location --retry 3 \
+              https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.bz2 \
+              -o "$DEPS_DIR/boost_1_85_0.tar.bz2"
+            echo "7009fe1faa1697476bdc7027703a2badb84e849b7b0baad5086b087b971f8617  $DEPS_DIR/boost_1_85_0.tar.bz2" | sha256sum -c -
+            tar -xjf "$DEPS_DIR/boost_1_85_0.tar.bz2" -C "$DEPS_DIR"
+            rm -f "$DEPS_DIR/boost_1_85_0.tar.bz2"
+          fi
+
+      - name: Build C++20 _candidate_features & _simulation Release extensions
+        run: |
+          DEPS_DIR="$HOME/.cache/kanachan-native-deps"
+          if [ -f "$DEPS_DIR/nyanten/nyanten/replacement_number.hpp" ]; then
+            NYANTEN_ROOT="$DEPS_DIR/nyanten"
+          elif [ -f "$DEPS_DIR/nyanten/include/nyanten/replacement_number.hpp" ]; then
+            NYANTEN_ROOT="$DEPS_DIR/nyanten/include"
+          else
+            rm -rf "$DEPS_DIR/nyanten-prefix"
+            cmake -S "$DEPS_DIR/nyanten" -B "$RUNNER_TEMP/nyanten-build" -G Ninja
+            cmake --install "$DEPS_DIR/nyanten" --prefix "$DEPS_DIR/nyanten-prefix" || \
+              cmake --install "$RUNNER_TEMP/nyanten-build" --prefix "$DEPS_DIR/nyanten-prefix"
+            NYANTEN_ROOT="$DEPS_DIR/nyanten-prefix/include"
+          fi
+          test -f "$NYANTEN_ROOT/nyanten/replacement_number.hpp"
+
+          PY_INC=$(python -c 'import sysconfig; print(sysconfig.get_path("include"))')
+          PY_LIB=$(python -c 'import sysconfig, pathlib; print(pathlib.Path(sysconfig.get_config_var("LIBDIR")) / sysconfig.get_config_var("LDLIBRARY"))')
+          cmake -S tools/runtime -B build-native -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DKANACHAN_BOOST_ROOT="$DEPS_DIR/boost_1_85_0" \
+            -DKANACHAN_NYANTEN_ROOT="$NYANTEN_ROOT" \
+            -DKANACHAN_PYTHON_INCLUDE_DIR="$PY_INC" \
+            -DKANACHAN_PYTHON_LIBRARY="$PY_LIB" \
+            -DKANACHAN_BUILD_ANNOTATION=OFF
+          cmake --build build-native --parallel 4
+
+          PYTHONPATH=. python -c "
+          import kanachan._candidate_features as cf
+          import kanachan.simulation._simulation as sim
+          from kanachan.structured_v2 import STRUCTURED_V2_SCHEMA_ID
+          assert cf.SCHEMA_ID == 'discard_afterstate_v1'
+          assert cf.STRUCTURED_V2_SCHEMA_ID == STRUCTURED_V2_SCHEMA_ID
+          assert hasattr(cf, 'encode_structured_v2_batch')
+          assert hasattr(sim, 'simulate')
+          print('C++ extensions verified:', cf.__file__, sim.__file__)
+          "
 
       - name: Run Structured V2 Python + 2-Rank Gloo DDP Tests
         run: |
@@ -56,7 +147,8 @@ jobs:
             test.training.test_structured_v2_repairs \
             test.training.test_structured_v2_audit \
             test.training.test_structured_v2_readiness \
-            test.training.test_structured_v2_streaming_integrity
+            test.training.test_structured_v2_streaming_integrity \
+            test.training.test_structured_v2_final_fixes
 
       - name: Verify training source packaging completeness
         run: |

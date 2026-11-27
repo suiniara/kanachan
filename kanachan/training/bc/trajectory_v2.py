@@ -58,6 +58,7 @@ from kanachan.training.core.features import validate_sparse_prefix
 from kanachan.training.core.optimizers import (
     OptimizerCoverageError,
     adamw_parameter_groups,
+    consolidate_optimizer_state,
     dummy_ddp_zero_loss,
     move_optimizer_state,
     sync_ddp_step_status,
@@ -567,6 +568,7 @@ def _validate_and_stage_bc_lines(
         ]
     ] = []
     index_by_key: dict[tuple[Any, ...], int] = {}
+    first_line_by_key: dict[tuple[Any, ...], int] = {}
     scores_by_game: dict[str, tuple[int, int, int, int] | None] = {}
     game_meta: dict[str, tuple[int, int]] = {}
     seen_labeled: bool | None = None
@@ -668,6 +670,7 @@ def _validate_and_stage_bc_lines(
         if idx is None:
             idx = len(index_by_key)
             index_by_key[key] = idx
+            first_line_by_key[key] = int(line_no)
             raw_groups.append((key, []))
         parsed_rows.append((key, sp, nu, pr, ca, act, final_scores, rs_raw, res_raw, pr_len))
 
@@ -784,6 +787,7 @@ def _validate_and_stage_bc_lines(
                         "num_steps": int(sub_idx.numel()),
                         "final_rank": int(rk_sub[0]) if all(has_lab) else None,
                         "observer_total_steps": 0,
+                        "first_line_no": int(first_line_by_key[key]),
                     },
                 )
             )
@@ -1544,6 +1548,7 @@ class TrajectoryBCModel(nn.Module):
         data_sha256: str = "",
         source_data_sha256: str = "",
         preprocess_recipe_sha256: str = "",
+        ordered_sample_sha256: str = "",
         lr: float = 0.0,
         weight_decay: float = 0.0,
         training_config: Mapping[str, Any] | None = None,
@@ -1575,6 +1580,7 @@ class TrajectoryBCModel(nn.Module):
             "data_sha256": data_sha256,
             "source_data_sha256": source_data_sha256,
             "preprocess_recipe_sha256": preprocess_recipe_sha256,
+            "ordered_sample_sha256": str(ordered_sample_sha256),
             "lr": float(lr),
             "weight_decay": float(weight_decay),
         }
@@ -1700,6 +1706,10 @@ def save_trajectory_bc_checkpoint(
     rank = dist.get_rank() if is_dist else 0
     world_size = dist.get_world_size() if is_dist else 1
 
+    if is_dist and world_size > 1:
+        # Collective across every rank right before rank 0 reads optimizer.state_dict().
+        consolidate_optimizer_state(optimizer)
+
     local_rng = capture_rng()
     local_sampler = sampler.state_dict()
     local_aug = aug_generator.get_state().cpu().clone() if aug_generator is not None else None
@@ -1779,6 +1789,8 @@ def load_trajectory_bc_checkpoint(
         raise ValueError("Trajectory BC resume source_data_sha256 differs (Fail-Closed).")
     if saved_recipe.get("preprocess_recipe_sha256") != expected_recipe.get("preprocess_recipe_sha256"):
         raise ValueError("Trajectory BC resume preprocess_recipe_sha256 differs (Fail-Closed).")
+    if saved_recipe.get("ordered_sample_sha256", "") != expected_recipe.get("ordered_sample_sha256", ""):
+        raise ValueError("Trajectory BC resume ordered_sample_sha256 differs (Fail-Closed).")
     if saved_recipe != expected_recipe:
         raise ValueError("Trajectory BC resume recipe/manifest/hyperparameters differ (Fail-Closed).")
     raw = model.module if isinstance(model, DistributedDataParallel) else model
@@ -2017,6 +2029,7 @@ def train_trajectory_bc_steps(
 
         src_sha = str(getattr(rounds, "source_data_sha256", "") or "")
         prep_sha = str(getattr(rounds, "preprocess_recipe_sha256", "") or "")
+        ord_sha = str(getattr(rounds, "ordered_sample_sha256", "") or "")
         if not prep_sha and hasattr(rounds, "source_data_sha256"):
             prep_sha = compute_bc_preprocess_fingerprint(
                 allow_unlabeled=bool(getattr(rounds, "allow_unlabeled", False)),
@@ -2040,6 +2053,7 @@ def train_trajectory_bc_steps(
                 data_sha256=resolved_data_sha,
                 source_data_sha256=src_sha,
                 preprocess_recipe_sha256=prep_sha,
+                ordered_sample_sha256=ord_sha,
                 lr=base_lr,
                 weight_decay=base_wd,
             )
@@ -2051,6 +2065,10 @@ def train_trajectory_bc_steps(
             if prep_sha and recipe.get("preprocess_recipe_sha256") and prep_sha != recipe.get("preprocess_recipe_sha256"):
                 raise ValueError(
                     "BC data source preprocess_recipe_sha256 disagrees with training recipe (Fail-Closed)."
+                )
+            if ord_sha and recipe.get("ordered_sample_sha256") and ord_sha != recipe.get("ordered_sample_sha256"):
+                raise ValueError(
+                    "BC data source ordered_sample_sha256 disagrees with training recipe (Fail-Closed)."
                 )
 
         inactive_ids = _expected_inactive_bc_param_ids(raw)
@@ -2245,7 +2263,7 @@ def train_trajectory_bc_steps(
                                 if (ddp_model and not is_last_micro)
                                 else contextlib.nullcontext()
                             )
-                            if not ddp_model or is_last_micro:
+                            with sync_ctx:
                                 with torch.autocast(
                                     device_type=device.type,
                                     dtype=amp_dtype or torch.float32,
@@ -2257,60 +2275,47 @@ def train_trajectory_bc_steps(
                                         denom_overrides=denom_overrides,
                                         ddp_world_size=world_size,
                                     )
-                                if ddp_model:
+                                if ddp_model and is_last_micro:
                                     last_forward_armed_reducer = True
-                            else:
-                                with sync_ctx, torch.autocast(
-                                    device_type=device.type,
-                                    dtype=amp_dtype or torch.float32,
-                                    enabled=bool(is_amp),
-                                    cache_enabled=False,
+                                loss = out["loss"]
+                                if loss_transform is not None:
+                                    loss = loss_transform(loss, step)
+
+                                if (
+                                    not isinstance(loss, Tensor)
+                                    or loss.numel() != 1
+                                    or not loss.requires_grad
+                                    or loss.grad_fn is None
                                 ):
-                                    out = model(
-                                        batch_dev,
-                                        denom_overrides=denom_overrides,
-                                        ddp_world_size=world_size,
-                                    )
-                            loss = out["loss"]
-                            if loss_transform is not None:
-                                loss = loss_transform(loss, step)
-
-                            if (
-                                not isinstance(loss, Tensor)
-                                or loss.numel() != 1
-                                or not loss.requires_grad
-                                or loss.grad_fn is None
-                            ):
-                                local_fatal = True
-                                local_fatal_msg = (
-                                    "BC training loss has no autograd graph (requires_grad=False or grad_fn is None); "
-                                    "aborting before backward/optimizer update."
-                                )
-                                break
-
-                            reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
-                            opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
-                            if not opt_reach:
-                                local_fatal = True
-                                local_fatal_msg = (
-                                    "Disconnected BC computation graph detected before backward: trainable parameters "
-                                    "not connected to loss (<no optimizer parameters connected to loss>)."
-                                )
-                                break
-                            if not has_reentrant_ckpt:
-                                pre_disc = [
-                                    n for n, p in expected_active_named if id(p) not in reachable_ids
-                                ]
-                                if pre_disc:
                                     local_fatal = True
                                     local_fatal_msg = (
-                                        "Disconnected BC computation graph detected before backward: trainable parameters "
-                                        f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                                        "BC training loss has no autograd graph (requires_grad=False or grad_fn is None); "
+                                        "aborting before backward/optimizer update."
                                     )
                                     break
 
-                            loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
-                            with sync_ctx:
+                                reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
+                                opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
+                                if not opt_reach:
+                                    local_fatal = True
+                                    local_fatal_msg = (
+                                        "Disconnected BC computation graph detected before backward: trainable parameters "
+                                        "not connected to loss (<no optimizer parameters connected to loss>)."
+                                    )
+                                    break
+                                if not has_reentrant_ckpt:
+                                    pre_disc = [
+                                        n for n, p in expected_active_named if id(p) not in reachable_ids
+                                    ]
+                                    if pre_disc:
+                                        local_fatal = True
+                                        local_fatal_msg = (
+                                            "Disconnected BC computation graph detected before backward: trainable parameters "
+                                            f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                                        )
+                                        break
+
+                                loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
                                 scaler.scale(loss).backward()
 
                     if local_fatal:

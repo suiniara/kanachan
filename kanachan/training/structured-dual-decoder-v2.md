@@ -595,10 +595,13 @@ flowchart TB
    - **双重内容与配方 SHA-256 指纹**（[core/dataset_fingerprint.py](core/dataset_fingerprint.py)）：
      - `source_data_sha256` 直接对所有源文件的原始磁盘字节（`.gz` 文件直接流式哈希压缩字节，保持多文件有序列表与 `schema_version`，不依赖路径与 `mtime`）计算 SHA-256，防止同字节数或回拨 `mtime` 篡改漏检；
      - `preprocess_recipe_sha256` 独立哈希完整解析配置、奖励方案与插件字节摘要、`FrozenGRP` 校验和/规则集摘要、`reservoir_size`/`warmup_transitions`/`batch_size`/`bucket_mult`/`drop_last`、`suit_augmentation` 与种子；
-     - `SpoolingRoundBCDataSource` 在 `meta.json` (`kanachan_bc_round_spool_v2`) 绑定 `index.bin` 与 `rounds.bin` 自身 SHA-256 并在命中缓存前完成校验；BC/IQL 检查点与 TensorBoard `architecture/summary` 均持久化两类身份，任一不匹配 Fail-Closed 拒绝恢复或重建缓存；
-   - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、IQL 分布式超参（`quantile_cql_alpha`, `cql_temperature`, `qr_double_q`）、完整 `training_config`、`source_data_sha256` / `preprocess_recipe_sha256` / `data_sha256`、奖励/GRP SHA256、精度配方、数值安全统计（`numerical_stats`）、优化器/调度器/`GradScaler`、外部/流式回放游标（`sampler_by_rank` / `stream_state_by_rank`）以及多卡独立 `rng_by_rank` 状态；任一摘要或 `world_size` 不一致直接抛错拒绝恢复；
-   - **O(1)-RAM BC 外部磁盘索引与线程隔离并发读取**（[bc/streaming_v2.py](bc/streaming_v2.py)）：
-     - `SpoolingRoundBCDataSource` 不再将 `round_event_lens` 或全部批列表常驻内存，而是通过 `DiskLengthBucketBatchSampler` 对 `index.bin` 执行顺序分块 + 保序 SplitMix64 外部哈希分区 + 有界窗口长度分桶 + 外部归并排序生成磁盘 `schedule.bin` / `ids.bin`，按 `threading.local()` 每线程独立只读句柄惰性流式读取与预取（支持单局截断/空批零权重 Ghost Batch 全局对齐）；
+     - `SpoolingRoundBCDataSource` 在 `meta.json` (`kanachan_bc_round_spool_v3`) 绑定 `index.bin`、`rounds.bin` 与按源文件出现序规范化后的 `ordered_sample_sha256` 并在命中缓存前完成校验；BC/IQL 检查点与 TensorBoard `architecture/summary` 均持久化两类身份及 `ordered_sample_sha256`，任一不匹配 Fail-Closed 拒绝恢复或重建缓存；
+   - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、IQL 分布式超参（`quantile_cql_alpha`, `cql_temperature`, `qr_double_q`）、完整 `training_config`、`source_data_sha256` / `preprocess_recipe_sha256` / `ordered_sample_sha256` / `data_sha256`、奖励/GRP SHA256、精度配方、数值安全统计（`numerical_stats`）、优化器（含 ZeRO 恢复前全 rank `consolidate_optimizer_state`）/调度器/`GradScaler`、外部/流式回放游标（`sampler_by_rank` / `stream_state_by_rank`）以及多卡独立 `rng_by_rank` 状态；任一摘要或 `world_size` 不一致直接抛错拒绝恢复；
+   - **有界资源外存 BC 磁盘索引与线程隔离并发读取**（[bc/streaming_v2.py](bc/streaming_v2.py)）：
+     - `SpoolingRoundBCDataSource` 与 `DiskLengthBucketBatchSampler` 不再将 `round_event_lens` 或全部批列表常驻内存，也不再依赖与分桶数耦合的物理顺序或无限扇入单轮 `heapq.merge`：
+       1. `SpoolingRoundBCDataSource` 通过递归拆分叶桶（受 `max_bucket_bytes` 限制，单遍/多级深度上界 `max_depth=4`）与固定扇入外存归并生成规范有序 `index.bin` 与 `ordered_sample_sha256`；
+       2. `DiskLengthBucketBatchSampler` 在构建每个 epoch 调度时使用递归 MSB SplitMix64 基数分区（并发打开文件数 `<= radix + 1 <= max_merge_fan_in + 2`）、`O(window_items + batch_size * bucket_mult)` 窗口内存排序分桶及固定扇入 `max_merge_fan_in` 多轮外存归并（并发句柄严格 `<= max_merge_fan_in + 1`，总归并读缓冲 `<= 256 KiB`、`O(log_{fan_in}(N))` 趟磁盘读写），稳态迭代与预取仅持有当前预取窗口张量与每线程 `2` 个只读句柄；
+       3. 多卡构建统一进入 Rank-0 决定缓存复用/构建后的全体系 `broadcast_object_list`，消除先完成 rank 提前返回导致的 collective 分支失配；
    - **IQL 多遍严格 transition 均匀水塘与块置换分片**（[iql/streaming_v2.py](iql/streaming_v2.py)）：
      - `_reservoir.total_seen` 保持跨遍累计供 Vitter Algorithm R（保证不等长对局下严格按**决策步**均匀采样 $\min(1, M/N)$，且跨遍由单调递增的 RNG 推进产生可复现但互异的采样序列）；
      - `pass_transitions_seen` / `pass_target_batches` / `pass_batches_emitted` 在每次 `reset_pass()` 清零且以 `(pass_batches_emitted + 1) * batch_size` 节流摄取，消除预热双计与超长单局多发批，prefetch 回滚同步恢复未消费批与预读 EOF 快照；
