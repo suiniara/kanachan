@@ -34,6 +34,7 @@ from kanachan.training.bc.trajectory_v2 import (
     collate_round_batch,
     parse_bc_rounds,
 )
+from kanachan.training.core.test_env import is_cuda_skipped, resolve_val_bc_path
 from tools.audit_structured_v2 import load_samples
 
 
@@ -134,13 +135,13 @@ def benchmark_presets(
     num_hanchans: int = 64,
     out_path: Path | None = None,
 ) -> dict[str, Any]:
-    sp, nu, pr, ca = load_samples(data_path, 512)
+    _uuids, sp, nu, pr, ca = load_samples(data_path, 512)
     feats_cpu = derive_structured_v2_batch(sp, nu, pr, ca)
-    rounds = parse_bc_rounds(data_path, max_rounds=48)
+    rounds = parse_bc_rounds(data_path, max_rounds=48, max_lines=4096, allow_incomplete=True)
     round_batch_cpu = collate_round_batch(rounds[:16])
 
     preset_stats: dict[str, Any] = {}
-    has_cuda = torch.cuda.is_available()
+    has_cuda = (not is_cuda_skipped()) and torch.cuda.is_available()
     cuda_dev = torch.device("cuda") if has_cuda else torch.device("cpu")
     gpu_name = torch.cuda.get_device_name(0) if has_cuda else "cpu-only"
 
@@ -428,7 +429,8 @@ def main() -> int:
     parser.add_argument(
         "--data",
         type=Path,
-        default=Path(r"D:\kanachan-training-data\validation.bc.tsv.gz"),
+        default=resolve_val_bc_path(),
+        help="Path to validation.bc.tsv(.gz) (defaults to KANACHAN_VAL_BC_DATA env var).",
     )
     parser.add_argument("--hanchans", type=int, default=64)
     parser.add_argument(
@@ -437,6 +439,10 @@ def main() -> int:
         default=Path("runs/v2-verify/phase1b_benchmark.json"),
     )
     args = parser.parse_args()
+    if args.data is None or not Path(args.data).is_file():
+        raise FileNotFoundError(
+            "Benchmark validation data not found; pass --data <path> or set KANACHAN_VAL_BC_DATA."
+        )
     benchmark_presets(args.data, num_hanchans=args.hanchans, out_path=args.out)
     return 0
 

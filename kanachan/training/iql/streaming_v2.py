@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import gzip
-import hashlib
-import json
 import math
 import queue
 import threading
@@ -20,16 +18,20 @@ from kanachan.constants import (
     MAX_LENGTH_OF_PROGRESSION_FEATURES,
     MAX_NUM_ACTION_CANDIDATES,
     MAX_NUM_ACTIVE_SPARSE_FEATURES,
-    MAX_NUM_ROUND_SUMMARY,
     NUM_NUMERIC_FEATURES,
-    NUM_RESULTS,
     NUM_TYPES_OF_PROGRESSION_FEATURES,
-    NUM_TYPES_OF_ROUND_SUMMARY,
     NUM_TYPES_OF_SPARSE_FEATURES,
     SEAT_INDEX,
     SEAT_OFFSET,
 )
-from kanachan.structured_v2 import permute_structured_batch
+from kanachan.structured_v2 import OFFSETS_136, PAD_ACTION_ID, permute_structured_batch
+from kanachan.training.core.dataset_fingerprint import (
+    SOURCE_V3_RL_FORMAT_VERSION,
+    combine_dataset_identity,
+    compute_iql_preprocess_fingerprint,
+    compute_reward_plugin_sha256,
+    compute_source_data_fingerprint,
+)
 from kanachan.training.core.offline_rl.data_iterator import DataIterator
 from kanachan.training.core.ranking import scores_to_ranks
 from kanachan.training.core.rl.rewards import configured_reward
@@ -37,6 +39,25 @@ from kanachan.training.grp import FrozenGRP, FrozenGRPPBRSReward, load_frozen_gr
 from kanachan.training.iql.joint_v2 import attach_structured_v2_transition_features
 
 _SENTINEL = object()
+
+
+def _splitmix64(x: int) -> int:
+    z = (x + 0x9E3779B97F4A7C15) & 0xFFFF_FFFF_FFFF_FFFF
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFF_FFFF_FFFF_FFFF
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFF_FFFF_FFFF_FFFF
+    return z ^ (z >> 31)
+
+
+def _block_owner_perm(seed: int, block_idx: int, world_size: int) -> tuple[int, ...]:
+    """Deterministic per-block permutation across ranks eliminating seat/class aliasing."""
+    if world_size <= 1:
+        return (0,)
+    arr = list(range(world_size))
+    base = (int(seed) * 0xD1342543DE82EF95 + int(block_idx) * 0x9E3779B97F4A7C15) & 0xFFFF_FFFF_FFFF_FFFF
+    for i in range(world_size - 1, 0, -1):
+        j = _splitmix64(base + i) % (i + 1)
+        arr[i], arr[j] = arr[j], arr[i]
+    return tuple(arr)
 
 
 def _resolve_rl_source_files(source: Path | Sequence[Path]) -> list[Path]:
@@ -205,11 +226,13 @@ class _CompactTransitionReservoir:
 
     def ingest_game(
         self, game: dict[str, Tensor], rng: torch.Generator
-    ) -> list[tuple[int, dict[str, Tensor] | None]]:
-        """Insert one complete game via Algorithm R and return undo log for touched slots."""
+    ) -> tuple[list[tuple[int, dict[str, Tensor] | None]], int, int]:
+        """Insert one complete game via Algorithm R and return ``(undo_log, prev_len, prev_total_seen)``."""
+        prev_len = self.length
+        prev_seen = self.total_seen
         n_rows = int(game["act"].shape[0])
         if n_rows == 0:
-            return []
+            return [], prev_len, prev_seen
         self._ensure_capacity(min(self.max_size, self.length + n_rows))
         undo: list[tuple[int, dict[str, Tensor] | None]] = []
 
@@ -220,6 +243,7 @@ class _CompactTransitionReservoir:
                 self.length += 1
                 undo.append((slot, None))
             else:
+                # Vitter Algorithm R: slot inclusion probability M / total_seen per transition.
                 j = int(torch.randint(0, self.total_seen, (1,), generator=rng).item())
                 if j >= self.max_size:
                     continue
@@ -229,7 +253,7 @@ class _CompactTransitionReservoir:
 
             for k, buf in self._bufs.items():
                 buf[slot].copy_(game[k][r].to(dtype=buf.dtype))
-        return undo
+        return undo, prev_len, prev_seen
 
     def rollback_ingest(
         self,
@@ -282,7 +306,22 @@ class _CompactTransitionReservoir:
 
 
 class StreamingIQLDataset:
-    """Bounded-memory streaming RL dataset with rank partitioning, Algorithm-R reservoir & exact resume."""
+    """Bounded-memory streaming RL dataset with transition-uniform Algorithm R & multi-pass accounting.
+
+    Multi-pass policy:
+    - ``_reservoir`` and ``_reservoir.total_seen`` remain **cumulative** across ``reset_pass()`` calls
+      so after ``p`` complete passes over ``N`` owned transitions, every transition ``i`` has been
+      presented ``p`` times and retains equal marginal inclusion probability ``min(1, M / N)`` without
+      biasing later passes toward pass start or re-running warmup filtering.
+    - ``pass_transitions_seen``, ``pass_target_batches``, and ``pass_batches_emitted`` measure ONLY the
+      current source traversal and are reset to ``(0, None, 0)`` in ``reset_pass()`` while
+      ``pass_index`` increments by 1.
+    - ``_ingest_rng``, ``_sample_rng``, and ``_aug_rng`` advance monotonically across passes so repeated
+      passes remain bit-reproducible from checkpoints yet explore distinct sampling/augmentation draws.
+    - Pre-EOF ingestion for each batch advances until the reservoir has reached ``warmup_transitions``
+      AND ``pass_transitions_seen >= (pass_batches_emitted + 1) * batch_size`` (or EOF), guaranteeing no
+      double-counted warmup transitions and no spurious extra batches on long games (``L > batch_size``).
+    """
 
     def __init__(
         self,
@@ -293,6 +332,7 @@ class StreamingIQLDataset:
         warmup_transitions: int | None = None,
         reward_scheme: str = "placement",
         reward_fn: Any | None = None,
+        reward_plugin_path: Path | None = None,
         grp: FrozenGRP | Path | None = None,
         score_unit: float = 10000.0,
         round_weight: float = 0.2,
@@ -309,6 +349,7 @@ class StreamingIQLDataset:
         max_prefetch: int = 2,
         max_games: int | None = None,
         max_batches: int | None = None,
+        schema_version: str | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1.")
@@ -321,11 +362,13 @@ class StreamingIQLDataset:
         self.batch_size = int(batch_size)
         self.reservoir_size = int(reservoir_size)
         self.warmup_transitions = (
-            min(self.reservoir_size, int(warmup_transitions))
+            min(self.reservoir_size, max(0, int(warmup_transitions)))
             if warmup_transitions is not None
             else min(self.reservoir_size, max(self.batch_size, 256))
         )
         self.reward_scheme = str(reward_scheme)
+        self.score_unit = float(score_unit)
+        self.round_weight = float(round_weight)
         self.discount_factor = float(discount_factor)
         self.rewrite_rooms = rewrite_rooms
         self.rewrite_grades = rewrite_grades
@@ -339,43 +382,59 @@ class StreamingIQLDataset:
         self.max_prefetch = int(max_prefetch)
         self.max_games = max_games
         self.max_batches = max_batches
+        self.schema_version = str(schema_version or SOURCE_V3_RL_FORMAT_VERSION)
 
         self.grp: FrozenGRP | None = None
         if reward_fn is not None:
             self.reward_fn = reward_fn
-            reward_id = f"plugin:{type(reward_fn).__name__}"
         elif self.reward_scheme == "grp_pbrs":
             grp_obj = load_frozen_grp(Path(grp), require_gate=True) if isinstance(grp, (str, Path)) else grp
             if not isinstance(grp_obj, FrozenGRP):
                 raise ValueError("StreamingIQLDataset reward_scheme='grp_pbrs' requires a verified FrozenGRP or Path.")
             self.grp = grp_obj
             self.reward_fn = FrozenGRPPBRSReward(grp_obj)
-            reward_id = f"grp_pbrs:{grp_obj.grp_sha256}"
         else:
             if grp is not None and isinstance(grp, FrozenGRP):
                 self.grp = grp
             self.reward_fn = configured_reward(
                 self.reward_scheme,
-                score_unit=float(score_unit),
-                round_weight=float(round_weight),
+                score_unit=self.score_unit,
+                round_weight=self.round_weight,
                 grp=self.grp,
             )
-            reward_id = f"{self.reward_scheme}:{score_unit}:{round_weight}"
 
-        sig_hasher = hashlib.sha256()
-        sig_payload = {
-            "files": [
-                {"path": str(f.resolve()), "size": int(f.stat().st_size), "mtime_ns": int(f.stat().st_mtime_ns)}
-                for f in self.source_files
-            ],
-            "reward_id": reward_id,
-            "discount_factor": self.discount_factor,
-            "rewrite_rooms": self.rewrite_rooms,
-            "rewrite_grades": self.rewrite_grades,
-            "enable_early_shape_hint": self.enable_early_shape_hint,
-        }
-        sig_hasher.update(json.dumps(sig_payload, sort_keys=True).encode("utf-8"))
-        self.data_sha256: str = sig_hasher.hexdigest()
+        reward_plugin_sha = (
+            compute_reward_plugin_sha256(reward_fn, reward_plugin_path)
+            if (reward_fn is not None or reward_plugin_path is not None)
+            else None
+        )
+        self.source_data_sha256, self.source_file_fingerprints = compute_source_data_fingerprint(
+            self.source_files,
+            source_format=self.schema_version,
+            max_items=self.max_games,
+        )
+        self.preprocess_recipe_sha256 = compute_iql_preprocess_fingerprint(
+            enable_early_shape_hint=self.enable_early_shape_hint,
+            rewrite_rooms=self.rewrite_rooms,
+            rewrite_grades=self.rewrite_grades,
+            reward_scheme=self.reward_scheme,
+            reward_plugin_sha256=reward_plugin_sha,
+            score_unit=self.score_unit,
+            round_weight=self.round_weight,
+            discount_factor=self.discount_factor,
+            grp=self.grp,
+            reservoir_size=self.reservoir_size,
+            warmup_transitions=self.warmup_transitions,
+            batch_size=self.batch_size,
+            drop_last=self.drop_last,
+            seed=self.seed,
+            suit_augmentation=self.suit_augmentation,
+            aug_seed=self.aug_seed,
+            schema_version=self.schema_version,
+        )
+        self.data_sha256 = combine_dataset_identity(
+            self.source_data_sha256, self.preprocess_recipe_sha256
+        )
 
         self._parser_helper = DataIterator(
             path=self.source_files[0],
@@ -401,14 +460,28 @@ class StreamingIQLDataset:
         self._fp: Any = None
         self._game_idx: int = 0
         self._eof: bool = False
-        self._batches_emitted: int = 0
-        self._target_batches_after_eof: int | None = None
+        self.pass_index: int = 0
+        self.pass_transitions_seen: int = 0
+        self.pass_target_batches: int | None = None
+        self.pass_batches_emitted: int = 0
+        self.total_batches_emitted: int = 0
+        self._perm_cache: tuple[int, tuple[int, ...]] | None = None
 
         self._lock = threading.Lock()
         self._prefetch_queue: queue.Queue[Any] | None = None
         self._stop_event: threading.Event | None = None
         self._worker: threading.Thread | None = None
         self._last_batch: TensorDict | None = None
+        self._cached_zero_ghost: TensorDict | None = None
+
+    def _game_owner_rank(self, game_idx: int) -> int:
+        if self.world_size == 1:
+            return 0
+        blk = game_idx // self.world_size
+        off = game_idx % self.world_size
+        if self._perm_cache is None or self._perm_cache[0] != blk:
+            self._perm_cache = (blk, _block_owner_perm(self.seed, blk, self.world_size))
+        return self._perm_cache[1][off]
 
     def _open_current_file(self) -> bool:
         while self._file_idx < len(self.source_files):
@@ -458,7 +531,7 @@ class StreamingIQLDataset:
                     f"Expected 8, 10, or 12 columns at {self.source_files[self._file_idx]}:{self._line_in_file}, got {n_tabs + 1}."
                 )
             is_eog = n_tabs == 7
-            owned = (self._game_idx % self.world_size) == self.rank
+            owned = self._game_owner_rank(self._game_idx) == self.rank
 
             if owned:
                 row = self._parse_line(stripped)
@@ -545,20 +618,23 @@ class StreamingIQLDataset:
         }
 
     def _produce_next_raw_with_rollback(self) -> tuple[dict[str, Tensor] | None, dict[str, Any] | None]:
-        """Advance stream/reservoir for one batch while recording exact LIFO rollback metadata."""
-        if self.max_batches is not None and self._batches_emitted >= int(self.max_batches):
+        """Advance current-pass stream and cumulative reservoir while recording exact LIFO rollback state."""
+        if self.max_batches is not None and self.total_batches_emitted >= int(self.max_batches):
             return None, None
-        if self._eof and self._target_batches_after_eof is not None:
-            if self._batches_emitted >= self._target_batches_after_eof:
+        if self._eof and self.pass_target_batches is not None:
+            if self.pass_batches_emitted >= self.pass_target_batches:
                 return None, None
 
-        snap = {
+        snap: dict[str, Any] = {
             "file_idx": self._file_idx,
             "line_in_file": self._line_in_file,
             "game_idx": self._game_idx,
             "eof": self._eof,
-            "batches_emitted": self._batches_emitted,
-            "target_batches_after_eof": self._target_batches_after_eof,
+            "pass_index": self.pass_index,
+            "pass_transitions_seen": self.pass_transitions_seen,
+            "pass_target_batches": self.pass_target_batches,
+            "pass_batches_emitted": self.pass_batches_emitted,
+            "total_batches_emitted": self.total_batches_emitted,
             "res_len": self._reservoir.length,
             "res_seen": self._reservoir.total_seen,
             "ingest_rng": self._ingest_rng.get_state().clone(),
@@ -567,27 +643,28 @@ class StreamingIQLDataset:
             "undos": [],
         }
 
-        while (not self._eof) and self._reservoir.length < self.warmup_transitions:
+        needed_pass_transitions = (self.pass_batches_emitted + 1) * self.batch_size
+        while not self._eof and (
+            self._reservoir.length < self.warmup_transitions
+            or self.pass_transitions_seen < needed_pass_transitions
+        ):
             game = self._read_next_owned_game()
             if game is None:
                 break
+            n_rows = int(game["act"].shape[0])
             snap["undos"].append(self._reservoir.ingest_game(game, self._ingest_rng))
+            self.pass_transitions_seen += n_rows
 
-        if not self._eof:
-            game = self._read_next_owned_game()
-            if game is not None:
-                snap["undos"].append(self._reservoir.ingest_game(game, self._ingest_rng))
-
-        if self._eof and self._target_batches_after_eof is None:
-            if self._reservoir.total_seen == 0:
-                self._target_batches_after_eof = 0
+        if self._eof and self.pass_target_batches is None:
+            if self.pass_transitions_seen == 0:
+                self.pass_target_batches = 0
             elif self.drop_last:
-                self._target_batches_after_eof = self._reservoir.total_seen // self.batch_size
+                self.pass_target_batches = self.pass_transitions_seen // self.batch_size
             else:
-                self._target_batches_after_eof = math.ceil(self._reservoir.total_seen / self.batch_size)
+                self.pass_target_batches = math.ceil(self.pass_transitions_seen / self.batch_size)
 
-        if self._eof and self._target_batches_after_eof is not None:
-            if self._batches_emitted >= self._target_batches_after_eof or self._reservoir.length == 0:
+        if self._eof and self.pass_target_batches is not None:
+            if self.pass_batches_emitted >= self.pass_target_batches or self._reservoir.length == 0:
                 return None, snap
 
         raw = self._reservoir.sample_batch(self.batch_size, self._sample_rng)
@@ -597,7 +674,8 @@ class StreamingIQLDataset:
             else 0
         )
         raw["perm_idx"] = torch.tensor(perm_idx, dtype=torch.int64)
-        self._batches_emitted += 1
+        self.pass_batches_emitted += 1
+        self.total_batches_emitted += 1
         return raw, snap
 
     def _build_tensordict_batch(self, raw: dict[str, Tensor], *, batch_weight: float = 1.0) -> TensorDict:
@@ -622,7 +700,7 @@ class StreamingIQLDataset:
                     "final_rank": raw["final_rank"].to(torch.int64),
                 },
             },
-            batch_size=[int(raw["act"].shape[0])],
+            batch_size=[bsz],
             device=torch.device("cpu"),
         )
         td = attach_structured_v2_transition_features(
@@ -635,16 +713,19 @@ class StreamingIQLDataset:
 
     def _rollback_snapshot(self, snap: dict[str, Any]) -> None:
         self._close_fp()
-        for undo in reversed(snap["undos"]):
-            self._reservoir.rollback_ingest(undo, snap["res_len"], snap["res_seen"])
+        for undo, prev_len, prev_seen in reversed(snap["undos"]):
+            self._reservoir.rollback_ingest(undo, prev_len, prev_seen)
         self._reservoir.length = int(snap["res_len"])
         self._reservoir.total_seen = int(snap["res_seen"])
         self._file_idx = int(snap["file_idx"])
         self._line_in_file = int(snap["line_in_file"])
         self._game_idx = int(snap["game_idx"])
         self._eof = bool(snap["eof"])
-        self._batches_emitted = int(snap["batches_emitted"])
-        self._target_batches_after_eof = snap["target_batches_after_eof"]
+        self.pass_index = int(snap["pass_index"])
+        self.pass_transitions_seen = int(snap["pass_transitions_seen"])
+        self.pass_target_batches = snap["pass_target_batches"]
+        self.pass_batches_emitted = int(snap["pass_batches_emitted"])
+        self.total_batches_emitted = int(snap["total_batches_emitted"])
         self._ingest_rng.set_state(snap["ingest_rng"])
         self._sample_rng.set_state(snap["sample_rng"])
         self._aug_rng.set_state(snap["aug_rng"])
@@ -654,7 +735,7 @@ class StreamingIQLDataset:
             return
         assert self._stop_event is not None and self._prefetch_queue is not None
         self._stop_event.set()
-        drained: list[tuple[TensorDict, dict[str, Any]]] = []
+        drained: list[dict[str, Any] | None] = []
         while True:
             try:
                 item = self._prefetch_queue.get_nowait()
@@ -665,14 +746,16 @@ class StreamingIQLDataset:
                 continue
             if item is _SENTINEL or (isinstance(item, tuple) and item[0] == "err"):
                 continue
-            if item[0] == "ok":
-                drained.append((item[1], item[2]))
+            if isinstance(item, tuple) and item[0] == "ok":
+                drained.append(item[2])
+            elif isinstance(item, tuple) and item[0] == "eof":
+                drained.append(item[1])
         if self._worker.is_alive():
             self._worker.join(timeout=2.0)
         if rollback_queued and drained:
-            # Undo unconsumed batches in reverse chronological order.
+            # Undo unconsumed queued batches AND pre-fetched EOF transitions in reverse order.
             with self._lock:
-                for _, snap in reversed(drained):
+                for snap in reversed(drained):
                     if snap is not None:
                         self._rollback_snapshot(snap)
         self._worker = None
@@ -704,7 +787,10 @@ class StreamingIQLDataset:
                             break
                         raw, snap = self._produce_next_raw_with_rollback()
                     if raw is None:
-                        _put(_SENTINEL)
+                        if not _put(("eof", snap)):
+                            with self._lock:
+                                if snap is not None:
+                                    self._rollback_snapshot(snap)
                         return
                     td = self._build_tensordict_batch(raw, batch_weight=1.0)
                     if not _put(("ok", td, snap)):
@@ -725,7 +811,7 @@ class StreamingIQLDataset:
             assert self._prefetch_queue is not None
             while True:
                 item = self._prefetch_queue.get()
-                if item is _SENTINEL:
+                if item is _SENTINEL or (isinstance(item, tuple) and item[0] == "eof"):
                     self._stop_prefetcher(rollback_queued=False)
                     return None
                 if item[0] == "err":
@@ -743,6 +829,47 @@ class StreamingIQLDataset:
             self._last_batch = td
             return td
 
+    def _empty_ghost_batch(self) -> TensorDict:
+        if self._cached_zero_ghost is not None:
+            return self._cached_zero_ghost
+        bsz = self.batch_size
+        sp_toks = [2, 5, 7, 23, 39, 55, 71, 75, 78, 82 + 69, 152 + 1]
+        closed_hand = {1: 1, 2: 1, 3: 1, 11: 1, 12: 1, 13: 1, 21: 1, 22: 1, 23: 1, 31: 3, 32: 1}
+        for t37, cnt in sorted(closed_hand.items()):
+            for k in range(cnt):
+                sp_toks.append(337 + OFFSETS_136[t37] + k)
+        sp_toks.append(473 + 32)
+        sp_row = torch.full((MAX_NUM_ACTIVE_SPARSE_FEATURES,), NUM_TYPES_OF_SPARSE_FEATURES, dtype=torch.int32)
+        sp_row[: len(sp_toks)] = torch.tensor(sp_toks, dtype=torch.int32)
+        sp = sp_row.unsqueeze(0).expand(bsz, -1).clone()
+        nu = torch.tensor([[0, 0, 25000, 25000, 25000, 25000]], dtype=torch.int32).expand(bsz, -1).clone()
+        pr = torch.full((bsz, MAX_LENGTH_OF_PROGRESSION_FEATURES), NUM_TYPES_OF_PROGRESSION_FEATURES, dtype=torch.int32)
+        pr[:, 0] = 0
+        ca = torch.full((bsz, MAX_NUM_ACTION_CANDIDATES), PAD_ACTION_ID, dtype=torch.int32)
+        ca[:, 0] = 4
+        ca[:, 1] = 44
+        ca[:, 2] = 84
+        ca[:, 3] = 130
+        raw = {
+            "sp": sp.to(torch.int16),
+            "nu": nu,
+            "pr": pr.to(torch.int16),
+            "ca": ca.to(torch.int16),
+            "act": torch.zeros((bsz,), dtype=torch.uint8),
+            "nsp": sp.to(torch.int16),
+            "nnu": nu,
+            "npr": pr.to(torch.int16),
+            "nca": ca.to(torch.int16),
+            "reward": torch.zeros((bsz,), dtype=torch.float32),
+            "discount": torch.full((bsz,), self.discount_factor, dtype=torch.float32),
+            "done": torch.ones((bsz,), dtype=torch.bool),
+            "eog": torch.ones((bsz,), dtype=torch.bool),
+            "final_rank": torch.zeros((bsz,), dtype=torch.int8),
+        }
+        td = self._build_tensordict_batch(raw, batch_weight=0.0)
+        self._cached_zero_ghost = td
+        return td
+
     def ghost_batch(self) -> TensorDict:
         """Return a valid zero-weight batch when another DDP rank still has remaining work."""
         if self._last_batch is not None:
@@ -750,9 +877,7 @@ class StreamingIQLDataset:
             bsz = int(cloned.batch_size[0])
             cloned["batch_weight"] = torch.zeros((bsz,), dtype=torch.float32)
             return cloned
-        raise RuntimeError(
-            "StreamingIQLDataset rank has 0 assigned transitions while peer rank is non-empty."
-        )
+        return self._empty_ghost_batch().clone(recurse=False)
 
     def __iter__(self) -> Iterator[TensorDict]:
         while True:
@@ -766,8 +891,10 @@ class StreamingIQLDataset:
         self._stop_prefetcher(rollback_queued=True)
         with self._lock:
             return {
-                "format": "kanachan_iql_stream_v1",
+                "format": "kanachan_iql_stream_v2",
                 "data_sha256": self.data_sha256,
+                "source_data_sha256": self.source_data_sha256,
+                "preprocess_recipe_sha256": self.preprocess_recipe_sha256,
                 "rank": self.rank,
                 "world_size": self.world_size,
                 "batch_size": self.batch_size,
@@ -776,8 +903,11 @@ class StreamingIQLDataset:
                 "line_in_file": self._line_in_file,
                 "game_idx": self._game_idx,
                 "eof": self._eof,
-                "batches_emitted": self._batches_emitted,
-                "target_batches_after_eof": self._target_batches_after_eof,
+                "pass_index": self.pass_index,
+                "pass_transitions_seen": self.pass_transitions_seen,
+                "pass_target_batches": self.pass_target_batches,
+                "pass_batches_emitted": self.pass_batches_emitted,
+                "total_batches_emitted": self.total_batches_emitted,
                 "ingest_rng": self._ingest_rng.get_state().clone(),
                 "sample_rng": self._sample_rng.get_state().clone(),
                 "aug_rng": self._aug_rng.get_state().clone(),
@@ -787,26 +917,39 @@ class StreamingIQLDataset:
     def load_state_dict(self, state: dict[str, Any]) -> None:
         self._stop_prefetcher(rollback_queued=False)
         with self._lock:
-            if state.get("format") != "kanachan_iql_stream_v1":
-                raise ValueError("Invalid StreamingIQLDataset checkpoint state format.")
+            if state.get("format") != "kanachan_iql_stream_v2":
+                raise ValueError("Invalid StreamingIQLDataset checkpoint state format (expected v2).")
+            if state.get("source_data_sha256") != self.source_data_sha256:
+                raise ValueError(
+                    "StreamingIQLDataset checkpoint source_data_sha256 mismatch (Fail-Closed)."
+                )
+            if state.get("preprocess_recipe_sha256") != self.preprocess_recipe_sha256:
+                raise ValueError(
+                    "StreamingIQLDataset checkpoint preprocess_recipe_sha256 mismatch (Fail-Closed)."
+                )
             if state.get("data_sha256") != self.data_sha256:
                 raise ValueError("StreamingIQLDataset checkpoint data_sha256 mismatch (Fail-Closed).")
             if int(state["rank"]) != self.rank or int(state["world_size"]) != self.world_size:
                 raise ValueError("StreamingIQLDataset checkpoint rank/world_size mismatch.")
+            if int(state["batch_size"]) != self.batch_size or int(state["reservoir_size"]) != self.reservoir_size:
+                raise ValueError("StreamingIQLDataset checkpoint batch_size/reservoir_size mismatch.")
             self._close_fp()
             self._file_idx = int(state["file_idx"])
             self._line_in_file = int(state["line_in_file"])
             self._game_idx = int(state["game_idx"])
             self._eof = bool(state["eof"])
-            self._batches_emitted = int(state["batches_emitted"])
-            self._target_batches_after_eof = state["target_batches_after_eof"]
+            self.pass_index = int(state["pass_index"])
+            self.pass_transitions_seen = int(state["pass_transitions_seen"])
+            self.pass_target_batches = state["pass_target_batches"]
+            self.pass_batches_emitted = int(state["pass_batches_emitted"])
+            self.total_batches_emitted = int(state["total_batches_emitted"])
             self._ingest_rng.set_state(state["ingest_rng"].cpu())
             self._sample_rng.set_state(state["sample_rng"].cpu())
             self._aug_rng.set_state(state["aug_rng"].cpu())
             self._reservoir.load_state_dict(state["reservoir"])
 
     def reset_pass(self) -> None:
-        """Restart streaming from file 0 if looping additional passes with max_steps."""
+        """Reset current-pass cursor/counters for another epoch while keeping cumulative reservoir & RNGs."""
         self._stop_prefetcher(rollback_queued=False)
         with self._lock:
             self._close_fp()
@@ -814,8 +957,10 @@ class StreamingIQLDataset:
             self._line_in_file = 0
             self._game_idx = 0
             self._eof = False
-            self._batches_emitted = 0
-            self._target_batches_after_eof = None
+            self.pass_index += 1
+            self.pass_transitions_seen = 0
+            self.pass_target_batches = None
+            self.pass_batches_emitted = 0
 
     def close(self) -> None:
         self._stop_prefetcher(rollback_queued=False)

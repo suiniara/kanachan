@@ -350,11 +350,14 @@ class FrozenGRPPBRSReward:
     @torch.no_grad()
     def __call__(self, episode: TensorDict, contiguous: bool) -> None:
         terminal = episode["next", "end_of_game"].bool()
+        boundary = episode["next", "end_of_round"].bool()
         count = int(episode.size(0))
         if count == 0:
             raise ValueError("An empty episode has no GRP PBRS reward.")
         if not contiguous or not bool(terminal[-1]):
             raise ValueError("FrozenGRPPBRSReward requires complete, contiguous observer games.")
+        if bool((terminal & ~boundary).any()):
+            raise ValueError("A terminal game transition must also set end_of_round=True.")
         seats = episode["sparse"][:, SEAT_INDEX].long() - SEAT_OFFSET
         if bool(((seats < 0) | (seats >= 4)).any()):
             raise ValueError("Invalid starting seat in episode['sparse'].")
@@ -362,6 +365,19 @@ class FrozenGRPPBRSReward:
         first_game[0] = True
         if bool(((seats != seats.roll(1)) & ~first_game).any()):
             raise ValueError("An observer seat changed within a game.")
+        game_mode = episode["sparse"][:, 1].long()
+        if bool(((game_mode != game_mode.roll(1)) & ~first_game).any()):
+            raise ValueError("Game mode changed within a contiguous observer game.")
+
+        starts = boundary.roll(1).bool() | terminal.roll(1)
+        starts[0] = True
+        round_ids = (
+            (episode["sparse"][:, 7].long() - 75) * 1_000_000
+            + (episode["sparse"][:, 8].long() - 78) * 10_000
+            + episode["numeric"][:, 0].long()
+        )
+        if bool(((round_ids != round_ids.roll(1)) & ~starts).any()):
+            raise ValueError("Round identifier (chang, ju, ben) changed without an end_of_round boundary.")
 
         device = terminal.device
         payoffs_dev = self.payoffs.to(device=device)
@@ -373,8 +389,6 @@ class FrozenGRPPBRSReward:
             own_rank = ranks.gather(1, seats[terminal, None]).squeeze(1)
             reward[terminal] = payoffs_dev[own_rank]
 
-        starts = episode["next", "end_of_round"].roll(1).bool() | terminal.roll(1)
-        starts[0] = True
         indices = starts.nonzero().flatten()
         grp_dev = next(self.frozen_grp.parameters()).device
         phi_rounds = self.frozen_grp.potential(
@@ -565,6 +579,12 @@ def extract_grp_samples_from_source(
                 existing = rounds_map.get(rkey)
                 if existing is None or prog_len < existing[0]:
                     rounds_map[rkey] = (prog_len, sp_raw[:9], nu_raw, seat)
+                elif prog_len == existing[0] and (
+                    existing[1] != sp_raw[:9] or existing[2] != nu_raw
+                ):
+                    raise ValueError(
+                        f"{fpath}:{line_no}: Conflicting initial state at same prog_len for {rkey!r}."
+                    )
 
     if not rounds_map:
         raise ValueError(f"No labeled round samples extracted from {source}.")

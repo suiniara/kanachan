@@ -94,6 +94,22 @@ def run_v2_trajectory_bc(
         )
     if config.rewrite_rooms is not None or config.rewrite_grades is not None:
         raise ValueError("v2_trajectory mode does not rewrite source-v3 room/grade sparse tokens.")
+    if config.initial_model_prefix is not None or config.initial_model_index is not None:
+        raise ValueError(
+            "training_mode='v2_trajectory' uses resume_from=<ckpt.pt>, not initial_model_prefix/initial_model_index."
+        )
+    if config.encoder.load_from is not None or config.decoder.load_from is not None:
+        raise ValueError(
+            "training_mode='v2_trajectory' does not support legacy encoder.load_from/decoder.load_from; use resume_from."
+        )
+    if int(config.candidate_feature_workers) > 0:
+        raise ValueError(
+            "v2_trajectory derives structured_v2 features inside SpoolingRoundBCDataSource; candidate_feature_workers > 0 is unsupported."
+        )
+    if int(config.prefetch_batches) < 0:
+        raise ValueError(f"prefetch_batches must be >= 0, got {config.prefetch_batches}.")
+    if int(config.spool_num_buckets) < 1 or int(config.spool_max_bucket_bytes) < 512:
+        raise ValueError("Invalid spool_num_buckets (<1) or spool_max_bucket_bytes (<512).")
     if config.batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {config.batch_size}.")
     if config.gradient_accumulation_steps <= 0:
@@ -106,6 +122,10 @@ def run_v2_trajectory_bc(
         raise ValueError(f"Invalid next_event_weight={config.next_event_weight}.")
     if not math.isfinite(config.final_rank_weight) or config.final_rank_weight < 0.0:
         raise ValueError(f"Invalid final_rank_weight={config.final_rank_weight}.")
+    if float(config.final_rank_weight) > 0.0 and not bool(config.use_final_rank_head):
+        raise ValueError("final_rank_weight > 0 requires use_final_rank_head=True.")
+    if bool(config.allow_unlabeled) and bool(config.use_final_rank_head) and float(config.final_rank_weight) > 0.0:
+        raise ValueError("allow_unlabeled=True conflicts with use_final_rank_head=True and final_rank_weight > 0.")
     if not math.isfinite(config.label_smoothing) or not 0.0 <= config.label_smoothing < 1.0:
         raise ValueError(f"Invalid label_smoothing={config.label_smoothing}.")
     _config.optimizer.validate(config.optimizer)
@@ -133,8 +153,21 @@ def run_v2_trajectory_bc(
         allow_unlabeled=bool(config.allow_unlabeled),
         allow_incomplete=bool(config.allow_incomplete),
         enable_early_shape_hint=bool(getattr(config.encoder, "enable_early_shape_hint", False)),
+        suit_augmentation=bool(config.suit_augmentation),
+        aug_seed=int(config.aug_seed),
+        sampler_seed=int(config.sampler_seed),
+        batch_size=int(config.batch_size),
+        drop_last=bool(config.drop_last),
     )
+    sampler = None
     try:
+        sampler = data_source.create_sampler(
+            batch_size=int(config.batch_size),
+            seed=int(config.sampler_seed),
+            rank=rank,
+            world_size=world_size,
+            drop_last=bool(config.drop_last),
+        )
         model = TrajectoryBCModel(
             preset=(getattr(config.encoder, "preset", None) or "custom"),
             dimension=int(config.encoder.dimension),
@@ -177,10 +210,38 @@ def run_v2_trajectory_bc(
             inactive_param_ids=_expected_inactive_bc_param_ids(raw_model),
             context="run_v2_trajectory_bc",
         )
+        scaler = GradScaler(
+            "cuda",
+            enabled=(device.type == "cuda" and amp_dtype == torch.float16),
+        )
+        training_cfg = {
+            "batch_size": int(config.batch_size),
+            "gradient_accumulation_steps": int(config.gradient_accumulation_steps),
+            "max_gradient_norm": float(config.max_gradient_norm),
+            "suit_augmentation": bool(config.suit_augmentation),
+            "aug_seed": int(config.aug_seed),
+            "sampler_seed": int(config.sampler_seed),
+            "drop_last": bool(config.drop_last),
+            "allow_unlabeled": bool(config.allow_unlabeled),
+            "allow_incomplete": bool(config.allow_incomplete),
+            "max_rounds": int(config.max_rounds) if config.max_rounds is not None else None,
+            "prefetch_batches": int(config.prefetch_batches),
+            "dtype": str(dtype),
+            "amp_dtype": str(amp_dtype),
+            "world_size": int(world_size),
+            "optimizer_type": str(config.optimizer.type),
+            "warmup_steps": int(getattr(config.optimizer, "warmup_steps", 0)),
+            "annealing_steps": int(getattr(config.optimizer, "annealing_steps", 0)),
+            "annealing_steps_factor": int(getattr(config.optimizer, "annealing_steps_factor", 1)),
+            "warmup_start_lr": float(getattr(config.optimizer, "warmup_start_lr", 0.0)),
+        }
         recipe = raw_model.recipe(
             data_sha256=data_source.data_sha256,
+            source_data_sha256=data_source.source_data_sha256,
+            preprocess_recipe_sha256=data_source.preprocess_recipe_sha256,
             lr=float(config.optimizer.learning_rate),
             weight_decay=float(config.optimizer.weight_decay),
+            training_config=training_cfg,
         )
         arch_meta = {
             "training_mode": "v2_trajectory",
@@ -189,6 +250,9 @@ def run_v2_trajectory_bc(
             "use_next_event_head": recipe["use_next_event_head"],
             "use_final_rank_head": recipe["use_final_rank_head"],
             "data_sha256": recipe["data_sha256"],
+            "source_data_sha256": data_source.source_data_sha256,
+            "preprocess_recipe_sha256": data_source.preprocess_recipe_sha256,
+            "training_config": training_cfg,
             "world_size": world_size,
         }
 
@@ -226,12 +290,16 @@ def run_v2_trajectory_bc(
                 sampler_seed=int(config.sampler_seed),
                 grad_clip=float(config.max_gradient_norm),
                 scheduler=scheduler,
+                grad_scaler=scaler,
                 ckpt_dir=ckpt_dir,
                 checkpoint_every=int(config.snapshot_interval),
                 resume_from=config.resume_from,
                 data_sha256=data_source.data_sha256,
+                recipe=recipe,
+                sampler=sampler,
                 grad_accum_steps=int(config.gradient_accumulation_steps),
                 prefetch_batches=int(config.prefetch_batches),
+                prefetch_workers=max(1, int(config.num_workers or 1)),
                 drop_last=bool(config.drop_last),
             )
             if rank == 0:
@@ -248,26 +316,25 @@ def run_v2_trajectory_bc(
         if world_size >= 2:
             torch.distributed.broadcast_object_list(need_final, src=0)
         if need_final[0]:
-            from kanachan.training.bc.trajectory_v2 import LengthBucketBatchSampler
-
-            final_sampler = LengthBucketBatchSampler(
-                list(data_source.round_event_lens),
-                batch_size=int(config.batch_size),
-                seed=int(config.sampler_seed),
-                rank=rank,
-                world_size=world_size,
-                drop_last=bool(config.drop_last),
-            )
-            if "sampler_state" in result:
-                final_sampler.load_state_dict(result["sampler_state"])
+            final_aug_gen: torch.Generator | None = None
+            if bool(config.suit_augmentation):
+                sync_seed = (
+                    int(config.aug_seed)
+                    + int(rank) * 1_000_003
+                    + int(sampler.epoch) * 1_000_003
+                    + int(sampler.cursor) * 10_007
+                ) & 0x7FFF_FFFF_FFFF_FFFF
+                final_aug_gen = torch.Generator(device="cpu").manual_seed(sync_seed)
             save_trajectory_bc_checkpoint(
                 ckpt_dir,
                 raw_model,
                 optimizer,
-                sampler=final_sampler,
+                sampler=sampler,
                 step=final_step,
                 recipe=recipe,
                 scheduler=scheduler,
+                grad_scaler=scaler,
+                aug_generator=final_aug_gen,
                 numerical_stats={
                     "optimizer_steps": int(result["optimizer_steps"]),
                     "skipped_steps": int(result["skipped_steps"]),
@@ -281,6 +348,8 @@ def run_v2_trajectory_bc(
             torch.distributed.barrier()
         return result
     finally:
+        if sampler is not None:
+            sampler.close()
         data_source.close()
 
 

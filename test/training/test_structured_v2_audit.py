@@ -57,6 +57,12 @@ from kanachan.training.bc.trajectory_v2 import (
 from kanachan.training.core.bc.data_iterator import DataIterator as CoreBCDataIterator
 from kanachan.training.core.optimizers import adamw_parameter_groups
 from kanachan.training.core.ranking import scores_to_ranks
+from kanachan.training.core.test_env import (
+    is_cuda_skipped,
+    preferred_test_device,
+    require_or_skip_cuda,
+    require_or_skip_real_data,
+)
 from kanachan.training.iql.joint_v2 import (
     _validate_grad_scaler_optimizer_state,
     build_joint_iql_optimizer,
@@ -73,7 +79,6 @@ from tools.audit_structured_v2 import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-VAL_DATA_PATH = Path(r"D:\kanachan-training-data\validation.bc.tsv.gz")
 
 
 def _make_sparse(
@@ -336,11 +341,11 @@ def _ddp_numerical_worker(rank: int, store_uri: str, tmp_dir: str) -> None:
         dist.destroy_process_group()
 
 
-def _extract_complete_games(max_games: int = 3, max_scan_lines: int = 20000) -> list[str]:
+def _extract_complete_games(val_path: Path, max_games: int = 3, max_scan_lines: int = 20000) -> list[str]:
     """Extract complete game records from validation.bc.tsv.gz without mid-game truncation."""
     by_uuid: dict[str, list[str]] = {}
     last_seen: dict[str, int] = {}
-    with gzip.open(VAL_DATA_PATH, "rt", encoding="utf-8") as fp:
+    with gzip.open(val_path, "rt", encoding="utf-8") as fp:
         for i, line in enumerate(fp):
             if i >= max_scan_lines:
                 break
@@ -506,9 +511,8 @@ class TestPreUpdateNumericalSafety(unittest.TestCase):
         self._run_injection_suite(torch.device("cpu"), None, with_scheduler=True)
         self._run_injection_suite(torch.device("cpu"), None, with_scheduler=False)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_cuda_fp32_bf16_fp16_overflow_and_zero_sync(self):
-        dev = torch.device("cuda")
+        dev = require_or_skip_cuda(self, context="CUDA FP32/BF16/FP16 overflow and zero-sync test")
         self._run_injection_suite(dev, torch.float32, with_scheduler=True)
         self._run_injection_suite(dev, torch.bfloat16, with_scheduler=False)
         self._run_injection_suite(dev, torch.bfloat16, with_scheduler=True)
@@ -568,7 +572,7 @@ class TestPreUpdateNumericalSafety(unittest.TestCase):
             torch.use_deterministic_algorithms(prev_det)
 
     def test_checkpoint_recovery_with_skipped_steps_and_max_nonfinite_limit(self):
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = preferred_test_device()
         amp = torch.float16 if dev.type == "cuda" else None
         batches = _make_iql_batches(505, n_batches=5, batch_size=2)
         with tempfile.TemporaryDirectory() as tmp:
@@ -654,7 +658,7 @@ class TestPreUpdateNumericalSafety(unittest.TestCase):
             _assert_snapshot_exact(self, snap3, mod3, opt3)
 
     def test_trajectory_bc_pre_update_numerical_guard(self):
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = preferred_test_device()
         closed = {1: 1, 2: 1, 3: 1, 11: 1, 12: 1, 13: 1, 21: 1, 22: 1, 23: 1, 31: 2, 32: 2}
         sp = torch.tensor([_make_sparse(seat=0, left=44 - k, closed37=closed, zimo=32) for k in range(4)], dtype=torch.int32)
         nu = torch.tensor([[0, 0, 25000, 25000, 25000, 25000]] * 4, dtype=torch.int32)
@@ -935,13 +939,14 @@ def _ddp_invalid_loss_worker(case_name: str, rank: int, store_uri: str, tmp_dir:
 
 
 def _extract_games_by_uuids(
+    val_path: Path,
     target_uuids: set[str],
     *,
     max_scan_lines: int = 230000,
 ) -> dict[str, list[str]]:
     by_uuid: dict[str, list[str]] = {u: [] for u in target_uuids}
     last_seen: dict[str, int] = {}
-    with gzip.open(VAL_DATA_PATH, "rt", encoding="utf-8") as fp:
+    with gzip.open(val_path, "rt", encoding="utf-8") as fp:
         for i, line in enumerate(fp):
             if i >= max_scan_lines:
                 break
@@ -1079,9 +1084,11 @@ def _make_ron_round_rows(
 
 
 class TestCompleteRoundTrajectoryReconstruction(unittest.TestCase):
-    @unittest.skipUnless(VAL_DATA_PATH.is_file(), "validation.bc.tsv.gz required")
     def test_real_complete_games_strict_and_adversarial_corruption_rejection(self):
-        lines = _extract_complete_games(max_games=3, max_scan_lines=25000)
+        val_path = require_or_skip_real_data(
+            self, "bc", context="strict complete-game reconstruction & corruption test"
+        )
+        lines = _extract_complete_games(val_path, max_games=3, max_scan_lines=25000)
         self.assertGreater(len(lines), 150)
 
         # Parse individual UUID groups so we can isolate 1 complete game cleanly for adversarial edits
@@ -1258,9 +1265,11 @@ class TestCompleteRoundTrajectoryReconstruction(unittest.TestCase):
             self.assertIn(one_uuid, str(cm_part.exception))
             self.assertRegex(str(cm_part.exception), r"\(\d+, \d+, \d+\)")
 
-    @unittest.skipUnless(VAL_DATA_PATH.is_file(), "validation.bc.tsv.gz required")
     def test_real_complete_game_mahjong_rule_scenarios(self):
-        # Extract real complete 4-seat games from validation.bc.tsv.gz covering all Hanchan Majsoul scenarios:
+        val_path = require_or_skip_real_data(
+            self, "bc", context="real complete-game Mahjong rule scenarios test"
+        )
+        # Extract real complete 4-seat games from source-v3 dataset covering all Hanchan Majsoul scenarios:
         # hanchan, south early tobi, east tobi, high honba + abortive liuju, agariyame,
         # double ron, triple ron, west extension, west-4 hard cap (<30000), exhaustive draw, riichi sticks.
         scenario_uuids = {
@@ -1274,7 +1283,7 @@ class TestCompleteRoundTrajectoryReconstruction(unittest.TestCase):
             "200714-e0698eab-5853-463c-abe8-7c9c6fd1fae9",
             "201025-7675a950-8dc3-4f07-b4d3-cd70b18732d3",
         }
-        by_u = _extract_games_by_uuids(scenario_uuids, max_scan_lines=220000)
+        by_u = _extract_games_by_uuids(val_path, scenario_uuids, max_scan_lines=220000)
         for u in scenario_uuids:
             self.assertGreater(len(by_u[u]), 40, f"Missing scenario game {u}")
 
@@ -1513,10 +1522,12 @@ class TestCompleteRoundTrajectoryReconstruction(unittest.TestCase):
 
 
 class TestParityExportInferenceAndSimulate(unittest.TestCase):
-    @unittest.skipUnless(VAL_DATA_PATH.is_file(), "validation.bc.tsv.gz required")
     def test_real_rare_categories_cpp_py_parity_and_6x_suit_perm(self):
+        val_path = require_or_skip_real_data(
+            self, "bc", context="rare categories C++/Python parity & 6x suit perm test"
+        )
         uuids, sp, nu, pr, ca, cat_counts = harvest_rare_categories(
-            VAL_DATA_PATH, scan_limit=150000, per_cat_target=32
+            val_path, scan_limit=150000, per_cat_target=32
         )
         self.assertGreater(len(uuids), 100)
         for req_cat in audit_tool.REQUIRED_RULE_CATEGORIES:
@@ -1547,7 +1558,7 @@ class TestParityExportInferenceAndSimulate(unittest.TestCase):
                 torch.testing.assert_close(c_out[tk].float(), t_out[tk].float(), atol=1e-5, rtol=1e-5)
 
     def test_all_inference_paths_amp_disabled_d1_and_tie_break(self):
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = preferred_test_device()
         dtypes = [torch.float32]
         if dev.type == "cuda":
             dtypes.extend([torch.bfloat16, torch.float16])
@@ -1653,7 +1664,7 @@ class TestParityExportInferenceAndSimulate(unittest.TestCase):
         self.assertEqual(int(tie_cands[0, chosen_slot].item()), 12)
 
     def test_cuda_actor_export_cpu_normalized_reload_and_native_simulate(self):
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = preferred_test_device()
         batches = _make_iql_batches(919, n_batches=2, batch_size=2)
         torch.manual_seed(920)
         jm = JointStructuredIQLModule(
@@ -1707,7 +1718,7 @@ class TestParityExportInferenceAndSimulate(unittest.TestCase):
             self.assertEqual(len(logs), 1)
             self.assertEqual(len(logs[0].get_result()), 4)
 
-            if torch.cuda.is_available():
+            if dev.type == "cuda":
                 actor_cuda = load_model(actor_path, map_location=torch.device("cuda")).eval()
                 with torch.inference_mode():
                     out_cuda = actor_cuda(sample.to("cuda"))
@@ -1781,7 +1792,7 @@ class TestNonDifferentiableAndGraphSafety(unittest.TestCase):
 
     def test_detached_and_leaf_loss_rejected_with_clean_recovery(self):
         devs = [torch.device("cpu")]
-        if torch.cuda.is_available():
+        if (not is_cuda_skipped()) and torch.cuda.is_available():
             devs.append(torch.device("cuda"))
         batches = _make_iql_batches(6201, n_batches=4, batch_size=2, final_rank=True, use_results=True)
 
@@ -1837,7 +1848,7 @@ class TestNonDifferentiableAndGraphSafety(unittest.TestCase):
             self.assertEqual(bsched.last_epoch, 2)
 
     def test_fully_frozen_model_and_disconnected_policy_head_vs_valid_freezes(self):
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = preferred_test_device()
         batches = _make_iql_batches(6301, n_batches=3, batch_size=2, final_rank=True, use_results=True)
 
         # 1. Fully frozen model -> RuntimeError before backward, weights/scheduler unchanged
@@ -1939,9 +1950,8 @@ class TestNonDifferentiableAndGraphSafety(unittest.TestCase):
 
 
 class TestGradScalerHardening(unittest.TestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_fused_and_non_fused_adamw_across_fp16_bf16_fp32(self):
-        dev = torch.device("cuda")
+        dev = require_or_skip_cuda(self, context="GradScaler fused/non-fused AMP test")
         batches = _make_iql_batches(6401, n_batches=4, batch_size=2, final_rank=True, use_results=True)
         for use_fused in (False, True):
             for amp_dt in (torch.float16, torch.bfloat16, torch.float32):
@@ -1988,9 +1998,8 @@ class TestGradScalerHardening(unittest.TestCase):
                         )
                         self.assertEqual(res_rec["optimizer_steps"], 1)
 
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
     def test_grad_scaler_scale_growth_tracker_and_checkpoint_recovery_consistency(self):
-        dev = torch.device("cuda")
+        dev = require_or_skip_cuda(self, context="GradScaler growth tracker & resume test")
         batches = _make_iql_batches(6501, n_batches=5, batch_size=2)
         with tempfile.TemporaryDirectory() as tmp:
             ckpt_dir = Path(tmp) / "gs_ckpt"

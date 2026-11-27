@@ -587,12 +587,23 @@ flowchart TB
 
 ---
 
-## 5. 检查点绑定、便携导出与缓存一致性合同
+5. **检查点绑定、便携导出与缓存一致性合同**
 
 1. **独立架构标识与 Fail-Closed 恢复检查**：
    - 新建常量 `ARCHITECTURE_ID = "mahjong_structured_dual_decoder_v2"`、`STRUCTURED_SCHEMA_ID = "kanachan_structured_v2_70_10_48_32_8"` 与 `KANACHAN_ACTION_MANIFEST_SHA256`；
    - 严禁与 `"mahjong_dense_block_decoder_v1"` 混用模型构造分支或复用旧优化器/回放检查点；
-   - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、IQL 分布式超参（`quantile_cql_alpha`, `cql_temperature`, `qr_double_q`）、数据 SHA256、奖励/GRP SHA256、精度配方、数值安全统计（`numerical_stats`）、优化器/调度器/`GradScaler`、回放游标以及多卡独立 `rng_by_rank` 状态；任一摘要不一致直接抛错拒绝恢复。
+   - **双重内容与配方 SHA-256 指纹**（[core/dataset_fingerprint.py](core/dataset_fingerprint.py)）：
+     - `source_data_sha256` 直接对所有源文件的原始磁盘字节（`.gz` 文件直接流式哈希压缩字节，保持多文件有序列表与 `schema_version`，不依赖路径与 `mtime`）计算 SHA-256，防止同字节数或回拨 `mtime` 篡改漏检；
+     - `preprocess_recipe_sha256` 独立哈希完整解析配置、奖励方案与插件字节摘要、`FrozenGRP` 校验和/规则集摘要、`reservoir_size`/`warmup_transitions`/`batch_size`/`bucket_mult`/`drop_last`、`suit_augmentation` 与种子；
+     - `SpoolingRoundBCDataSource` 在 `meta.json` (`kanachan_bc_round_spool_v2`) 绑定 `index.bin` 与 `rounds.bin` 自身 SHA-256 并在命中缓存前完成校验；BC/IQL 检查点与 TensorBoard `architecture/summary` 均持久化两类身份，任一不匹配 Fail-Closed 拒绝恢复或重建缓存；
+   - 检查点完整绑定：架构超参字典（含 `preset, d_model, n_heads, n_d1_layers, n_d2_layers, use_rel_bias, cand_self_attn, head_type, enable_early_shape_hint, include_room_level`）、IQL 分布式超参（`quantile_cql_alpha`, `cql_temperature`, `qr_double_q`）、完整 `training_config`、`source_data_sha256` / `preprocess_recipe_sha256` / `data_sha256`、奖励/GRP SHA256、精度配方、数值安全统计（`numerical_stats`）、优化器/调度器/`GradScaler`、外部/流式回放游标（`sampler_by_rank` / `stream_state_by_rank`）以及多卡独立 `rng_by_rank` 状态；任一摘要或 `world_size` 不一致直接抛错拒绝恢复；
+   - **O(1)-RAM BC 外部磁盘索引与线程隔离并发读取**（[bc/streaming_v2.py](bc/streaming_v2.py)）：
+     - `SpoolingRoundBCDataSource` 不再将 `round_event_lens` 或全部批列表常驻内存，而是通过 `DiskLengthBucketBatchSampler` 对 `index.bin` 执行顺序分块 + 保序 SplitMix64 外部哈希分区 + 有界窗口长度分桶 + 外部归并排序生成磁盘 `schedule.bin` / `ids.bin`，按 `threading.local()` 每线程独立只读句柄惰性流式读取与预取（支持单局截断/空批零权重 Ghost Batch 全局对齐）；
+   - **IQL 多遍严格 transition 均匀水塘与块置换分片**（[iql/streaming_v2.py](iql/streaming_v2.py)）：
+     - `_reservoir.total_seen` 保持跨遍累计供 Vitter Algorithm R（保证不等长对局下严格按**决策步**均匀采样 $\min(1, M/N)$，且跨遍由单调递增的 RNG 推进产生可复现但互异的采样序列）；
+     - `pass_transitions_seen` / `pass_target_batches` / `pass_batches_emitted` 在每次 `reset_pass()` 清零且以 `(pass_batches_emitted + 1) * batch_size` 节流摄取，消除预热双计与超长单局多发批，prefetch 回滚同步恢复未消费批与预读 EOF 快照；
+     - 多卡对局分配采用按 `world_size` 连续块的确定性 SplitMix64 置换（消除固定模运算导致的 4 家起手席位周期性混叠），零对局空 Rank 自动生成零权重合成 `ghost_batch()`；
+   - **可移植验证环境约定**：实盘验证路径与严格模式统一通过 `KANACHAN_VAL_BC_DATA`、`KANACHAN_VAL_RL_DATA`、`KANACHAN_STRICT_ACCEPTANCE=1`、`KANACHAN_TEST_DISTRIBUTED=1` 与 `KANACHAN_SKIP_CUDA=1` 控制（严禁在源码或测试内硬编码本地磁盘路径）；
    - 便携导出归一化：`dump_actor()` 强制将 `state["state_dict"]` 中的浮点权重统一转移为 `(device="cpu", dtype=save_dtype)`（非浮点张量至 `cpu`）后原子落盘，确保从 GPU/混精训练导出的 `model.kanachan` 在任意 CPU/CUDA 设备均可零报错 `weights_only=True` 重载并对接 `DecisionMaker`。
 2. **C++ 扩展模块向后兼容、Wheel 钩子与源码打包契约（严禁破坏现有 `discard_v1` 基线与远程构建）**：
    - 现有 [candidate_features.py](../candidate_features.py) 在导入 `kanachan._candidate_features` 时强制校验 `SCHEMA_ID == "discard_afterstate_v1"` 与 `FEATURE_WIDTH == 46`，且 [hatch_build.py](../../hatch_build.py) 的 `NATIVE_MODULES` 白名单绑定了 `"kanachan/_candidate_features"`；

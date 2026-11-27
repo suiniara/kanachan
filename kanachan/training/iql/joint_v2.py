@@ -125,6 +125,9 @@ def build_joint_iql_recipe(
     decoder1_lr_scale: float,
     grp: FrozenGRP | None = None,
     data_sha256: str = "",
+    source_data_sha256: str = "",
+    preprocess_recipe_sha256: str = "",
+    training_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     iql_cfg: dict[str, Any] = {
         "expectile": module.expectile,
@@ -145,8 +148,8 @@ def build_joint_iql_recipe(
         iql_cfg["qr_double_q"] = bool(module.qr_double_q)
         iql_cfg["quantile_cql_alpha"] = float(module.quantile_cql_alpha)
         iql_cfg["cql_temperature"] = float(module.cql_temperature)
-    return {
-        "format_version": 1,
+    recipe_obj: dict[str, Any] = {
+        "format_version": 2,
         "architecture": ARCHITECTURE_ID,
         "manifest_sha256": KANACHAN_ACTION_MANIFEST_SHA256,
         "schema": structured_v2_schema(),
@@ -170,9 +173,14 @@ def build_joint_iql_recipe(
         "grp_rank_payoffs": list(grp.rank_payoffs) if grp is not None else None,
         "grp_calibration_report": dict(grp.calibration_report) if grp is not None else None,
         "data_sha256": data_sha256,
+        "source_data_sha256": source_data_sha256,
+        "preprocess_recipe_sha256": preprocess_recipe_sha256,
         "base_lr": float(base_lr),
         "weight_decay": float(weight_decay),
     }
+    if training_config is not None:
+        recipe_obj["training_config"] = dict(training_config)
+    return recipe_obj
 
 
 def build_joint_iql_optimizer(
@@ -286,7 +294,14 @@ def load_joint_iql_checkpoint(
     """Fail-closed restore preserving Target Q Polyak lag, DDP sync, and per-rank RNG/stream."""
     del map_location  # Load on CPU first, then place optimizer state beside module parameters.
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    if payload.get("recipe") != expected_recipe:
+    saved_recipe = payload.get("recipe")
+    if not isinstance(saved_recipe, dict):
+        raise ValueError("Joint IQL checkpoint missing valid recipe dictionary (Fail-Closed).")
+    if saved_recipe.get("source_data_sha256") != expected_recipe.get("source_data_sha256"):
+        raise ValueError("Joint IQL resume source_data_sha256 differs (Fail-Closed).")
+    if saved_recipe.get("preprocess_recipe_sha256") != expected_recipe.get("preprocess_recipe_sha256"):
+        raise ValueError("Joint IQL resume preprocess_recipe_sha256 differs (Fail-Closed).")
+    if saved_recipe != expected_recipe:
         raise ValueError("Joint IQL resume recipe/manifest/GRP differs (Fail-Closed).")
     raw = module.module if isinstance(module, DistributedDataParallel) else module
     assert isinstance(raw, JointStructuredIQLModule)
@@ -308,6 +323,10 @@ def load_joint_iql_checkpoint(
     is_dist = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_dist else 0
     world_size = dist.get_world_size() if is_dist else 1
+    if "world_size" in payload and int(payload["world_size"]) != world_size:
+        raise ValueError(
+            f"Checkpoint world_size={payload['world_size']} does not match current world_size={world_size}."
+        )
     if payload.get("rng_by_rank") is not None:
         rng_list = payload["rng_by_rank"]
         if len(rng_list) != world_size:
@@ -552,6 +571,21 @@ def train_joint_iql_batches(
             raise ValueError(
                 "StreamingIQLDataset FrozenGRP identity disagrees with Joint IQL recipe (Fail-Closed)."
             )
+    stream_src_sha = getattr(batches, "source_data_sha256", None)
+    if stream_src_sha and recipe.get("source_data_sha256") and stream_src_sha != recipe.get("source_data_sha256"):
+        raise ValueError(
+            "StreamingIQLDataset source_data_sha256 disagrees with Joint IQL recipe (Fail-Closed)."
+        )
+    stream_prep_sha = getattr(batches, "preprocess_recipe_sha256", None)
+    if stream_prep_sha and recipe.get("preprocess_recipe_sha256") and stream_prep_sha != recipe.get("preprocess_recipe_sha256"):
+        raise ValueError(
+            "StreamingIQLDataset preprocess_recipe_sha256 disagrees with Joint IQL recipe (Fail-Closed)."
+        )
+    stream_data_sha = getattr(batches, "data_sha256", None)
+    if stream_data_sha and recipe.get("data_sha256") and stream_data_sha != recipe.get("data_sha256"):
+        raise ValueError(
+            "StreamingIQLDataset data_sha256 disagrees with Joint IQL recipe (Fail-Closed)."
+        )
 
     is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
     scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))

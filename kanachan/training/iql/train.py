@@ -119,6 +119,26 @@ def run_joint_v2_iql(
             f"training_mode='v2_joint' requires encoder.architecture='structured_dual_v2', "
             f"got {config.encoder.architecture!r}."
         )
+    if config.initial_model_prefix is not None or config.initial_model_index is not None:
+        raise ValueError(
+            "training_mode='v2_joint' uses resume_from=<ckpt.pt>, not initial_model_prefix/initial_model_index."
+        )
+    if config.encoder.load_from is not None or config.decoder.load_from is not None:
+        raise ValueError(
+            "training_mode='v2_joint' uses bc_initial_model or resume_from, not legacy encoder.load_from/decoder.load_from."
+        )
+    if not bool(config.contiguous_training_data):
+        raise ValueError("training_mode='v2_joint' requires contiguous_training_data=True.")
+    if int(config.replay_buffer_size or 0) < 1:
+        raise ValueError(
+            f"training_mode='v2_joint' requires replay_buffer_size >= 1, got {config.replay_buffer_size}."
+        )
+    if int(config.target_update_interval) != 1:
+        raise ValueError(
+            f"training_mode='v2_joint' performs Polyak EMA on every valid optimizer step (target_update_interval=1), got {config.target_update_interval}."
+        )
+    if int(config.prefetch_batches) < 0:
+        raise ValueError(f"prefetch_batches must be >= 0, got {config.prefetch_batches}.")
     if not config.double_q_learning:
         raise ValueError("Joint IQL requires two critics; double_q_learning=false is not supported.")
     if not math.isfinite(config.discount_factor) or not 0.0 <= config.discount_factor <= 1.0:
@@ -129,6 +149,26 @@ def run_joint_v2_iql(
         raise ValueError(f"Invalid final_rank_weight={config.final_rank_weight}.")
     if not math.isfinite(config.kl_coef) or config.kl_coef < 0.0:
         raise ValueError(f"Invalid kl_coef={config.kl_coef}.")
+    if not math.isfinite(config.awr_inv_temp_beta) or config.awr_inv_temp_beta <= 0.0:
+        raise ValueError(f"Invalid awr_inv_temp_beta={config.awr_inv_temp_beta}.")
+    if not math.isfinite(config.awr_max_weight) or config.awr_max_weight <= 0.0:
+        raise ValueError(f"Invalid awr_max_weight={config.awr_max_weight}.")
+    if (
+        (float(config.kl_coef) > 0.0 or bool(config.keep_bc_anchor))
+        and config.bc_initial_model is None
+        and config.resume_from is None
+    ):
+        raise ValueError(
+            "kl_coef > 0 or keep_bc_anchor=True requires bc_initial_model (or resume_from) to anchor against."
+        )
+    if not math.isfinite(config.quantile_cql_alpha) or float(config.quantile_cql_alpha) < 0.0:
+        raise ValueError(f"Invalid quantile_cql_alpha={config.quantile_cql_alpha}.")
+    if float(config.quantile_cql_alpha) > 0.0 and not bool(config.use_cql_quantile_head):
+        raise ValueError("quantile_cql_alpha > 0 requires use_cql_quantile_head=True.")
+    if not math.isfinite(config.cql_temperature) or float(config.cql_temperature) <= 0.0:
+        raise ValueError(f"Invalid cql_temperature={config.cql_temperature}.")
+    if int(config.num_quantiles) < 1:
+        raise ValueError(f"num_quantiles must be >= 1, got {config.num_quantiles}.")
     if not math.isfinite(config.target_update_rate) or not 0.0 < config.target_update_rate <= 1.0:
         raise ValueError(f"Invalid target_update_rate={config.target_update_rate}.")
     if config.batch_size <= 0 or config.gradient_accumulation_steps <= 0:
@@ -150,21 +190,32 @@ def run_joint_v2_iql(
 
     frozen_grp: FrozenGRP | None = None
     custom_reward_fn = None
+    reward_plugin_path: Path | None = None
     reward_scheme = str(getattr(config, "reward_scheme", "placement"))
+    if reward_scheme not in ("placement", "round_and_placement", "grp_pbrs", "plugin"):
+        raise ValueError(f"Unknown v2_joint reward_scheme={reward_scheme!r}.")
     if reward_scheme == "grp_pbrs":
         if config.grp_checkpoint is None:
             raise ValueError("reward_scheme='grp_pbrs' requires grp_checkpoint=<path-to-frozen-grp.pt>.")
+        if config.reward_plugin is not None:
+            raise ValueError("reward_plugin conflicts with reward_scheme='grp_pbrs'.")
         frozen_grp = load_frozen_grp(Path(config.grp_checkpoint), require_gate=True)
     elif reward_scheme == "plugin":
         if config.reward_plugin is None or not Path(config.reward_plugin).is_file():
             raise ValueError("reward_scheme='plugin' requires a valid reward_plugin file.")
+        if config.grp_checkpoint is not None:
+            raise ValueError("grp_checkpoint conflicts with reward_scheme='plugin'.")
+        reward_plugin_path = Path(config.reward_plugin)
         ns: dict[str, Any] = {}
-        exec(Path(config.reward_plugin).read_text(encoding="utf-8"), ns)  # noqa: S102
+        exec(reward_plugin_path.read_text(encoding="utf-8"), ns)  # noqa: S102
         if "get_reward" not in ns:
             raise ValueError(f"Reward plugin {config.reward_plugin} does not define `get_reward`.")
         custom_reward_fn = ns["get_reward"]
-    elif config.grp_checkpoint is not None:
-        raise ValueError("grp_checkpoint was supplied without reward_scheme='grp_pbrs'.")
+    else:
+        if config.grp_checkpoint is not None:
+            raise ValueError("grp_checkpoint was supplied without reward_scheme='grp_pbrs'.")
+        if config.reward_plugin is not None:
+            raise ValueError("reward_plugin was supplied without reward_scheme='plugin'.")
 
     dataset = StreamingIQLDataset(
         config.training_data,
@@ -173,6 +224,7 @@ def run_joint_v2_iql(
         warmup_transitions=config.warmup_transitions,
         reward_scheme=reward_scheme,
         reward_fn=custom_reward_fn,
+        reward_plugin_path=reward_plugin_path,
         grp=frozen_grp,
         score_unit=float(config.score_unit),
         round_weight=float(config.round_weight),
@@ -281,6 +333,35 @@ def run_joint_v2_iql(
             context="run_joint_v2_iql",
         )
         scheduler = _build_optional_scheduler(optimizer, config.optimizer)
+        scaler = GradScaler(
+            "cuda",
+            enabled=(device.type == "cuda" and amp_dtype == torch.float16),
+        )
+        training_cfg = {
+            "reward_scheme": reward_scheme,
+            "score_unit": float(config.score_unit),
+            "round_weight": float(config.round_weight),
+            "reservoir_size": int(dataset.reservoir_size),
+            "warmup_transitions": int(dataset.warmup_transitions),
+            "batch_size": int(config.batch_size),
+            "gradient_accumulation_steps": int(config.gradient_accumulation_steps),
+            "q_max_gradient_norm": float(config.q_max_gradient_norm),
+            "suit_augmentation": bool(config.suit_augmentation),
+            "aug_seed": int(config.aug_seed),
+            "sampler_seed": int(config.sampler_seed),
+            "drop_last": bool(config.drop_last),
+            "max_games": int(config.max_games) if config.max_games is not None else None,
+            "max_batches": int(config.max_batches) if config.max_batches is not None else None,
+            "prefetch_batches": int(config.prefetch_batches),
+            "dtype": str(dtype),
+            "amp_dtype": str(amp_dtype),
+            "world_size": int(world_size),
+            "optimizer_type": str(config.optimizer.type),
+            "warmup_steps": int(getattr(config.optimizer, "warmup_steps", 0)),
+            "annealing_steps": int(getattr(config.optimizer, "annealing_steps", 0)),
+            "annealing_steps_factor": int(getattr(config.optimizer, "annealing_steps_factor", 1)),
+            "warmup_start_lr": float(getattr(config.optimizer, "warmup_start_lr", 0.0)),
+        }
         recipe = build_joint_iql_recipe(
             module,
             base_lr=float(config.optimizer.learning_rate),
@@ -288,6 +369,9 @@ def run_joint_v2_iql(
             decoder1_lr_scale=float(config.decoder1_lr_scale),
             grp=frozen_grp,
             data_sha256=dataset.data_sha256,
+            source_data_sha256=dataset.source_data_sha256,
+            preprocess_recipe_sha256=dataset.preprocess_recipe_sha256,
+            training_config=training_cfg,
         )
 
         arch_meta = {
@@ -300,6 +384,9 @@ def run_joint_v2_iql(
             "final_rank_weight": recipe["iql"]["final_rank_weight"],
             "kl_coef": recipe["iql"]["kl_coef"],
             "data_sha256": recipe["data_sha256"],
+            "source_data_sha256": dataset.source_data_sha256,
+            "preprocess_recipe_sha256": dataset.preprocess_recipe_sha256,
+            "training_config": training_cfg,
             "world_size": world_size,
         }
         if rank == 0:
@@ -334,6 +421,7 @@ def run_joint_v2_iql(
                 amp_dtype=amp_dtype,
                 max_grad_norm=float(config.q_max_gradient_norm),
                 scheduler=scheduler,
+                grad_scaler=scaler,
                 ckpt_dir=ckpt_dir,
                 checkpoint_every=int(config.snapshot_interval),
                 resume_from=config.resume_from,
@@ -363,6 +451,7 @@ def run_joint_v2_iql(
                 cursor=int(result["cursor"]),
                 recipe=recipe,
                 scheduler=scheduler,
+                grad_scaler=scaler,
                 numerical_stats={
                     "optimizer_steps": int(result["optimizer_steps"]),
                     "skipped_steps": int(result["skipped_steps"]),

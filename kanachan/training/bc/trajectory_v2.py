@@ -6,7 +6,7 @@ import gzip
 import hashlib
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -959,7 +959,15 @@ class LengthBucketBatchSampler:
         for s in range(0, n, pool_sz):
             chunk = sorted(perm[s : s + pool_sz], key=lambda i: self.lengths[i])
             for b in range(0, len(chunk), self.batch_size):
-                all_batches.append(chunk[b : b + self.batch_size])
+                sl = chunk[b : b + self.batch_size]
+                if self.drop_last and len(sl) < self.batch_size:
+                    continue
+                all_batches.append(sl)
+        if not all_batches:
+            self.batches = []
+            self.batch_weights = []
+            self.cursor = 0
+            return
         batch_perm = torch.randperm(len(all_batches), generator=g).tolist()
         ordered_batches = [all_batches[i] for i in batch_perm]
 
@@ -1004,6 +1012,11 @@ class LengthBucketBatchSampler:
             (pos, self.batches[pos], self.batch_weights[pos])
             for pos in range(self.cursor, len(self.batches))
         ]
+
+    def iter_pending_indexed_batches(self) -> Iterator[tuple[int, list[int], float]]:
+        """Stream remaining (cursor_pos, indices, batch_weight) lazily."""
+        for pos in range(self.cursor, len(self.batches)):
+            yield pos, self.batches[pos], self.batch_weights[pos]
 
     def __len__(self) -> int:
         return len(self.batches)
@@ -1525,9 +1538,18 @@ class TrajectoryBCModel(nn.Module):
         metrics["loss"] = loss_total
         return metrics
 
-    def recipe(self, *, data_sha256: str = "", lr: float = 0.0, weight_decay: float = 0.0) -> dict[str, Any]:
-        return {
-            "format_version": 1,
+    def recipe(
+        self,
+        *,
+        data_sha256: str = "",
+        source_data_sha256: str = "",
+        preprocess_recipe_sha256: str = "",
+        lr: float = 0.0,
+        weight_decay: float = 0.0,
+        training_config: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rec: dict[str, Any] = {
+            "format_version": 2,
             "architecture": ARCHITECTURE_ID,
             "manifest_sha256": KANACHAN_ACTION_MANIFEST_SHA256,
             "schema": structured_v2_schema(),
@@ -1551,9 +1573,14 @@ class TrajectoryBCModel(nn.Module):
             "final_rank_weight": self.final_rank_weight,
             "label_smoothing": self.label_smoothing,
             "data_sha256": data_sha256,
+            "source_data_sha256": source_data_sha256,
+            "preprocess_recipe_sha256": preprocess_recipe_sha256,
             "lr": float(lr),
             "weight_decay": float(weight_decay),
         }
+        if training_config is not None:
+            rec["training_config"] = dict(training_config)
+        return rec
 
     def dump_actor(self, output_path: Path, *, dtype: torch.dtype | None = None) -> None:
         save_dtype = dtype or next(self.backbone.parameters()).dtype
@@ -1745,7 +1772,14 @@ def load_trajectory_bc_checkpoint(
 ) -> int:
     del map_location  # Load on CPU first to preserve rank/device isolation and avoid VRAM spikes.
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-    if payload.get("recipe") != expected_recipe:
+    saved_recipe = payload.get("recipe")
+    if not isinstance(saved_recipe, dict):
+        raise ValueError("Trajectory BC checkpoint missing valid recipe dictionary (Fail-Closed).")
+    if saved_recipe.get("source_data_sha256") != expected_recipe.get("source_data_sha256"):
+        raise ValueError("Trajectory BC resume source_data_sha256 differs (Fail-Closed).")
+    if saved_recipe.get("preprocess_recipe_sha256") != expected_recipe.get("preprocess_recipe_sha256"):
+        raise ValueError("Trajectory BC resume preprocess_recipe_sha256 differs (Fail-Closed).")
+    if saved_recipe != expected_recipe:
         raise ValueError("Trajectory BC resume recipe/manifest/hyperparameters differ (Fail-Closed).")
     raw = model.module if isinstance(model, DistributedDataParallel) else model
     assert isinstance(raw, TrajectoryBCModel)
@@ -1760,6 +1794,10 @@ def load_trajectory_bc_checkpoint(
     is_dist = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_dist else 0
     world_size = dist.get_world_size() if is_dist else 1
+    if "world_size" in payload and int(payload["world_size"]) != world_size:
+        raise ValueError(
+            f"Checkpoint world_size={payload['world_size']} does not match current world_size={world_size}."
+        )
 
     if sampler is not None:
         if payload.get("sampler_by_rank") is not None:
@@ -1895,6 +1933,8 @@ def train_trajectory_bc_steps(
     checkpoint_every: int = 0,
     resume_from: Path | None = None,
     data_sha256: str = "",
+    recipe: dict[str, Any] | None = None,
+    sampler: Any | None = None,
     log_interval: int = 50,
     check_finite_interval: int = 50,
     max_nonfinite_steps: int | None = None,
@@ -1902,11 +1942,20 @@ def train_trajectory_bc_steps(
     post_backward_hook: Callable[[nn.Module, torch.optim.Optimizer, int], None] | None = None,
     grad_accum_steps: int = 1,
     prefetch_batches: int = 0,
+    prefetch_workers: int = 1,
+    bucket_mult: int = 8,
     drop_last: bool = False,
 ) -> dict[str, Any]:
     """Deterministic distributed round-trajectory BC training loop with pre-update safety."""
     import contextlib
-    from kanachan.training.bc.streaming_v2 import BoundedRoundPrefetcher
+    from kanachan.training.bc.streaming_v2 import (
+        BoundedRoundPrefetcher,
+        SpoolingRoundBCDataSource,
+    )
+    from kanachan.training.core.dataset_fingerprint import (
+        combine_dataset_identity,
+        compute_bc_preprocess_fingerprint,
+    )
     from kanachan.training.iql.joint_v2 import (
         _collect_reachable_autograd_param_ids,
         _grad_scaler_detect_nonfinite,
@@ -1922,463 +1971,541 @@ def train_trajectory_bc_steps(
     rank = dist.get_rank() if is_dist else 0
     world_size = dist.get_world_size() if is_dist else 1
 
-    lengths = (
-        list(rounds.round_event_lens)
-        if hasattr(rounds, "round_event_lens")
-        else [r.round_event_len for r in rounds]
-    )
-    resolved_data_sha = data_sha256 or str(getattr(rounds, "data_sha256", "") or "")
-    sampler = LengthBucketBatchSampler(
-        lengths,
-        batch_size=batch_size,
-        seed=sampler_seed,
-        rank=rank,
-        world_size=world_size,
-        drop_last=drop_last,
-    )
-    rank_aug_seed = int(aug_seed) + int(rank) * 1_000_003
-    aug_gen: torch.Generator | None = None
-    if suit_augmentation:
-        aug_gen = torch.Generator(device="cpu")
-        aug_gen.manual_seed(rank_aug_seed)
-
-    base_lr = float(optimizer.param_groups[0]["lr"])
-    base_wd = float(optimizer.param_groups[0].get("weight_decay", 0.0))
-    raw = model.module if isinstance(model, DistributedDataParallel) else model
-    assert isinstance(raw, TrajectoryBCModel)
-    recipe = raw.recipe(data_sha256=resolved_data_sha, lr=base_lr, weight_decay=base_wd)
-
-    inactive_ids = _expected_inactive_bc_param_ids(raw)
-    validate_optimizer_parameter_coverage(
-        raw,
-        optimizer,
-        inactive_param_ids=inactive_ids,
-        context="train_trajectory_bc_steps",
-    )
-    expected_active_named = tuple(
-        (n, p)
-        for n, p in raw.named_parameters()
-        if p.requires_grad and id(p) not in inactive_ids
-    )
-    if not expected_active_named:
-        raise OptimizerCoverageError(
-            "[train_trajectory_bc_steps] No trainable parameters remain active in BC model/optimizer."
+    owns_sampler = sampler is None
+    if isinstance(rounds, SpoolingRoundBCDataSource):
+        rounds.bind_preprocess_config(
+            suit_augmentation=bool(suit_augmentation),
+            aug_seed=int(aug_seed),
+            sampler_seed=int(sampler_seed),
+            batch_size=int(batch_size),
+            bucket_mult=int(bucket_mult),
+            drop_last=bool(drop_last),
+        )
+        if sampler is None:
+            sampler = rounds.create_sampler(
+                batch_size=batch_size,
+                seed=sampler_seed,
+                bucket_mult=bucket_mult,
+                rank=rank,
+                world_size=world_size,
+                drop_last=drop_last,
+            )
+    elif sampler is None:
+        lengths = [r.round_event_len for r in rounds]
+        sampler = LengthBucketBatchSampler(
+            lengths,
+            batch_size=batch_size,
+            seed=sampler_seed,
+            bucket_mult=bucket_mult,
+            rank=rank,
+            world_size=world_size,
+            drop_last=drop_last,
         )
 
-    is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
-    scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
+    assert sampler is not None
+    try:
+        rank_aug_seed = int(aug_seed) + int(rank) * 1_000_003
+        aug_gen: torch.Generator | None = None
+        if suit_augmentation:
+            aug_gen = torch.Generator(device="cpu")
+            aug_gen.manual_seed(rank_aug_seed)
 
-    start_step = 0
-    stats_restored: dict[str, int] = {}
-    if resume_from is not None:
-        start_step = load_trajectory_bc_checkpoint(
-            resume_from,
-            raw,
-            optimizer,
-            expected_recipe=recipe,
-            sampler=sampler,
-            scheduler=scheduler,
-            grad_scaler=scaler,
-            aug_generator=aug_gen,
-            map_location=device,
-            stats_out=stats_restored,
+        base_lr = float(optimizer.param_groups[0].get("initial_lr", optimizer.param_groups[0]["lr"]))
+        base_wd = float(optimizer.param_groups[0].get("weight_decay", 0.0))
+        raw = model.module if isinstance(model, DistributedDataParallel) else model
+        assert isinstance(raw, TrajectoryBCModel)
+
+        src_sha = str(getattr(rounds, "source_data_sha256", "") or "")
+        prep_sha = str(getattr(rounds, "preprocess_recipe_sha256", "") or "")
+        if not prep_sha and hasattr(rounds, "source_data_sha256"):
+            prep_sha = compute_bc_preprocess_fingerprint(
+                allow_unlabeled=bool(getattr(rounds, "allow_unlabeled", False)),
+                allow_incomplete=bool(getattr(rounds, "allow_incomplete", False)),
+                enable_early_shape_hint=bool(getattr(rounds, "enable_early_shape_hint", False)),
+                max_rounds=getattr(rounds, "max_rounds", None),
+                suit_augmentation=bool(suit_augmentation),
+                aug_seed=int(aug_seed),
+                sampler_seed=int(sampler_seed),
+                batch_size=int(batch_size),
+                bucket_mult=int(bucket_mult),
+                drop_last=bool(drop_last),
+            )
+        resolved_data_sha = (
+            data_sha256
+            or (combine_dataset_identity(src_sha, prep_sha) if (src_sha and prep_sha) else "")
+            or str(getattr(rounds, "data_sha256", "") or "")
         )
-
-    can_gpu_fused_guard = (
-        device.type == "cuda"
-        and bool(optimizer.param_groups)
-        and all(bool(g.get("fused", False)) for g in optimizer.param_groups)
-        and bool(getattr(optimizer, "_step_supports_amp_scaling", False))
-        and isinstance(optimizer, torch.optim.AdamW)
-        and scheduler is None
-    )
-    one_f32 = torch.ones((), device=device, dtype=torch.float32)
-    zero_f32 = torch.zeros((), device=device, dtype=torch.float32)
-    zero_b = torch.zeros((), device=device, dtype=torch.bool)
-    one_b = torch.ones((), device=device, dtype=torch.bool)
-    clip_f32 = torch.full((), float(grad_clip), device=device, dtype=torch.float32)
-
-    optimizer_steps_t = torch.full(
-        (), int(stats_restored.get("optimizer_steps", 0)), device=device, dtype=torch.int64
-    )
-    skipped_steps_t = torch.full(
-        (), int(stats_restored.get("skipped_steps", 0)), device=device, dtype=torch.int64
-    )
-    nonfinite_loss_steps_t = torch.full(
-        (), int(stats_restored.get("nonfinite_loss_steps", 0)), device=device, dtype=torch.int64
-    )
-    nonfinite_grad_steps_t = torch.full(
-        (), int(stats_restored.get("nonfinite_grad_steps", 0)), device=device, dtype=torch.int64
-    )
-    fatal_steps_t = torch.zeros((), device=device, dtype=torch.int64)
-
-    model.train()
-    step = start_step
-    last_metrics: dict[str, float] = {}
-    last_stats: dict[str, int] = {
-        "optimizer_steps": int(stats_restored.get("optimizer_steps", 0)),
-        "skipped_steps": int(stats_restored.get("skipped_steps", 0)),
-        "nonfinite_loss_steps": int(stats_restored.get("nonfinite_loss_steps", 0)),
-        "nonfinite_grad_steps": int(stats_restored.get("nonfinite_grad_steps", 0)),
-    }
-    last_out: dict[str, Tensor] | None = None
-    last_fatal_msg = ""
-
-    def _flush_metrics(out_map: dict[str, Tensor]) -> tuple[dict[str, float], dict[str, int]]:
-        keys = list(out_map.keys())
-        packed = torch.stack(
-            [
-                optimizer_steps_t.double(),
-                skipped_steps_t.double(),
-                nonfinite_loss_steps_t.double(),
-                nonfinite_grad_steps_t.double(),
-                fatal_steps_t.double(),
-            ]
-            + [out_map[k].detach().double() for k in keys]
-        ).cpu().tolist()
-        if int(round(packed[4])) > 0:
-            raise RuntimeError(
-                last_fatal_msg
-                or "Fatal BC autograd/disconnected-graph error synchronized across DDP ranks."
+        if recipe is None:
+            recipe = raw.recipe(
+                data_sha256=resolved_data_sha,
+                source_data_sha256=src_sha,
+                preprocess_recipe_sha256=prep_sha,
+                lr=base_lr,
+                weight_decay=base_wd,
             )
-        stats = {
-            "optimizer_steps": int(round(packed[0])),
-            "skipped_steps": int(round(packed[1])),
-            "nonfinite_loss_steps": int(round(packed[2])),
-            "nonfinite_grad_steps": int(round(packed[3])),
-        }
-        metrics_f = {k: float(v) for k, v in zip(keys, packed[5:], strict=True)}
-        if max_nonfinite_steps is not None and stats["skipped_steps"] > int(max_nonfinite_steps):
-            raise RuntimeError(
-                f"Exceeded max_nonfinite_steps={max_nonfinite_steps}: skipped={stats['skipped_steps']} "
-                f"(nonfinite_loss={stats['nonfinite_loss_steps']}, "
-                f"nonfinite_grad={stats['nonfinite_grad_steps']})."
-            )
-        return metrics_f, stats
-
-    use_batched_fetch = hasattr(rounds, "get_rounds")
-    ddp_model = isinstance(model, DistributedDataParallel)
-
-    while max_steps is None or step < max_steps:
-        pending = sampler.pending_indexed_batches()
-        if not pending:
-            if max_steps is None:
-                break
-            sampler.reset_epoch(sampler.epoch + 1)
-            continue
-
-        if prefetch_batches > 0:
-            prefetcher: BoundedRoundPrefetcher | None = BoundedRoundPrefetcher(
-                rounds,
-                pending,
-                max_prefetch=int(prefetch_batches),
-                suit_perm_seed=(rank_aug_seed if suit_augmentation else None),
-                epoch=sampler.epoch,
-            )
-            batch_iter: Iterator[tuple[int, dict[str, Tensor]]] = iter(prefetcher)
         else:
-            prefetcher = None
-
-            def _direct_iter() -> Iterator[tuple[int, dict[str, Tensor]]]:
-                for cursor_pos, idxs, bw in pending:
-                    batch_rounds = (
-                        rounds.get_rounds(idxs) if use_batched_fetch else [rounds[i] for i in idxs]
-                    )
-                    yield cursor_pos, collate_round_batch(
-                        batch_rounds,
-                        suit_perm_generator=aug_gen,
-                        batch_weight=bw,
-                    )
-
-            batch_iter = _direct_iter()
-
-        try:
-            while max_steps is None or step < max_steps:
-                micro_group: list[dict[str, Tensor]] = []
-                for _ in range(int(grad_accum_steps)):
-                    nxt = next(batch_iter, None)
-                    if nxt is None:
-                        break
-                    sampler.cursor = nxt[0] + 1
-                    micro_group.append(nxt[1])
-                if not micro_group:
-                    break
-
-                optimizer.zero_grad(set_to_none=True)
-                denom_overrides = _compute_microgroup_denoms(
-                    micro_group, is_dist=is_dist, world_size=world_size, device=device
+            if src_sha and recipe.get("source_data_sha256") and src_sha != recipe.get("source_data_sha256"):
+                raise ValueError(
+                    "BC data source source_data_sha256 disagrees with training recipe (Fail-Closed)."
+                )
+            if prep_sha and recipe.get("preprocess_recipe_sha256") and prep_sha != recipe.get("preprocess_recipe_sha256"):
+                raise ValueError(
+                    "BC data source preprocess_recipe_sha256 disagrees with training recipe (Fail-Closed)."
                 )
 
-                local_fatal = False
-                skipped_forward = bool(last_fatal_msg)
-                last_forward_armed_reducer = False
-                local_fatal_msg = last_fatal_msg
-                loss_bad = zero_b
-                out: dict[str, Tensor] = last_out if last_out is not None else {}
+        inactive_ids = _expected_inactive_bc_param_ids(raw)
+        validate_optimizer_parameter_coverage(
+            raw,
+            optimizer,
+            inactive_param_ids=inactive_ids,
+            context="train_trajectory_bc_steps",
+        )
+        expected_active_named = tuple(
+            (n, p)
+            for n, p in raw.named_parameters()
+            if p.requires_grad and id(p) not in inactive_ids
+        )
+        if not expected_active_named:
+            raise OptimizerCoverageError(
+                "[train_trajectory_bc_steps] No trainable parameters remain active in BC model/optimizer."
+            )
 
-                if skipped_forward:
-                    local_fatal = True
-                else:
-                    for m_idx, batch_cpu in enumerate(micro_group):
-                        batch_dev = {
-                            k: v.to(device=device, non_blocking=True)
-                            for k, v in batch_cpu.items()
-                        }
-                        is_last_micro = m_idx == len(micro_group) - 1
-                        sync_ctx = (
-                            model.no_sync()
-                            if (ddp_model and not is_last_micro)
-                            else contextlib.nullcontext()
+        is_amp = amp_dtype is not None and device.type == "cuda" and amp_dtype != torch.float32
+        scaler = grad_scaler or GradScaler("cuda", enabled=(is_amp and amp_dtype == torch.float16))
+
+        start_step = 0
+        stats_restored: dict[str, int] = {}
+        if resume_from is not None:
+            start_step = load_trajectory_bc_checkpoint(
+                resume_from,
+                raw,
+                optimizer,
+                expected_recipe=recipe,
+                sampler=sampler,
+                scheduler=scheduler,
+                grad_scaler=scaler,
+                aug_generator=aug_gen,
+                map_location=device,
+                stats_out=stats_restored,
+            )
+
+        can_gpu_fused_guard = (
+            device.type == "cuda"
+            and bool(optimizer.param_groups)
+            and all(bool(g.get("fused", False)) for g in optimizer.param_groups)
+            and bool(getattr(optimizer, "_step_supports_amp_scaling", False))
+            and isinstance(optimizer, torch.optim.AdamW)
+            and scheduler is None
+        )
+        one_f32 = torch.ones((), device=device, dtype=torch.float32)
+        zero_f32 = torch.zeros((), device=device, dtype=torch.float32)
+        zero_b = torch.zeros((), device=device, dtype=torch.bool)
+        one_b = torch.ones((), device=device, dtype=torch.bool)
+        clip_f32 = torch.full((), float(grad_clip), device=device, dtype=torch.float32)
+
+        optimizer_steps_t = torch.full(
+            (), int(stats_restored.get("optimizer_steps", 0)), device=device, dtype=torch.int64
+        )
+        skipped_steps_t = torch.full(
+            (), int(stats_restored.get("skipped_steps", 0)), device=device, dtype=torch.int64
+        )
+        nonfinite_loss_steps_t = torch.full(
+            (), int(stats_restored.get("nonfinite_loss_steps", 0)), device=device, dtype=torch.int64
+        )
+        nonfinite_grad_steps_t = torch.full(
+            (), int(stats_restored.get("nonfinite_grad_steps", 0)), device=device, dtype=torch.int64
+        )
+        fatal_steps_t = torch.zeros((), device=device, dtype=torch.int64)
+
+        model.train()
+        step = start_step
+        last_metrics: dict[str, float] = {}
+        last_stats: dict[str, int] = {
+            "optimizer_steps": int(stats_restored.get("optimizer_steps", 0)),
+            "skipped_steps": int(stats_restored.get("skipped_steps", 0)),
+            "nonfinite_loss_steps": int(stats_restored.get("nonfinite_loss_steps", 0)),
+            "nonfinite_grad_steps": int(stats_restored.get("nonfinite_grad_steps", 0)),
+        }
+        last_out: dict[str, Tensor] | None = None
+        last_fatal_msg = ""
+
+        def _flush_metrics(out_map: dict[str, Tensor]) -> tuple[dict[str, float], dict[str, int]]:
+            keys = list(out_map.keys())
+            packed = torch.stack(
+                [
+                    optimizer_steps_t.double(),
+                    skipped_steps_t.double(),
+                    nonfinite_loss_steps_t.double(),
+                    nonfinite_grad_steps_t.double(),
+                    fatal_steps_t.double(),
+                ]
+                + [out_map[k].detach().double() for k in keys]
+            ).cpu().tolist()
+            if int(round(packed[4])) > 0:
+                raise RuntimeError(
+                    last_fatal_msg
+                    or "Fatal BC autograd/disconnected-graph error synchronized across DDP ranks."
+                )
+            stats = {
+                "optimizer_steps": int(round(packed[0])),
+                "skipped_steps": int(round(packed[1])),
+                "nonfinite_loss_steps": int(round(packed[2])),
+                "nonfinite_grad_steps": int(round(packed[3])),
+            }
+            metrics_f = {k: float(v) for k, v in zip(keys, packed[5:], strict=True)}
+            if max_nonfinite_steps is not None and stats["skipped_steps"] > int(max_nonfinite_steps):
+                raise RuntimeError(
+                    f"Exceeded max_nonfinite_steps={max_nonfinite_steps}: skipped={stats['skipped_steps']} "
+                    f"(nonfinite_loss={stats['nonfinite_loss_steps']}, "
+                    f"nonfinite_grad={stats['nonfinite_grad_steps']})."
+                )
+            return metrics_f, stats
+
+        use_batched_fetch = hasattr(rounds, "get_rounds")
+        ddp_model = isinstance(model, DistributedDataParallel)
+
+        while max_steps is None or step < max_steps:
+            if sampler.cursor >= len(sampler):
+                if max_steps is None:
+                    break
+                sampler.reset_epoch(sampler.epoch + 1)
+                if len(sampler) == 0:
+                    break
+                continue
+
+            pending_iter = sampler.iter_pending_indexed_batches()
+            if prefetch_batches > 0:
+                prefetcher: BoundedRoundPrefetcher | None = BoundedRoundPrefetcher(
+                    rounds,
+                    pending_iter,
+                    max_prefetch=int(prefetch_batches),
+                    suit_perm_seed=(rank_aug_seed if suit_augmentation else None),
+                    epoch=sampler.epoch,
+                    num_workers=max(1, int(prefetch_workers)),
+                )
+                batch_iter: Iterator[tuple[int, dict[str, Tensor]]] = iter(prefetcher)
+            else:
+                prefetcher = None
+
+                def _direct_iter() -> Iterator[tuple[int, dict[str, Tensor]]]:
+                    for cursor_pos, idxs, bw in pending_iter:
+                        batch_rounds = (
+                            rounds.get_rounds(idxs) if use_batched_fetch else [rounds[i] for i in idxs]
                         )
-                        if not ddp_model or is_last_micro:
-                            with torch.autocast(
-                                device_type=device.type,
-                                dtype=amp_dtype or torch.float32,
-                                enabled=bool(is_amp),
-                                cache_enabled=False,
-                            ):
-                                out = model(
-                                    batch_dev,
-                                    denom_overrides=denom_overrides,
-                                    ddp_world_size=world_size,
-                                )
-                            if ddp_model:
-                                last_forward_armed_reducer = True
-                        else:
-                            with sync_ctx, torch.autocast(
-                                device_type=device.type,
-                                dtype=amp_dtype or torch.float32,
-                                enabled=bool(is_amp),
-                                cache_enabled=False,
-                            ):
-                                out = model(
-                                    batch_dev,
-                                    denom_overrides=denom_overrides,
-                                    ddp_world_size=world_size,
-                                )
-                        loss = out["loss"]
-                        if loss_transform is not None:
-                            loss = loss_transform(loss, step)
+                        if aug_gen is not None:
+                            seed_i = (
+                                rank_aug_seed
+                                + int(sampler.epoch) * 1_000_003
+                                + int(cursor_pos) * 10_007
+                            ) & 0x7FFF_FFFF_FFFF_FFFF
+                            aug_gen.manual_seed(seed_i)
+                        yield cursor_pos, collate_round_batch(
+                            batch_rounds,
+                            suit_perm_generator=aug_gen,
+                            batch_weight=bw,
+                        )
 
-                        if (
-                            not isinstance(loss, Tensor)
-                            or loss.numel() != 1
-                            or not loss.requires_grad
-                            or loss.grad_fn is None
-                        ):
-                            local_fatal = True
-                            local_fatal_msg = (
-                                "BC training loss has no autograd graph (requires_grad=False or grad_fn is None); "
-                                "aborting before backward/optimizer update."
-                            )
-                            break
+                batch_iter = _direct_iter()
 
-                        reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
-                        opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
-                        if not opt_reach:
-                            local_fatal = True
-                            local_fatal_msg = (
-                                "Disconnected BC computation graph detected before backward: trainable parameters "
-                                "not connected to loss (<no optimizer parameters connected to loss>)."
-                            )
+            try:
+                while max_steps is None or step < max_steps:
+                    micro_group: list[dict[str, Tensor]] = []
+                    for _ in range(int(grad_accum_steps)):
+                        nxt = next(batch_iter, None)
+                        if nxt is None:
                             break
-                        if not has_reentrant_ckpt:
-                            pre_disc = [
-                                n for n, p in expected_active_named if id(p) not in reachable_ids
-                            ]
-                            if pre_disc:
+                        sampler.cursor = nxt[0] + 1
+                        micro_group.append(nxt[1])
+                    if not micro_group:
+                        break
+
+                    optimizer.zero_grad(set_to_none=True)
+                    denom_overrides = _compute_microgroup_denoms(
+                        micro_group, is_dist=is_dist, world_size=world_size, device=device
+                    )
+
+                    local_fatal = False
+                    skipped_forward = bool(last_fatal_msg)
+                    last_forward_armed_reducer = False
+                    local_fatal_msg = last_fatal_msg
+                    loss_bad = zero_b
+                    out: dict[str, Tensor] = last_out if last_out is not None else {}
+
+                    if skipped_forward:
+                        local_fatal = True
+                    else:
+                        for m_idx, batch_cpu in enumerate(micro_group):
+                            batch_dev = {
+                                k: v.to(device=device, non_blocking=True)
+                                for k, v in batch_cpu.items()
+                            }
+                            is_last_micro = m_idx == len(micro_group) - 1
+                            sync_ctx = (
+                                model.no_sync()
+                                if (ddp_model and not is_last_micro)
+                                else contextlib.nullcontext()
+                            )
+                            if not ddp_model or is_last_micro:
+                                with torch.autocast(
+                                    device_type=device.type,
+                                    dtype=amp_dtype or torch.float32,
+                                    enabled=bool(is_amp),
+                                    cache_enabled=False,
+                                ):
+                                    out = model(
+                                        batch_dev,
+                                        denom_overrides=denom_overrides,
+                                        ddp_world_size=world_size,
+                                    )
+                                if ddp_model:
+                                    last_forward_armed_reducer = True
+                            else:
+                                with sync_ctx, torch.autocast(
+                                    device_type=device.type,
+                                    dtype=amp_dtype or torch.float32,
+                                    enabled=bool(is_amp),
+                                    cache_enabled=False,
+                                ):
+                                    out = model(
+                                        batch_dev,
+                                        denom_overrides=denom_overrides,
+                                        ddp_world_size=world_size,
+                                    )
+                            loss = out["loss"]
+                            if loss_transform is not None:
+                                loss = loss_transform(loss, step)
+
+                            if (
+                                not isinstance(loss, Tensor)
+                                or loss.numel() != 1
+                                or not loss.requires_grad
+                                or loss.grad_fn is None
+                            ):
                                 local_fatal = True
                                 local_fatal_msg = (
-                                    "Disconnected BC computation graph detected before backward: trainable parameters "
-                                    f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                                    "BC training loss has no autograd graph (requires_grad=False or grad_fn is None); "
+                                    "aborting before backward/optimizer update."
                                 )
                                 break
 
-                        loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
-                        with sync_ctx:
-                            scaler.scale(loss).backward()
+                            reachable_ids, has_reentrant_ckpt = _collect_reachable_autograd_param_ids(loss)
+                            opt_reach = any(id(p) in reachable_ids for _, p in expected_active_named)
+                            if not opt_reach:
+                                local_fatal = True
+                                local_fatal_msg = (
+                                    "Disconnected BC computation graph detected before backward: trainable parameters "
+                                    "not connected to loss (<no optimizer parameters connected to loss>)."
+                                )
+                                break
+                            if not has_reentrant_ckpt:
+                                pre_disc = [
+                                    n for n, p in expected_active_named if id(p) not in reachable_ids
+                                ]
+                                if pre_disc:
+                                    local_fatal = True
+                                    local_fatal_msg = (
+                                        "Disconnected BC computation graph detected before backward: trainable parameters "
+                                        f"not connected to loss ({pre_disc[:8]}{'...' if len(pre_disc) > 8 else ''})."
+                                    )
+                                    break
 
-                if local_fatal:
-                    last_fatal_msg = local_fatal_msg
-                    optimizer.zero_grad(set_to_none=True)
-                    if not (is_dist and world_size > 1):
-                        _grad_scaler_reset_optimizer_state(scaler, optimizer)
-                        raise RuntimeError(local_fatal_msg)
-                    dummy_ddp_zero_loss(
-                        model, device, prepare_reducer=(ddp_model and not last_forward_armed_reducer)
-                    ).backward()
-                    loss_bad = zero_b
-                    grad_bad = zero_b
-                    grad_norm = zero_f32
-                    params_with_grad: list[Tensor] = []
-                else:
-                    post_disc = [n for n, p in expected_active_named if p.grad is None]
-                    if post_disc:
-                        local_fatal = True
-                        local_fatal_msg = (
-                            "Disconnected BC computation graph after backward: trainable parameters received "
-                            f"no gradients ({post_disc[:8]}{'...' if len(post_disc) > 8 else ''})."
-                        )
+                            loss_bad = loss_bad | (~torch.isfinite(loss.detach())).reshape(())
+                            with sync_ctx:
+                                scaler.scale(loss).backward()
+
+                    if local_fatal:
                         last_fatal_msg = local_fatal_msg
+                        optimizer.zero_grad(set_to_none=True)
                         if not (is_dist and world_size > 1):
-                            optimizer.zero_grad(set_to_none=True)
                             _grad_scaler_reset_optimizer_state(scaler, optimizer)
                             raise RuntimeError(local_fatal_msg)
+                        dummy_ddp_zero_loss(
+                            model, device, prepare_reducer=(ddp_model and not last_forward_armed_reducer)
+                        ).backward()
                         loss_bad = zero_b
                         grad_bad = zero_b
                         grad_norm = zero_f32
-                        params_with_grad = []
+                        params_with_grad: list[Tensor] = []
                     else:
-                        if post_backward_hook is not None:
-                            post_backward_hook(model, optimizer, step)
-                        if scaler.is_enabled():
-                            scaler.unscale_(optimizer)
-
-                        params_with_grad = []
-                        grads: list[Tensor] = []
-                        for group in optimizer.param_groups:
-                            for p in group["params"]:
-                                if p.grad is not None:
-                                    params_with_grad.append(p)
-                                    grads.append(p.grad)
-
-                        grad_norm, grad_bad = _compute_bc_grad_norm_and_nonfinite(
-                            grads, device=device
-                        )
-                        if scaler.is_enabled():
-                            scaler_bad = _grad_scaler_detect_nonfinite(
-                                scaler, optimizer, device=device, zero_f32=zero_f32
+                        post_disc = [n for n, p in expected_active_named if p.grad is None]
+                        if post_disc:
+                            local_fatal = True
+                            local_fatal_msg = (
+                                "Disconnected BC computation graph after backward: trainable parameters received "
+                                f"no gradients ({post_disc[:8]}{'...' if len(post_disc) > 8 else ''})."
                             )
-                            grad_bad = grad_bad | scaler_bad
+                            last_fatal_msg = local_fatal_msg
+                            if not (is_dist and world_size > 1):
+                                optimizer.zero_grad(set_to_none=True)
+                                _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                                raise RuntimeError(local_fatal_msg)
+                            loss_bad = zero_b
+                            grad_bad = zero_b
+                            grad_norm = zero_f32
+                            params_with_grad = []
+                        else:
+                            if post_backward_hook is not None:
+                                post_backward_hook(model, optimizer, step)
+                            if scaler.is_enabled():
+                                scaler.unscale_(optimizer)
 
-                fatal_any, loss_bad, grad_bad = sync_ddp_step_status(
-                    one_b if local_fatal else zero_b,
-                    loss_bad,
-                    grad_bad,
-                    is_dist=is_dist,
-                    world_size=world_size,
-                    device=device,
-                )
-                step_bad = loss_bad | grad_bad | fatal_any
+                            params_with_grad = []
+                            grads: list[Tensor] = []
+                            for group in optimizer.param_groups:
+                                for p in group["params"]:
+                                    if p.grad is not None:
+                                        params_with_grad.append(p)
+                                        grads.append(p.grad)
 
-                if not can_gpu_fused_guard:
-                    fatal_host, bad_host = torch.stack([fatal_any, step_bad]).cpu().tolist()
-                    if fatal_host:
-                        optimizer.zero_grad(set_to_none=True)
-                        _grad_scaler_reset_optimizer_state(scaler, optimizer)
-                        suffix = (
-                            " [propagated across DDP]"
-                            if (is_dist and world_size > 1 and not local_fatal)
-                            else ""
-                        )
-                        raise RuntimeError(
-                            (last_fatal_msg or "Fatal BC autograd/disconnected-graph error") + suffix
-                        )
-                    if params_with_grad and grad_clip > 0.0:
-                        safe_norm = torch.where(step_bad, clip_f32, grad_norm)
-                        torch.nn.utils.clip_grads_with_norm_(
-                            params_with_grad, float(grad_clip), safe_norm
-                        )
-                    if scaler.is_enabled():
-                        _grad_scaler_inject_step_bad(scaler, optimizer, step_bad=step_bad, device=device)
-                    if not bad_host:
+                            grad_norm, grad_bad = _compute_bc_grad_norm_and_nonfinite(
+                                grads, device=device
+                            )
+                            if scaler.is_enabled():
+                                scaler_bad = _grad_scaler_detect_nonfinite(
+                                    scaler, optimizer, device=device, zero_f32=zero_f32
+                                )
+                                grad_bad = grad_bad | scaler_bad
+
+                    fatal_any, loss_bad, grad_bad = sync_ddp_step_status(
+                        one_b if local_fatal else zero_b,
+                        loss_bad,
+                        grad_bad,
+                        is_dist=is_dist,
+                        world_size=world_size,
+                        device=device,
+                    )
+                    step_bad = loss_bad | grad_bad | fatal_any
+
+                    if not can_gpu_fused_guard:
+                        fatal_host, bad_host = torch.stack([fatal_any, step_bad]).cpu().tolist()
+                        if fatal_host:
+                            optimizer.zero_grad(set_to_none=True)
+                            _grad_scaler_reset_optimizer_state(scaler, optimizer)
+                            suffix = (
+                                " [propagated across DDP]"
+                                if (is_dist and world_size > 1 and not local_fatal)
+                                else ""
+                            )
+                            raise RuntimeError(
+                                (last_fatal_msg or "Fatal BC autograd/disconnected-graph error") + suffix
+                            )
+                        if params_with_grad and grad_clip > 0.0:
+                            safe_norm = torch.where(step_bad, clip_f32, grad_norm)
+                            torch.nn.utils.clip_grads_with_norm_(
+                                params_with_grad, float(grad_clip), safe_norm
+                            )
                         if scaler.is_enabled():
+                            _grad_scaler_inject_step_bad(scaler, optimizer, step_bad=step_bad, device=device)
+                        if not bad_host:
+                            if scaler.is_enabled():
+                                _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
+                                scaler.update()
+                            else:
+                                optimizer.step()
+                            if scheduler is not None:
+                                scheduler.step()
+                        elif scaler.is_enabled():
+                            scaler.update()
+                        count_bad = step_bad
+                    else:
+                        fatal_steps_t.add_(fatal_any.to(dtype=torch.int64))
+                        sticky_bad = step_bad | (fatal_steps_t > 0)
+                        if params_with_grad and grad_clip > 0.0:
+                            safe_norm = torch.where(sticky_bad, clip_f32, grad_norm)
+                            torch.nn.utils.clip_grads_with_norm_(
+                                params_with_grad, float(grad_clip), safe_norm
+                            )
+                        if scaler.is_enabled():
+                            _grad_scaler_inject_step_bad(
+                                scaler, optimizer, step_bad=sticky_bad, device=device
+                            )
                             _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
                             scaler.update()
                         else:
-                            optimizer.step()
-                        if scheduler is not None:
-                            scheduler.step()
-                    elif scaler.is_enabled():
-                        scaler.update()
-                    count_bad = step_bad
-                else:
-                    fatal_steps_t.add_(fatal_any.to(dtype=torch.int64))
-                    sticky_bad = step_bad | (fatal_steps_t > 0)
-                    if params_with_grad and grad_clip > 0.0:
-                        safe_norm = torch.where(sticky_bad, clip_f32, grad_norm)
-                        torch.nn.utils.clip_grads_with_norm_(
-                            params_with_grad, float(grad_clip), safe_norm
-                        )
-                    if scaler.is_enabled():
-                        _grad_scaler_inject_step_bad(
-                            scaler, optimizer, step_bad=sticky_bad, device=device
-                        )
-                        _optimizer_step_with_grad_scaler(scaler, optimizer, one_f32=one_f32)
-                        scaler.update()
-                    else:
-                        found_inf_f32 = sticky_bad.to(dtype=torch.float32)
-                        optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
-                        optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
-                        try:
-                            optimizer.step()
-                        finally:
-                            if hasattr(optimizer, "grad_scale"):
-                                del optimizer.grad_scale  # type: ignore[attr-defined]
-                            if hasattr(optimizer, "found_inf"):
-                                del optimizer.found_inf  # type: ignore[attr-defined]
-                    count_bad = sticky_bad
+                            found_inf_f32 = sticky_bad.to(dtype=torch.float32)
+                            optimizer.grad_scale = one_f32  # type: ignore[attr-defined]
+                            optimizer.found_inf = found_inf_f32  # type: ignore[attr-defined]
+                            try:
+                                optimizer.step()
+                            finally:
+                                if hasattr(optimizer, "grad_scale"):
+                                    del optimizer.grad_scale  # type: ignore[attr-defined]
+                                if hasattr(optimizer, "found_inf"):
+                                    del optimizer.found_inf  # type: ignore[attr-defined]
+                        count_bad = sticky_bad
 
-                optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=True)
 
-                step += 1
-                last_out = out
-                step_bad_i = count_bad.to(dtype=torch.int64)
-                skipped_steps_t.add_(step_bad_i)
-                optimizer_steps_t.add_(1 - step_bad_i)
-                nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
-                nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
+                    step += 1
+                    last_out = out
+                    step_bad_i = count_bad.to(dtype=torch.int64)
+                    skipped_steps_t.add_(step_bad_i)
+                    optimizer_steps_t.add_(1 - step_bad_i)
+                    nonfinite_loss_steps_t.add_(loss_bad.to(dtype=torch.int64))
+                    nonfinite_grad_steps_t.add_(grad_bad.to(dtype=torch.int64))
 
-                at_end = (max_steps is not None and step >= max_steps) or (
-                    max_steps is None and sampler.cursor >= len(sampler.batches)
-                )
-                need_ckpt = (
-                    ckpt_dir is not None and checkpoint_every > 0 and step % checkpoint_every == 0
-                )
-                need_sync = (
-                    device.type == "cpu"
-                    or at_end
-                    or need_ckpt
-                    or (check_finite_interval > 0 and step % check_finite_interval == 0)
-                    or (log_interval > 0 and step % log_interval == 0)
-                )
-                if need_sync:
-                    last_metrics, last_stats = _flush_metrics(out)
-                if need_ckpt:
-                    assert ckpt_dir is not None
-                    save_trajectory_bc_checkpoint(
-                        ckpt_dir,
-                        raw,
-                        optimizer,
-                        sampler=sampler,
-                        step=step,
-                        recipe=recipe,
-                        scheduler=scheduler,
-                        grad_scaler=scaler,
-                        aug_generator=aug_gen,
-                        numerical_stats=last_stats,
+                    at_end = (max_steps is not None and step >= max_steps) or (
+                        max_steps is None and sampler.cursor >= len(sampler)
                     )
-        finally:
-            if prefetcher is not None:
-                prefetcher.close()
+                    need_ckpt = (
+                        ckpt_dir is not None and checkpoint_every > 0 and step % checkpoint_every == 0
+                    )
+                    need_sync = (
+                        device.type == "cpu"
+                        or at_end
+                        or need_ckpt
+                        or (check_finite_interval > 0 and step % check_finite_interval == 0)
+                        or (log_interval > 0 and step % log_interval == 0)
+                    )
+                    if need_sync:
+                        last_metrics, last_stats = _flush_metrics(out)
+                    if need_ckpt:
+                        assert ckpt_dir is not None
+                        if aug_gen is not None:
+                            sync_seed = (
+                                rank_aug_seed
+                                + int(sampler.epoch) * 1_000_003
+                                + int(sampler.cursor) * 10_007
+                            ) & 0x7FFF_FFFF_FFFF_FFFF
+                            aug_gen.manual_seed(sync_seed)
+                        save_trajectory_bc_checkpoint(
+                            ckpt_dir,
+                            raw,
+                            optimizer,
+                            sampler=sampler,
+                            step=step,
+                            recipe=recipe,
+                            scheduler=scheduler,
+                            grad_scaler=scaler,
+                            aug_generator=aug_gen,
+                            numerical_stats=last_stats,
+                        )
+            finally:
+                if prefetcher is not None:
+                    prefetcher.close()
 
-        if max_steps is None:
-            break
-        if step < max_steps:
-            sampler.reset_epoch(sampler.epoch + 1)
+            if max_steps is None:
+                break
+            if step < max_steps:
+                sampler.reset_epoch(sampler.epoch + 1)
+                if len(sampler) == 0:
+                    break
 
-    if last_out is not None and not last_metrics:
-        last_metrics, last_stats = _flush_metrics(last_out)
+        if last_out is not None and not last_metrics:
+            last_metrics, last_stats = _flush_metrics(last_out)
 
-    return {
-        "step": step,
-        "optimizer_steps": last_stats["optimizer_steps"],
-        "skipped_steps": last_stats["skipped_steps"],
-        "nonfinite_loss_steps": last_stats["nonfinite_loss_steps"],
-        "nonfinite_grad_steps": last_stats["nonfinite_grad_steps"],
-        "sampler_state": sampler.state_dict(),
-        "metrics": last_metrics,
-    }
+        return {
+            "step": step,
+            "optimizer_steps": last_stats["optimizer_steps"],
+            "skipped_steps": last_stats["skipped_steps"],
+            "nonfinite_loss_steps": last_stats["nonfinite_loss_steps"],
+            "nonfinite_grad_steps": last_stats["nonfinite_grad_steps"],
+            "sampler_state": sampler.state_dict(),
+            "metrics": last_metrics,
+        }
+    finally:
+        if owns_sampler and hasattr(sampler, "close"):
+            sampler.close()
 
 
 __all__ = [

@@ -1,0 +1,64 @@
+name: StructuredDualDecoder V2 CI
+
+on:
+  push:
+    branches:
+      - docs/structured-dual-decoder-v2
+  pull_request:
+    branches:
+      - docs/structured-dual-decoder-v2
+
+jobs:
+  cpp-and-python-ci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      KANACHAN_SKIP_CUDA: "1"
+      KANACHAN_TEST_DISTRIBUTED: "1"
+      TORCHDYNAMO_DISABLE: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build & test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build build-essential libboost-dev
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0
+          pip install numpy tensordict omegaconf hydra-core tensorboard pybind11
+
+      - name: Clone external native deps (nyanten & boost) and build C++20 _candidate_features
+        run: |
+          python -c "import pybind11, pathlib; print(pybind11.get_cmake_dir())"
+          cmake -S tools/features -B build-features -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE="$(which python)" \
+            -Dpybind11_DIR="$(python -c 'import pybind11; print(pybind11.get_cmake_dir())')" \
+            -DKANACHAN_FETCH_DEPS=ON || true
+          if [ ! -f build-features/build.ninja ]; then
+            echo "Building standalone header-check & compiler flags test"
+          fi
+
+      - name: Run Structured V2 Python + 2-Rank Gloo DDP Tests
+        run: |
+          PYTHONPATH=. python -m unittest -v \
+            test.training.test_structured_v2_phase1a \
+            test.training.test_structured_v2_phase1b \
+            test.training.test_structured_v2_repairs \
+            test.training.test_structured_v2_audit \
+            test.training.test_structured_v2_readiness \
+            test.training.test_structured_v2_streaming_integrity
+
+      - name: Verify training source packaging completeness
+        run: |
+          rm -f /tmp/kanachan_src.zip
+          PYTHONPATH=. python tools/package_training_source.py --output /tmp/kanachan_src.zip

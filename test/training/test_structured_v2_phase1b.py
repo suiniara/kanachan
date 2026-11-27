@@ -66,6 +66,10 @@ from kanachan.training.bc.trajectory_v2 import (
 )
 from kanachan.training.core.optimizers import adamw_parameter_groups
 from kanachan.training.core.rl.discrete_cql import scalar_cql_loss
+from kanachan.training.core.test_env import (
+    preferred_test_device,
+    require_or_skip_real_data,
+)
 from kanachan.training.grp import (
     FrozenGRP,
     PureStateGRP,
@@ -82,7 +86,6 @@ from kanachan.training.iql.joint_v2 import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-VAL_DATA_PATH = Path(r"D:\kanachan-training-data\validation.bc.tsv.gz")
 
 
 def _make_sparse(
@@ -727,7 +730,7 @@ class TestStructuredV2Phase1B(unittest.TestCase):
                         self.assertIn(id(p), no_decay_ids)
 
         # 11E. FP16 .to(half) + autocast safety -> heads emit float32, RoPE stays float32
-        dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        dev = preferred_test_device()
         j_half = copy.deepcopy(joint).to(device=dev, dtype=torch.half).eval()
         self.assertEqual(j_half.backbone.decoder1._rope_cos.dtype, torch.float32)
         self.assertEqual(j_half.backbone.decoder1._rope_sin.dtype, torch.float32)
@@ -747,55 +750,7 @@ class TestStructuredV2Phase1B(unittest.TestCase):
                 self.assertEqual(j_bf.q1_head(ca_dev, enc_b).dtype, torch.float32)
 
     # Test #12: forward vs forward_round_trajectory vs forward_step_cached + KVCache reset
-    def test_12_three_mode_forward_equivalence_and_kvcache_reset(self):
-        rounds: list[Any] = []
-        if VAL_DATA_PATH.is_file():
-            game_lines: dict[str, list[str]] = {}
-            max_idx: dict[str, int] = {}
-            with gzip.open(VAL_DATA_PATH, "rt", encoding="utf-8") as fp:
-                for idx_line, line in enumerate(fp):
-                    if idx_line >= 15000:
-                        break
-                    u = line.split("\t", 1)[0]
-                    game_lines.setdefault(u, []).append(line)
-                    max_idx[u] = idx_line
-            complete_lines: list[str] = []
-            picked_games = 0
-            for u, lines_u in game_lines.items():
-                if max_idx[u] < 10000 and len(lines_u) >= 80:
-                    complete_lines.extend(lines_u)
-                    picked_games += 1
-                    if picked_games >= 2:
-                        break
-            if complete_lines:
-                with tempfile.TemporaryDirectory() as tmp_val:
-                    val_sub = Path(tmp_val) / "val_complete.tsv"
-                    val_sub.write_text("".join(complete_lines), encoding="utf-8")
-                    rounds = [
-                        r for r in parse_bc_rounds(val_sub)
-                        if len(r.decision_event_len) >= 3
-                    ][:6]
-        if not rounds:
-            closed = {
-                1: 1, 2: 1, 3: 1, 11: 1, 12: 1, 13: 1,
-                21: 1, 22: 1, 23: 1, 31: 2, 32: 2,
-            }
-            sp = torch.tensor(
-                [_make_sparse(seat=0, left=42 - k * 4, doras=(1,), closed37=closed, zimo=32) for k in range(3)],
-                dtype=torch.int32,
-            )
-            nu = torch.tensor([[0, 0, 25000, 25000, 25000, 25000]] * 3, dtype=torch.int32)
-            pr = torch.tensor(
-                [
-                    _pad_prog([_dahai(1, 35)]),
-                    _pad_prog([_dahai(1, 35), _dahai(2, 36), _dahai(3, 35)]),
-                    _pad_prog([_dahai(1, 35), _dahai(2, 36), _dahai(3, 35), _dahai(0, 31), _dahai(1, 36)]),
-                ],
-                dtype=torch.int32,
-            )
-            ca = torch.tensor([_pad_cands([4, 44, 84, 130])] * 3, dtype=torch.int32)
-            rounds = build_round_trajectories_from_raw(sp, nu, pr, ca, torch.tensor([0, 1, 2]), ["r0"] * 3)
-
+    def _verify_three_mode_rounds(self, rounds: list[Any]) -> None:
         for head_type in ("factorized", "flat546"):
             bb = StructuredDualDecoder(
                 preset="v2_tiny", dimension=64, num_heads=4, dim_feedforward=128,
@@ -867,7 +822,6 @@ class TestStructuredV2Phase1B(unittest.TestCase):
                     cand_ids=r0.v2_cand_ids[:1], cand_mask=r0.v2_cand_mask[:1],
                     cand_mode=r0.v2_cand_mode[:1], cand_dyn=r0.v2_cand_dyn[:1],
                 )
-                # Mutate prefix event 0 tile -> cache must invalidate & match fresh stateless forward!
                 ev_mut = ev0.clone()
                 ev_mut[0, 0, 3] = (int(ev_mut[0, 0, 3].item()) + 1) % 37
                 enc_mut_cached = bb.forward_step_cached(
@@ -884,7 +838,6 @@ class TestStructuredV2Phase1B(unittest.TestCase):
                 )
                 torch.testing.assert_close(enc_mut_cached, enc_mut_fresh, atol=1e-5, rtol=1e-5)
 
-                # Smoke test cached_structured_decision public API on raw 4-field tensors
                 closed = {
                     1: 1, 2: 1, 3: 1, 11: 1, 12: 1, 13: 1,
                     21: 1, 22: 1, 23: 1, 31: 2, 32: 2,
@@ -898,6 +851,60 @@ class TestStructuredV2Phase1B(unittest.TestCase):
                 lg_stateless = hd(ca1, bb(sp1, nu1, pr1, ca1))
                 torch.testing.assert_close(lg_cache_api, lg_stateless, atol=1e-5, rtol=1e-5)
                 _ = ref0
+
+    def test_12_three_mode_forward_equivalence_and_kvcache_reset(self):
+        closed = {
+            1: 1, 2: 1, 3: 1, 11: 1, 12: 1, 13: 1,
+            21: 1, 22: 1, 23: 1, 31: 2, 32: 2,
+        }
+        sp = torch.tensor(
+            [_make_sparse(seat=0, left=42 - k * 4, doras=(1,), closed37=closed, zimo=32) for k in range(3)],
+            dtype=torch.int32,
+        )
+        nu = torch.tensor([[0, 0, 25000, 25000, 25000, 25000]] * 3, dtype=torch.int32)
+        pr = torch.tensor(
+            [
+                _pad_prog([_dahai(1, 35)]),
+                _pad_prog([_dahai(1, 35), _dahai(2, 36), _dahai(3, 35)]),
+                _pad_prog([_dahai(1, 35), _dahai(2, 36), _dahai(3, 35), _dahai(0, 31), _dahai(1, 36)]),
+            ],
+            dtype=torch.int32,
+        )
+        ca = torch.tensor([_pad_cands([4, 44, 84, 130])] * 3, dtype=torch.int32)
+        rounds = build_round_trajectories_from_raw(sp, nu, pr, ca, torch.tensor([0, 1, 2]), ["r0"] * 3)
+        self._verify_three_mode_rounds(rounds)
+
+    def test_12b_three_mode_forward_equivalence_real_data(self):
+        val_bc = require_or_skip_real_data(
+            self, "bc", context="three-mode forward equivalence on real trajectories"
+        )
+        game_lines: dict[str, list[str]] = {}
+        max_idx: dict[str, int] = {}
+        with gzip.open(val_bc, "rt", encoding="utf-8") as fp:
+            for idx_line, line in enumerate(fp):
+                if idx_line >= 15000:
+                    break
+                u = line.split("\t", 1)[0]
+                game_lines.setdefault(u, []).append(line)
+                max_idx[u] = idx_line
+        complete_lines: list[str] = []
+        picked_games = 0
+        for u, lines_u in game_lines.items():
+            if max_idx[u] < 10000 and len(lines_u) >= 80:
+                complete_lines.extend(lines_u)
+                picked_games += 1
+                if picked_games >= 2:
+                    break
+        self.assertTrue(complete_lines)
+        with tempfile.TemporaryDirectory() as tmp_val:
+            val_sub = Path(tmp_val) / "val_complete.tsv"
+            val_sub.write_text("".join(complete_lines), encoding="utf-8")
+            rounds = [
+                r for r in parse_bc_rounds(val_sub)
+                if len(r.decision_event_len) >= 3
+            ][:6]
+        self.assertTrue(rounds)
+        self._verify_three_mode_rounds(rounds)
 
     # Test #13: Native kanachan.simulation.simulate + C++ DecisionMaker step parity
     def test_13_simulate_end_to_end_cpp_decision_maker(self):
@@ -944,7 +951,7 @@ class TestStructuredV2Phase1B(unittest.TestCase):
                 self.assertTrue(torch.equal(td["action"], cpp_action))
 
             # Verify raw un-wrapped loaded model also runs directly inside C++ DecisionMaker
-            sim_dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+            sim_dev = preferred_test_device()
             sim_dtype = torch.half if sim_dev.type == "cuda" else torch.float32
             loaded_dev = load_model(model_path, map_location="cpu").to(
                 device=sim_dev, dtype=sim_dtype

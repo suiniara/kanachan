@@ -55,6 +55,10 @@ from kanachan.training.core.optimizers import (
     validate_optimizer_parameter_coverage,
 )
 from kanachan.training.core.rl.rewards import configured_reward
+from kanachan.training.core.test_env import (
+    require_or_skip_cuda,
+    require_or_skip_real_data,
+)
 from kanachan.training.grp import (
     FrozenGRP,
     FrozenGRPPBRSReward,
@@ -78,9 +82,6 @@ from kanachan.training.iql.joint_v2 import (
 )
 from kanachan.training.iql.streaming_v2 import StreamingIQLDataset
 import tools.audit_structured_v2 as audit_tool
-
-VAL_BC_PATH = Path(r"D:\kanachan-training-data\validation.bc.tsv.gz")
-VAL_RL_PATH = Path(r"D:\kanachan-training-data\validation.rl.tsv.gz")
 
 
 def _free_port() -> int:
@@ -364,11 +365,13 @@ def _worker_ddp_bc(rank: int, world_size: int, bc_path: str, out_dir: str, actio
         ddp_m = DistributedDataParallel(model)
         opt = torch.optim.AdamW(adamw_parameter_groups(model, 0.01), lr=3e-4)
 
-        sampler = LengthBucketBatchSampler(
-            list(ds.round_event_lens), batch_size=2, seed=42, rank=rank, world_size=world_size
+        sampler = ds.create_sampler(
+            batch_size=2, seed=42, rank=rank, world_size=world_size
         )
         assigned = sampler.assigned_sample_indices()
-        torch.save({"assigned": assigned, "weights": list(sampler.batch_weights)}, out / f"samp_{rank}.pt")
+        weights = [w for _, _, w in sampler.iter_pending_indexed_batches()]
+        torch.save({"assigned": assigned, "weights": weights}, out / f"samp_{rank}.pt")
+        sampler.close()
 
         if action == "cont":
             res = train_trajectory_bc_steps(
@@ -638,6 +641,7 @@ class TestStructuredV2Readiness(unittest.TestCase):
             with SpoolingRoundBCDataSource(
                 bc_p, cache_dir=root / "spool", num_hash_buckets=4, max_bucket_bytes=1024
             ) as src:
+                self.assertFalse(hasattr(src, "round_event_lens"))
                 self.assertEqual(src.num_games, 5)
                 self.assertEqual(len(src), len(direct_rounds))
                 by_key_direct = {(r.uuid, r.observer_seat, r.round_event_len, r.action_idx[0].item()): r for r in direct_rounds}
@@ -650,18 +654,18 @@ class TestStructuredV2Readiness(unittest.TestCase):
                     torch.testing.assert_close(r_sp.final_rank, r_dir.final_rank, atol=0, rtol=0)
                     self.assertEqual(r_sp.observer_total_steps, r_dir.observer_total_steps)
 
-                # Test BoundedRoundPrefetcher determinism
-                samp = LengthBucketBatchSampler(list(src.round_event_lens), batch_size=3, seed=7)
-                with BoundedRoundPrefetcher(
-                    src, samp.pending_indexed_batches(), max_prefetch=2, suit_perm_seed=91, epoch=0
-                ) as pf1, BoundedRoundPrefetcher(
-                    src, samp.pending_indexed_batches(), max_prefetch=2, suit_perm_seed=91, epoch=0
-                ) as pf2:
-                    b1 = [b for _, b in pf1]
-                    b2 = [b for _, b in pf2]
-                    self.assertEqual(len(b1), len(b2))
-                    for x, y in zip(b1, b2, strict=True):
-                        torch.testing.assert_close(x["v2_tile_feats"], y["v2_tile_feats"], atol=0.0, rtol=0.0)
+                # Test DiskLengthBucketBatchSampler + BoundedRoundPrefetcher determinism
+                with src.create_sampler(batch_size=3, seed=7) as samp:
+                    with BoundedRoundPrefetcher(
+                        src, samp.iter_pending_indexed_batches(), max_prefetch=2, suit_perm_seed=91, epoch=0
+                    ) as pf1, BoundedRoundPrefetcher(
+                        src, samp.iter_pending_indexed_batches(), max_prefetch=2, suit_perm_seed=91, epoch=0
+                    ) as pf2:
+                        b1 = [b for _, b in pf1]
+                        b2 = [b for _, b in pf2]
+                        self.assertEqual(len(b1), len(b2))
+                        for x, y in zip(b1, b2, strict=True):
+                            torch.testing.assert_close(x["v2_tile_feats"], y["v2_tile_feats"], atol=0.0, rtol=0.0)
 
             # Truncated / incomplete UUID MUST be rejected cleanly!
             bad_bc = root / "incomplete.bc.tsv"
@@ -881,53 +885,52 @@ class TestStructuredV2Readiness(unittest.TestCase):
             out.mkdir()
             _spawn_2rank("--ddp-fatal-bc-worker", str(bc_p), str(out))
 
-        if torch.cuda.is_available():
-            dev = torch.device("cuda")
-            sp_raw = _make_sparse_row(seat=0, chang=0, ju=0)
-            sp = torch.tensor(
-                sp_raw + [NUM_TYPES_OF_SPARSE_FEATURES] * (MAX_NUM_ACTIVE_SPARSE_FEATURES - len(sp_raw)),
-                dtype=torch.int32,
-            ).unsqueeze(0)
-            nu = torch.tensor([[0, 0, 25000, 25000, 25000, 25000]], dtype=torch.int32)
-            pr = torch.tensor(
-                [[0] + [NUM_TYPES_OF_PROGRESSION_FEATURES] * (MAX_LENGTH_OF_PROGRESSION_FEATURES - 1)],
-                dtype=torch.int32,
-            )
-            ca = torch.tensor(
-                [[4, 44, 84, 130] + [PAD_ACTION_ID] * (MAX_NUM_ACTION_CANDIDATES - 4)],
-                dtype=torch.int32,
-            )
-            rounds = build_round_trajectories_from_raw(
-                sp.repeat(4, 1), nu.repeat(4, 1), pr.repeat(4, 1), ca.repeat(4, 1),
-                torch.zeros(4, dtype=torch.long), ["g0", "g1", "g2", "g3"],
-            )
-            bm = TrajectoryBCModel(
-                preset="v2_tiny", dimension=64, num_heads=4, dim_feedforward=128,
-                n_d1_layers=1, n_d2_layers=1, use_next_event_head=False, use_final_rank_head=False,
-                device=dev, dtype=torch.float32,
-            )
-            bopt = torch.optim.AdamW(adamw_parameter_groups(bm, 0.01), lr=1e-4, fused=True)
-            train_trajectory_bc_steps(
-                bm, rounds, bopt, batch_size=2, max_steps=1, device=dev, amp_dtype=torch.bfloat16
-            )
-            prev_det = torch.are_deterministic_algorithms_enabled()
-            torch.use_deterministic_algorithms(False)
-            torch.cuda.synchronize()
-            torch.cuda.set_sync_debug_mode(1)
-            try:
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter("always")
-                    train_trajectory_bc_steps(
-                        bm, rounds, bopt, batch_size=2, max_steps=4, device=dev,
-                        amp_dtype=torch.bfloat16, log_interval=0, check_finite_interval=0,
-                    )
-                    torch.cuda.synchronize()
-            finally:
-                torch.cuda.set_sync_debug_mode(0)
-                torch.use_deterministic_algorithms(prev_det)
-            sync_warns = [w for w in caught if "synchronizing CUDA operation" in str(w.message)]
-            # At most 1 sync total (the final at_end metrics flush); 0 across all intermediate steps.
-            self.assertLessEqual(len(sync_warns), 1, [str(w.message) for w in sync_warns])
+    def test_05b_bc_cuda_fused_zero_sync(self):
+        dev = require_or_skip_cuda(self, context="BC CUDA fused zero-sync test")
+        sp_raw = _make_sparse_row(seat=0, chang=0, ju=0)
+        sp = torch.tensor(
+            sp_raw + [NUM_TYPES_OF_SPARSE_FEATURES] * (MAX_NUM_ACTIVE_SPARSE_FEATURES - len(sp_raw)),
+            dtype=torch.int32,
+        ).unsqueeze(0)
+        nu = torch.tensor([[0, 0, 25000, 25000, 25000, 25000]], dtype=torch.int32)
+        pr = torch.tensor(
+            [[0] + [NUM_TYPES_OF_PROGRESSION_FEATURES] * (MAX_LENGTH_OF_PROGRESSION_FEATURES - 1)],
+            dtype=torch.int32,
+        )
+        ca = torch.tensor(
+            [[4, 44, 84, 130] + [PAD_ACTION_ID] * (MAX_NUM_ACTION_CANDIDATES - 4)],
+            dtype=torch.int32,
+        )
+        rounds = build_round_trajectories_from_raw(
+            sp.repeat(4, 1), nu.repeat(4, 1), pr.repeat(4, 1), ca.repeat(4, 1),
+            torch.zeros(4, dtype=torch.long), ["g0", "g1", "g2", "g3"],
+        )
+        bm = TrajectoryBCModel(
+            preset="v2_tiny", dimension=64, num_heads=4, dim_feedforward=128,
+            n_d1_layers=1, n_d2_layers=1, use_next_event_head=False, use_final_rank_head=False,
+            device=dev, dtype=torch.float32,
+        )
+        bopt = torch.optim.AdamW(adamw_parameter_groups(bm, 0.01), lr=1e-4, fused=True)
+        train_trajectory_bc_steps(
+            bm, rounds, bopt, batch_size=2, max_steps=1, device=dev, amp_dtype=torch.bfloat16
+        )
+        prev_det = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(False)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode(1)
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                train_trajectory_bc_steps(
+                    bm, rounds, bopt, batch_size=2, max_steps=4, device=dev,
+                    amp_dtype=torch.bfloat16, log_interval=0, check_finite_interval=0,
+                )
+                torch.cuda.synchronize()
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+            torch.use_deterministic_algorithms(prev_det)
+        sync_warns = [w for w in caught if "synchronizing CUDA operation" in str(w.message)]
+        self.assertLessEqual(len(sync_warns), 1, [str(w.message) for w in sync_warns])
 
     # ------------------------------------------------------------------
     # §6: Enforced FrozenGRP Gate + Full Workflow + Recipe Binding
@@ -1176,12 +1179,13 @@ class TestStructuredV2Readiness(unittest.TestCase):
             self.assertGreater(rep["ref_verified_pad_slot_count"], 0)
             self.assertEqual(rep["unverified_modes"], ["2", "3", "4", "5", "6"])
 
-        if VAL_BC_PATH.is_file():
-            uuids, sp, nu, pr, ca, cat_counts = audit_tool.harvest_rare_categories(
-                VAL_BC_PATH, scan_limit=150000, per_cat_target=16
-            )
-            for req in audit_tool.REQUIRED_RULE_CATEGORIES:
-                self.assertGreater(cat_counts.get(req, 0), 0, f"Missing {req} in 150k validation.bc.tsv.gz")
+    def test_08b_audit_tool_real_data_category_harvest(self):
+        val_bc = require_or_skip_real_data(self, "bc", context="audit rare category harvest")
+        uuids, sp, nu, pr, ca, cat_counts = audit_tool.harvest_rare_categories(
+            val_bc, scan_limit=150000, per_cat_target=16
+        )
+        for req in audit_tool.REQUIRED_RULE_CATEGORIES:
+            self.assertGreater(cat_counts.get(req, 0), 0, f"Missing {req} in 150k {val_bc.name}")
 
 
 if __name__ == "__main__":

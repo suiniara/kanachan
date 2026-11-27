@@ -53,6 +53,12 @@ from kanachan.training.core.bc.data_iterator import DataIterator as CoreBCDataIt
 from kanachan.training.core.bc.prefetch import CandidateFeaturePrefetch
 from kanachan.training.core.optimizers import adamw_parameter_groups
 from kanachan.training.core.ranking import scores_to_ranks
+from kanachan.training.core.test_env import (
+    is_cuda_skipped,
+    preferred_test_device,
+    require_or_skip_cuda,
+    require_or_skip_real_data,
+)
 from kanachan.training.iql.joint_v2 import (
     attach_structured_v2_transition_features,
     build_joint_iql_recipe,
@@ -63,7 +69,6 @@ from kanachan.training.iql.joint_v2 import (
 from kanachan.training.online import state as online_state
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-VAL_DATA_PATH = Path(r"D:\kanachan-training-data\validation.bc.tsv.gz")
 
 
 def _make_sparse(
@@ -176,7 +181,7 @@ def _draw_rng_sample(n: int = 4) -> dict[str, list]:
         "np": np.random.random(n).tolist(),
         "torch": torch.rand(n).tolist(),
     }
-    if torch.cuda.is_available():
+    if (not is_cuda_skipped()) and torch.cuda.is_available():
         out["cuda"] = torch.rand(n, device="cuda").cpu().tolist()
     return out
 
@@ -237,7 +242,8 @@ def _make_iql_transition_batches(
 def _ddp_phase_worker(mode: str, rank: int, world_size: int, store_uri: str, tmp_dir: str) -> None:
     os.environ["USE_LIBUV"] = "0"
     torch.set_num_threads(1)
-    dev = torch.device("cuda" if (mode != "fail_save" and torch.cuda.is_available() and world_size == 1) else "cpu")
+    use_cuda = (mode != "fail_save") and (not is_cuda_skipped()) and torch.cuda.is_available() and (world_size == 1)
+    dev = torch.device("cuda" if use_cuda else "cpu")
     dist.init_process_group(
         backend="gloo",
         init_method=store_uri,
@@ -252,14 +258,14 @@ def _ddp_phase_worker(mode: str, rank: int, world_size: int, store_uri: str, tmp
             random.seed(1000 + rank * 7777)
             np.random.seed(2000 + rank * 7777)
             torch.manual_seed(3000 + rank * 7777)
-            if torch.cuda.is_available():
+            if (not is_cuda_skipped()) and torch.cuda.is_available():
                 torch.cuda.manual_seed_all(4000 + rank * 7777)
         else:
             # Deliberately identical / scrambled RNG on restart to prove restore works!
             random.seed(999999)
             np.random.seed(999999)
             torch.manual_seed(999999)
-            if torch.cuda.is_available():
+            if (not is_cuda_skipped()) and torch.cuda.is_available():
                 torch.cuda.manual_seed_all(999999)
 
         torch.manual_seed(1234)  # identical initial weights on both ranks
@@ -281,7 +287,7 @@ def _ddp_phase_worker(mode: str, rank: int, world_size: int, store_uri: str, tmp
             random.seed(1000 + rank * 7777)
             np.random.seed(2000 + rank * 7777)
             torch.manual_seed(3000 + rank * 7777)
-            if torch.cuda.is_available():
+            if (not is_cuda_skipped()) and torch.cuda.is_available():
                 torch.cuda.manual_seed_all(4000 + rank * 7777)
             # Advance RNG slightly differently per rank
             for _ in range(rank + 1):
@@ -575,48 +581,51 @@ class TestSourceV3FinalRank(unittest.TestCase):
             self.assertEqual(len(rounds), 1)
             self.assertEqual(rounds[0].final_rank.tolist(), [0, 0])
 
-        if VAL_DATA_PATH.is_file():
-            # Harvest complete real games from source-v3 dataset and verify strict complete-game parsing!
-            game_lines: dict[str, list[str]] = {}
-            max_idx: dict[str, int] = {}
-            with gzip.open(VAL_DATA_PATH, "rt", encoding="utf-8") as fp:
-                for idx_line, line in enumerate(fp):
-                    if idx_line >= 15000:
-                        break
-                    u = line.split("\t", 1)[0]
-                    game_lines.setdefault(u, []).append(line)
-                    max_idx[u] = idx_line
-            complete_lines: list[str] = []
-            picked_games = 0
-            for u, lines_u in game_lines.items():
-                if max_idx[u] < 10000 and len(lines_u) >= 80:
-                    complete_lines.extend(lines_u)
-                    picked_games += 1
-                    if picked_games >= 2:
-                        break
-            self.assertGreaterEqual(picked_games, 1)
-            with tempfile.TemporaryDirectory() as tmp2:
-                real_p = Path(tmp2) / "real_complete.tsv"
-                real_p.write_text("".join(complete_lines), encoding="utf-8")
-                rounds = parse_bc_rounds(real_p)
-                self.assertGreater(len(rounds), 10)
-                expected_by_key: dict[tuple, list[int]] = {}
-                it = CoreBCDataIterator(
-                    path=real_p, num_skip_samples=0, rewrite_rooms=None, rewrite_grades=None, local_rank=0
-                )
-                for line in complete_lines:
-                    uuid = line.split("\t", 1)[0]
-                    sp, nu, _pr, _ca, _act, _rs, res = it.parse_line(line)
-                    seat = int(sp[6].item()) - 71
-                    rnk = int(scores_to_ranks(res[10:14].unsqueeze(0))[0, seat].item())
-                    k = (uuid, int(sp[6].item()), int(sp[7].item()), int(sp[8].item()), int(nu[0].item()))
-                    expected_by_key.setdefault(k, []).append(rnk)
-                del it
-                for r in rounds:
-                    self.assertIsNotNone(r.final_rank)
-                    self.assertTrue(((r.final_rank >= 0) & (r.final_rank < 4)).all())
-                    self.assertEqual(torch.unique(r.final_rank).numel(), 1)
-                self.assertEqual(sum(int(r.final_rank.numel()) for r in rounds), len(complete_lines))
+    def test_real_data_cpp_annotation_and_parse_bc_rounds(self):
+        val_bc = require_or_skip_real_data(
+            self, "bc", context="parse_bc_rounds strict real-data check"
+        )
+        # Harvest complete real games from source-v3 dataset and verify strict complete-game parsing!
+        game_lines: dict[str, list[str]] = {}
+        max_idx: dict[str, int] = {}
+        with gzip.open(val_bc, "rt", encoding="utf-8") as fp:
+            for idx_line, line in enumerate(fp):
+                if idx_line >= 15000:
+                    break
+                u = line.split("\t", 1)[0]
+                game_lines.setdefault(u, []).append(line)
+                max_idx[u] = idx_line
+        complete_lines: list[str] = []
+        picked_games = 0
+        for u, lines_u in game_lines.items():
+            if max_idx[u] < 10000 and len(lines_u) >= 80:
+                complete_lines.extend(lines_u)
+                picked_games += 1
+                if picked_games >= 2:
+                    break
+        self.assertGreaterEqual(picked_games, 1)
+        with tempfile.TemporaryDirectory() as tmp2:
+            real_p = Path(tmp2) / "real_complete.tsv"
+            real_p.write_text("".join(complete_lines), encoding="utf-8")
+            rounds = parse_bc_rounds(real_p)
+            self.assertGreater(len(rounds), 10)
+            expected_by_key: dict[tuple, list[int]] = {}
+            it = CoreBCDataIterator(
+                path=real_p, num_skip_samples=0, rewrite_rooms=None, rewrite_grades=None, local_rank=0
+            )
+            for line in complete_lines:
+                uuid = line.split("\t", 1)[0]
+                sp, nu, _pr, _ca, _act, _rs, res = it.parse_line(line)
+                seat = int(sp[6].item()) - 71
+                rnk = int(scores_to_ranks(res[10:14].unsqueeze(0))[0, seat].item())
+                k = (uuid, int(sp[6].item()), int(sp[7].item()), int(sp[8].item()), int(nu[0].item()))
+                expected_by_key.setdefault(k, []).append(rnk)
+            del it
+            for r in rounds:
+                self.assertIsNotNone(r.final_rank)
+                self.assertTrue(((r.final_rank >= 0) & (r.final_rank < 4)).all())
+                self.assertEqual(torch.unique(r.final_rank).numel(), 1)
+            self.assertEqual(sum(int(r.final_rank.numel()) for r in rounds), len(complete_lines))
 
 
 class TestDDPCheckpointAndPerRankRNG(unittest.TestCase):
@@ -708,7 +717,7 @@ class TestDDPCheckpointAndPerRankRNG(unittest.TestCase):
             self.assertIn("Rank-0 checkpoint save failed", (Path(tmp) / "fail_rank_1.txt").read_text())
 
     def test_single_rank_mode_intact(self):
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = preferred_test_device()
         batches = _make_iql_transition_batches(seed=31, n_batches=4, batch_size=2)
         with tempfile.TemporaryDirectory() as tmp:
             torch.manual_seed(7)
@@ -823,7 +832,7 @@ class TestDistributionalQRDQN(unittest.TestCase):
         # Under distributional QR-DQN (not scalar TD target!), s0's predicted quantiles
         # spread across {-2, +2} so lower quantiles < -0.5 and upper quantiles > +0.5!
         torch.manual_seed(99)
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = preferred_test_device()
         mod = JointStructuredIQLModule(
             preset="v2_tiny", dimension=64, num_heads=4, dim_feedforward=128,
             n_d1_layers=1, n_d2_layers=1, use_cql_quantile_head=True, num_quantiles=8,
@@ -896,7 +905,7 @@ class TestDistributionalQRDQN(unittest.TestCase):
             self.assertGreater(float(q_s0[-2:].mean().item()), 0.4, q_s0.tolist())
 
         # Verify FP16 + GradScaler finite step on CUDA when available
-        if torch.cuda.is_available():
+        if dev.type == "cuda":
             scaler = GradScaler("cuda", enabled=True)
             opt.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.float16, cache_enabled=False):
@@ -909,14 +918,13 @@ class TestDistributionalQRDQN(unittest.TestCase):
 
 
 class TestGPUHotPathZeroSyncAndAudit(unittest.TestCase):
-    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required for GPU zero-sync test")
     def test_zero_cuda_sync_on_intermediate_training_steps(self):
+        dev = require_or_skip_cuda(self, context="GPU zero-sync audit")
         # Guard against leaked torch.use_deterministic_algorithms(True) from earlier tests (e.g. tools/train_decision_cql)
         # which would force CUB scatter_add stream syncs in backward Embedding/gather kernels.
         prev_det = torch.are_deterministic_algorithms_enabled()
         torch.use_deterministic_algorithms(False)
         try:
-            dev = torch.device("cuda")
             # 1. JointStructuredIQLModule with QR-DQN + BC KL anchor + FinalRank under BF16
             batches = _make_iql_transition_batches(seed=51, n_batches=11, batch_size=2, include_results=True)
             bc_bb = StructuredDualDecoder(
